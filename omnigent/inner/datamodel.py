@@ -735,6 +735,14 @@ class TerminalEnvSpec:
         default, which is control mode unless ``terminal.transport`` in
         ``~/.omnigent/config.yaml`` opts out to ``pty``. A per-attach
         ``?transport=`` query overrides both.
+    :param terminal_backend: Which terminal multiplexer backend hosts this
+        terminal, e.g. ``"tmux"``. ``None`` defers to the selection precedence
+        (env ``OMNIGENT_TERMINAL_BACKEND`` → ``terminal.backend`` in
+        ``~/.omnigent/config.yaml`` → the platform default: tmux on POSIX,
+        none yet on Windows). The most specific tier wins, so a non-``None``
+        value here overrides both the env var and the config. An unknown or
+        platform-incompatible name fails loudly at
+        :func:`omnigent.inner.terminal.select_terminal_backend_class`.
     """
 
     command: str | None = None
@@ -752,6 +760,7 @@ class TerminalEnvSpec:
     tmux_start_on_attach: bool = False
     keep_alive_after_exit: bool = False
     terminal_transport: str | None = None
+    terminal_backend: str | None = None
 
 
 # ---------------------------------------------------------------------------

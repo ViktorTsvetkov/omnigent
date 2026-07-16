@@ -79,6 +79,13 @@ _TRANSPORT_PTY_ALIASES = frozenset({TERMINAL_TRANSPORT_PTY, "0", "false", "no", 
 _CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
 _TERMINAL_CONFIG_TABLE = "terminal"
 _TERMINAL_TRANSPORT_CONFIG_KEY = "transport"
+# Config-file key and env-var override for the multiplexer backend selection.
+# The backend lives under the same ``terminal:`` table as
+# ``terminal.backend``; the env var takes precedence over the config file (but
+# both yield to an explicit per-terminal spec). See
+# :func:`resolve_terminal_backend_name`.
+_TERMINAL_BACKEND_CONFIG_KEY = "backend"
+_TERMINAL_BACKEND_ENV_VAR = "OMNIGENT_TERMINAL_BACKEND"
 
 
 def _global_config_path() -> Path:
@@ -980,6 +987,20 @@ class TerminalBackend(ABC):
     platforms: frozenset[str]
     """Platform tags the backend supports (``"posix"`` / ``"windows"``)."""
 
+    @classmethod
+    def ensure_available(cls) -> None:
+        """Verify the backend's multiplexer binary is present and usable.
+
+        Called at selection time (the terminal factory) after the platform
+        check passes, so a chosen backend whose binary is missing or too old
+        fails loudly with an actionable, install-hint error instead of
+        crashing mysteriously at launch. The default is a no-op; a backend
+        driven by an external binary (tmux, herdr) overrides this to probe
+        that binary — and, where the binary's protocol churns (herdr is
+        pre-1.0), to gate its version.
+        """
+        del cls  # base no-op; binary-backed backends override this
+
     @abstractmethod
     async def launch(self, request: TerminalLaunchRequest) -> None:
         """Create the hosted session/pane and start the inner command.
@@ -1121,9 +1142,29 @@ class TmuxBackend(TerminalBackend):
         control_mode_attach=True,
         status_line=True,
     )
-    # tmux is POSIX-only; native Windows uses a different backend (the factory
-    # still hard-raises on Windows until backend selection lands).
+    # tmux is POSIX-only; native Windows uses a different backend, selected by
+    # the terminal factory (which raises a clear availability error on Windows
+    # until a Windows-native backend is registered).
     platforms = frozenset({"posix"})
+
+    @classmethod
+    def ensure_available(cls) -> None:
+        """Fail loudly with an install hint when tmux is not on PATH.
+
+        The tmux backend hosts each managed terminal in a private tmux server,
+        so a missing ``tmux`` binary means no native harness can launch. Raise
+        an actionable error naming the common install commands rather than
+        letting the first ``tmux`` subprocess fail opaquely.
+
+        :raises RuntimeError: When ``tmux`` is not installed or not on PATH.
+        """
+        if not _tmux_available():
+            raise RuntimeError(
+                "tmux is not installed or not on PATH. The tmux terminal "
+                "backend hosts native harnesses in a private tmux server; "
+                "install tmux (e.g. `apt install tmux`, `brew install tmux`, "
+                "`dnf install tmux`) and ensure it is on PATH."
+            )
 
     def __init__(
         self,
@@ -1435,6 +1476,202 @@ class TmuxBackend(TerminalBackend):
         return reaped
 
 
+# ---------------------------------------------------------------------------
+# Backend registry + selection
+# ---------------------------------------------------------------------------
+#
+# A name→backend-class registry (mirroring the ``SandboxBackend`` registry in
+# ``sandbox.py``) plus the selection contract the firstmate abstraction proved
+# out: an explicit per-terminal spec beats an env override beats user config
+# beats the platform default, with unknown names and platform mismatches
+# failing loudly rather than falling back silently.
+
+# Registered terminal backends, keyed by :attr:`TerminalBackend.name`.
+# Populated by :func:`register_terminal_backend`; ``TmuxBackend`` registers at
+# import. A new backend (herdr, a later change) registers its class here and is
+# then selectable by name with no change to the machinery above the seam.
+_TERMINAL_BACKENDS: dict[str, type[TerminalBackend]] = {}
+
+
+def register_terminal_backend(backend_cls: type[TerminalBackend]) -> None:
+    """Register *backend_cls* under its :attr:`TerminalBackend.name`.
+
+    :param backend_cls: A concrete :class:`TerminalBackend` subclass whose
+        ``name`` / ``capabilities`` / ``platforms`` class attributes are set.
+    """
+    _TERMINAL_BACKENDS[backend_cls.name] = backend_cls
+
+
+register_terminal_backend(TmuxBackend)
+
+
+# Platform → default backend name used when nothing is explicitly selected.
+# POSIX defaults to tmux (the compatibility contract: an absent backend field
+# means tmux, so every pre-existing persisted spec keeps working unchanged).
+# Windows has no native backend yet — herdr arrives in a later change — so it
+# has no entry, and selection raises a clear availability error there instead
+# of an incidental hard-raise.
+_PLATFORM_DEFAULT_BACKEND: dict[str, str] = {"posix": TmuxBackend.name}
+
+
+def _current_platform_tag() -> str:
+    """Return this host's backend platform tag (``"posix"`` / ``"windows"``).
+
+    Routed through the module-level :data:`IS_WINDOWS` so tests can simulate
+    the other platform by monkeypatching it.
+    """
+    return "windows" if IS_WINDOWS else "posix"
+
+
+def _env_terminal_backend() -> str | None:
+    """Read the :data:`_TERMINAL_BACKEND_ENV_VAR` override, or ``None``.
+
+    An unset or blank/whitespace-only value returns ``None`` so it does not
+    shadow the config or platform-default tiers.
+    """
+    value = os.environ.get(_TERMINAL_BACKEND_ENV_VAR)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _read_terminal_backend_config() -> str | None:
+    """Read ``terminal.backend`` from the global config, or ``None``.
+
+    Best-effort, mirroring :func:`_read_terminal_transport_config`: any failure
+    (missing/unreadable file, non-mapping YAML, absent table/key, non-string
+    value) returns ``None`` so the caller falls through to the platform
+    default. Never raises — reading the backend must not crash terminal
+    construction.
+
+    :returns: The configured backend name, or ``None`` when unset.
+    """
+    import yaml
+
+    path = _global_config_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    try:
+        raw = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    table = raw.get(_TERMINAL_CONFIG_TABLE)
+    if not isinstance(table, dict):
+        return None
+    value = table.get(_TERMINAL_BACKEND_CONFIG_KEY)
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def resolve_terminal_backend_name(*, spec_backend: str | None = None) -> str:
+    """Resolve the backend name for one terminal by selection precedence.
+
+    Precedence (first non-empty wins):
+
+    1. ``spec_backend`` — the per-terminal
+       :attr:`~omnigent.inner.datamodel.TerminalEnvSpec.terminal_backend`, the
+       most specific selection.
+    2. The :data:`_TERMINAL_BACKEND_ENV_VAR` env override.
+    3. ``terminal.backend`` in ``~/.omnigent/config.yaml`` (the user config).
+    4. The platform default in :data:`_PLATFORM_DEFAULT_BACKEND` — tmux on
+       POSIX; none on Windows (yet).
+
+    An absent value at every tier resolves to the platform default, which is
+    the compatibility contract that keeps pre-existing specs working as tmux.
+
+    :param spec_backend: The per-terminal backend name, or ``None``.
+    :returns: The resolved backend name (not yet validated against the
+        registry or platform — see :func:`select_terminal_backend_class`).
+    :raises RuntimeError: When no tier selects a backend and the current
+        platform has no default (native Windows until herdr lands).
+    """
+    for candidate in (spec_backend, _env_terminal_backend(), _read_terminal_backend_config()):
+        if candidate is not None and candidate.strip():
+            return candidate.strip()
+    platform_tag = _current_platform_tag()
+    default = _PLATFORM_DEFAULT_BACKEND.get(platform_tag)
+    if default is None:
+        raise RuntimeError(
+            f"No terminal multiplexer backend supports this platform "
+            f"({platform_tag}); native harnesses require a platform-native "
+            "backend. tmux is POSIX-only and the Windows-native backend "
+            "(herdr) is not yet available. Run an SDK-based harness via "
+            "`omnigent run <agent.yaml>` (e.g. the claude-sdk, cursor, "
+            "copilot, or codex harness) or use the web UI."
+        )
+    return default
+
+
+def select_terminal_backend_class(*, spec_backend: str | None = None) -> type[TerminalBackend]:
+    """Select and validate the backend class for one terminal.
+
+    Resolves the name via :func:`resolve_terminal_backend_name`, then checks it
+    loudly at selection time — the single point the terminal factory calls:
+
+    - an unknown name raises, listing the known backends;
+    - a backend whose :attr:`~TerminalBackend.platforms` excludes the current
+      platform raises. No silent fallback.
+
+    Binary availability is checked separately by the caller via
+    :meth:`TerminalBackend.ensure_available` (so the platform verdict and the
+    install-hint error stay distinct).
+
+    :param spec_backend: The per-terminal backend name, or ``None``.
+    :returns: The selected, registered, platform-compatible backend class.
+    :raises RuntimeError: On an unknown name, a platform mismatch, or no
+        available backend for the platform (via the resolver).
+    """
+    name = resolve_terminal_backend_name(spec_backend=spec_backend)
+    backend_cls = _TERMINAL_BACKENDS.get(name)
+    if backend_cls is None:
+        known = ", ".join(sorted(_TERMINAL_BACKENDS)) or "(none registered)"
+        raise RuntimeError(f"Unknown terminal backend {name!r}. Known backends: {known}.")
+    platform_tag = _current_platform_tag()
+    if platform_tag not in backend_cls.platforms:
+        supported = ", ".join(sorted(backend_cls.platforms)) or "(none)"
+        raise RuntimeError(
+            f"Terminal backend {name!r} does not support this platform "
+            f"({platform_tag}). Supported platforms: {supported}."
+        )
+    return backend_cls
+
+
+def _construct_terminal_backend(name: str, *, socket_path: Path, target: str) -> TerminalBackend:
+    """Construct the registered backend *name* for a terminal instance.
+
+    The construction seam for :meth:`TerminalInstance.__post_init__`. Each
+    backend takes different constructor arguments, so this dispatches per
+    backend rather than calling a uniform constructor. tmux is the only
+    backend wired today; a new backend (herdr) adds its branch here when it
+    lands.
+
+    :param name: A registered backend name, e.g. ``"tmux"``.
+    :param socket_path: Private multiplexer socket path for this instance.
+    :param target: Session/pane target name, e.g. ``"main"``.
+    :returns: A fresh backend instance bound to this terminal.
+    :raises RuntimeError: When *name* is not registered.
+    :raises NotImplementedError: When *name* is registered but has no
+        constructor wired here yet.
+    """
+    backend_cls = _TERMINAL_BACKENDS.get(name)
+    if backend_cls is None:
+        known = ", ".join(sorted(_TERMINAL_BACKENDS)) or "(none registered)"
+        raise RuntimeError(f"Unknown terminal backend {name!r}. Known backends: {known}.")
+    if backend_cls is TmuxBackend:
+        return TmuxBackend(socket_path=socket_path, target=target)
+    raise NotImplementedError(
+        f"terminal backend {name!r} is registered but its constructor is not "
+        "wired into _construct_terminal_backend yet."
+    )
+
+
 @dataclass
 class TerminalInstance:
     """
@@ -1510,6 +1747,13 @@ class TerminalInstance:
     # attach routes via :func:`resolve_terminal_transport`; does not affect how
     # the tmux server itself is launched.
     terminal_transport: str | None = None
+    # Multiplexer backend name for this instance (``"tmux"`` today). The
+    # factory sets this from the selection precedence
+    # (:func:`select_terminal_backend_class`); direct construction (test
+    # paths) defaults to tmux, preserving today's behavior byte-for-byte.
+    # ``__post_init__`` constructs the matching backend via
+    # :func:`_construct_terminal_backend`.
+    backend_name: str = TmuxBackend.name
     running: bool = False
     launch_cwd: str | None = None
     # Owned per-launch egress proxy. ``None`` when the sandbox
@@ -1546,8 +1790,19 @@ class TerminalInstance:
     _backend: TerminalBackend = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        """Wire up the tmux lifecycle backend for this instance's socket."""
-        self._backend = TmuxBackend(socket_path=self.socket_path, target=self.tmux_target)
+        """Construct this instance's multiplexer backend from ``backend_name``.
+
+        Defaults to tmux (see :attr:`backend_name`), so every existing
+        construction path — including tests that build ``TerminalInstance``
+        directly — gets a tmux backend for its socket without any signature
+        change. The factory overrides ``backend_name`` from the selection
+        precedence before construction.
+        """
+        self._backend = _construct_terminal_backend(
+            self.backend_name,
+            socket_path=self.socket_path,
+            target=self.tmux_target,
+        )
 
     @property
     def tmux_target(self) -> str:
@@ -2377,14 +2632,15 @@ def create_terminal_instance(
     :returns: A :class:`TerminalCreateResult` carrying the new instance
         and the resolved cwd to pass to ``launch()``.
     """
-    if IS_WINDOWS:
-        raise RuntimeError(
-            "Native terminal harnesses (tmux/PTY) are not supported on Windows. "
-            "Run an SDK-based harness via `omnigent run <agent.yaml>` (e.g. the "
-            "claude-sdk, cursor, copilot, or codex harness) or use the web UI."
-        )
-    if not _tmux_available():
-        raise RuntimeError("tmux is not installed or not on PATH")
+    # Select the multiplexer backend at the single construction point, by the
+    # documented precedence (per-terminal spec → env → user config → platform
+    # default). This is the one place platform support is decided: on native
+    # Windows there is no backend yet, so selection raises a clear availability
+    # error (a ``RuntimeError``, as the old hard-raise was) rather than an
+    # incidental failure deeper in construction. ``ensure_available`` then
+    # gates the chosen backend's binary with an install hint.
+    backend_cls = select_terminal_backend_class(spec_backend=spec.terminal_backend)
+    backend_cls.ensure_available()
 
     # Create the instance's private directory.
     private_dir = Path(tempfile.mkdtemp(prefix=_TERMINAL_DIR_PREFIX))
@@ -2476,6 +2732,7 @@ def create_terminal_instance(
         tmux_start_on_attach=spec.tmux_start_on_attach,
         keep_alive_after_exit=spec.keep_alive_after_exit,
         terminal_transport=spec.terminal_transport,
+        backend_name=backend_cls.name,
     )
 
     return TerminalCreateResult(instance=instance, cwd=cwd)

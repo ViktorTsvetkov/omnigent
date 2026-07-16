@@ -22,19 +22,25 @@ the sidecar (modeling herdr auto-starting the per-session server on first use).
 Modeled vocabulary (nothing else)
 ----------------------------------
 
-- ``version --format json`` → ``{"protocol", "version"}`` (protocol/version come
-  from :envvar:`OMNIGENT_HERDR_PROTOCOL` / :envvar:`OMNIGENT_HERDR_VERSION`, so a
-  test can simulate an old protocol). Session-independent, but still invoked with
-  an explicit ``--session``.
+- ``api schema`` → the real binary's **text** report with a ``protocol: <N>``
+  line (``N`` from :envvar:`OMNIGENT_HERDR_PROTOCOL`, so a test can simulate an
+  old protocol). Models the real ``herdr api schema`` default output, which is
+  human-readable text (NOT JSON) — the #12 protocol probe regex-extracts the
+  number. Session-independent, but still invoked with an explicit ``--session``.
 - ``workspace list`` / ``workspace create --label`` / ``workspace close
   --workspace`` — labels are NOT unique (a create never dedupes), so the backend
   can leave and later adopt same-label husks.
 - ``tab create --workspace --cwd --cols --rows --command -- <argv...>`` — creates
   the tab and its single pane, pinning geometry.
-- ``pane get`` (liveness: alive / pane_not_found / workspace_not_found),
-  ``pane read`` (screen snapshot, emitted with CRLF so the backend's
-  normalization is exercised), ``pane send-text`` (stdin, non-submitting),
-  ``pane send-keys`` (named/plus-notation keys).
+- ``pane get <id>`` (liveness: alive / pane_not_found / workspace_not_found,
+  plus ``agent_status``), ``pane read <id> --source S --format F [--lines N]``
+  (screen snapshot: ``visible`` returns the whole viewport, ``recent``/
+  ``recent-unwrapped`` tail ``--lines``; a small ``--lines`` models the historic
+  empty-read quirk; ``--format ansi`` prepends an SGR marker; emitted with CRLF
+  so the backend's normalization is exercised), ``pane send-text <id> <text>``
+  (positional, non-submitting), ``pane send-keys <id> <key...>`` (positional
+  named/plus-notation keys). The pane id is a **positional** argument (the
+  spike-verified form), not a ``--pane`` flag.
 
 Observability conventions (shared with :mod:`tests.inner._fake_tmux`)
 ---------------------------------------------------------------------
@@ -48,8 +54,8 @@ Observability conventions (shared with :mod:`tests.inner._fake_tmux`)
   array per line) so a test can assert that EVERY herdr call carried an explicit
   ``--session`` (the never-ambient-targeting enforcement).
 
-``#12`` can extend this fake (an ``agent_status`` knob, richer screen markers)
-without rewriting the lifecycle model here.
+Later tickets can extend this fake (richer screen markers, more verbs) without
+rewriting the model here.
 """
 
 from __future__ import annotations
@@ -68,13 +74,29 @@ from pathlib import Path
 STATE_DIR_ENV_VAR = "OMNIGENT_HERDR_STATE_DIR"
 #: File the fake appends every invocation's argv to (JSON-array lines).
 LOG_ENV_VAR = "OMNIGENT_HERDR_LOG"
-#: Wire protocol the fake's ``version`` report announces (default ``"16"``).
+#: Wire protocol the fake's ``api schema`` report announces (default ``"16"``).
 PROTOCOL_ENV_VAR = "OMNIGENT_HERDR_PROTOCOL"
-#: Version string the fake's ``version`` report announces.
+#: Version string the fake's ``api schema`` report announces.
 VERSION_ENV_VAR = "OMNIGENT_HERDR_VERSION"
+#: Optional override for the ``agent_status`` every ``pane get`` reports, so a
+#: test can flip the native busy/idle signal (incl. the lying-idle case where
+#: native reads ``idle`` while the screen keeps changing). Unset → the pane's
+#: own stored status (default ``"idle"``).
+AGENT_STATUS_ENV_VAR = "OMNIGENT_HERDR_AGENT_STATUS"
 
 DEFAULT_PROTOCOL = "16"
 DEFAULT_VERSION = "0.7.4-preview"
+
+#: ``pane read --format ansi`` prepends this SGR marker so a test can assert the
+#: backend preserves ANSI escapes (herdr's ``--format ansi`` keeps 256-color
+#: SGR). A lone LF-free escape so CRLF handling and tailing stay unaffected.
+ANSI_MARKER = "\x1b[38;5;11m"
+
+#: ``pane read --source recent|recent-unwrapped --lines N`` with ``N`` below this
+#: returns an EMPTY capture, modeling the historic small-N empty-read quirk (NOT
+#: reproduced on real 0.7.4, but the backend's fetch-large-tail-locally
+#: workaround is regression-tested against it). ``visible`` ignores ``--lines``.
+SMALL_N_EMPTY_THRESHOLD = 100
 
 # An inner command whose sole argv token is this sentinel models a process that
 # exits immediately on launch (herdr destroys its pane at once — no remain-on-
@@ -200,15 +222,23 @@ def _log(argv: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _handle_version() -> int:
-    """Emit the protocol/version report (session-independent)."""
+def _handle_api_schema() -> int:
+    """Emit the ``api schema`` report (session-independent protocol gate).
+
+    Models the **real** ``herdr api schema`` output, whose default form is
+    human-readable text with a ``protocol: <N>`` line (verified against the real
+    binary — it is NOT JSON by default; ``api schema --json`` prints the full
+    schema). The #12 protocol gate regex-extracts the number from this text.
+    """
     protocol = os.environ.get(PROTOCOL_ENV_VAR, DEFAULT_PROTOCOL)
-    version = os.environ.get(VERSION_ENV_VAR, DEFAULT_VERSION)
-    try:
-        protocol_num: object = int(protocol)
-    except ValueError:
-        protocol_num = protocol  # let the backend's parse-guard reject it
-    sys.stdout.write(json.dumps({"protocol": protocol_num, "version": version}))
+    sys.stdout.write(
+        "Herdr API schema\n"
+        f"protocol: {protocol}\n"
+        "schema_version: 1\n"
+        "schemas: error_response, event, request, subscription_event, success_response\n"
+        "\n"
+        "Use `herdr api schema --json` to print the full schema.\n"
+    )
     return 0
 
 
@@ -307,9 +337,14 @@ def _live_pane(state_dir: str, session: str, pid: str) -> dict[str, object] | No
 
 
 def _handle_pane(state_dir: str, session: str, rest: list[str]) -> int:
-    """Dispatch ``pane get|read|send-text|send-keys``."""
+    """Dispatch ``pane get|read|send-text|send-keys`` (positional pane id).
+
+    ``rest`` is ``["pane", <action>, <pane-id>, ...]`` — the pane id is the
+    first positional after the action (the spike-verified form), not a
+    ``--pane`` flag.
+    """
     action = rest[1] if len(rest) > 1 else ""
-    pid = _flag(rest, "--pane") or ""
+    pid = rest[2] if len(rest) > 2 else ""
 
     if action == "get":
         state = _load(state_dir, session)
@@ -320,7 +355,10 @@ def _handle_pane(state_dir: str, session: str, rest: list[str]) -> int:
         if pane is None:
             sys.stdout.write(json.dumps({"result": "pane_not_found"}))
             return 0
-        sys.stdout.write(json.dumps({"result": "alive", "agent_status": pane.get("agent_status")}))
+        # An env override lets a test flip the native busy/idle signal (incl. the
+        # lying-idle case) without mutating the sidecar per pane.
+        status = os.environ.get(AGENT_STATUS_ENV_VAR) or pane.get("agent_status")
+        sys.stdout.write(json.dumps({"result": "alive", "agent_status": status}))
         return 0
 
     if action == "read":
@@ -328,16 +366,12 @@ def _handle_pane(state_dir: str, session: str, rest: list[str]) -> int:
         if pane is None:
             sys.stderr.write("pane_not_found\n")
             return 1
-        # Emit with CRLF so the backend's CRLF→LF normalization is exercised.
-        # Normalize the stored screen to LF first so the CRLF is purely a
-        # read-path (herdr-emission) artifact, independent of any newline
-        # translation the platform applied to the send-text stdin.
-        screen = str(pane.get("screen", "")).replace("\r\n", "\n").replace("\r", "\n")
+        out = _rendered_read(pane, rest)
         # Write bytes (not text): on Windows a text-mode ``sys.stdout`` would
         # translate ``\n`` → ``\r\n`` on write and corrupt the CRLF we emit on
         # purpose. The buffer bypasses that so the backend receives exactly the
         # CRLF stream a real herdr capture carries.
-        sys.stdout.buffer.write(screen.replace("\n", "\r\n").encode("utf-8"))
+        sys.stdout.buffer.write(out.replace("\n", "\r\n").encode("utf-8"))
         return 0
 
     if action in ("send-text", "send-keys"):
@@ -356,10 +390,10 @@ def _handle_pane(state_dir: str, session: str, rest: list[str]) -> int:
             return 1
         screen = str(pane.get("screen", ""))
         if action == "send-text":
-            # Non-submitting literal paste, delivered via stdin.
-            screen += sys.stdin.buffer.read().decode("utf-8")
+            # Non-submitting literal paste, delivered as the positional <text>.
+            screen += rest[3] if len(rest) > 3 else ""
         else:
-            for key in _positional_keys(rest):
+            for key in rest[3:]:  # positional (already backend-translated) keys
                 screen += key_marker(key)
                 if key == "Enter":
                     screen += SUBMIT_SENTINEL
@@ -371,21 +405,38 @@ def _handle_pane(state_dir: str, session: str, rest: list[str]) -> int:
     return 2
 
 
-def _positional_keys(rest: list[str]) -> list[str]:
-    """Return the key tokens of a ``pane send-keys`` command.
+def _rendered_read(pane: dict[str, object], rest: list[str]) -> str:
+    """Render a ``pane read`` snapshot honoring ``--source``/``--format``/``--lines``.
 
-    Drops the ``pane``/``send-keys`` words and the ``--pane <id>`` pair, leaving
-    the (already backend-translated) key names.
+    - ``--source visible`` (default) returns the whole stored viewport, ignoring
+      ``--lines`` (herdr's ``visible`` behavior).
+    - ``--source recent``/``recent-unwrapped`` tail the last ``--lines`` logical
+      lines; a ``--lines`` below :data:`SMALL_N_EMPTY_THRESHOLD` returns EMPTY,
+      modeling the historic small-N empty-read quirk the backend defends against.
+    - ``--format ansi`` prepends :data:`ANSI_MARKER` (an SGR escape) so a test
+      can assert the backend passes ANSI through.
+
+    The stored screen is normalized to LF first so the CRLF the caller emits is
+    purely a read-path (herdr-emission) artifact.
     """
-    keys: list[str] = []
-    i = 2  # skip "pane" and "send-keys"
-    while i < len(rest):
-        if rest[i] == "--pane":
-            i += 2
+    screen = str(pane.get("screen", "")).replace("\r\n", "\n").replace("\r", "\n")
+    source = _flag(rest, "--source") or "visible"
+    lines_flag = _flag(rest, "--lines")
+
+    if source in ("recent", "recent-unwrapped"):
+        n = int(lines_flag) if lines_flag is not None and lines_flag.isdigit() else None
+        if n is not None and n < SMALL_N_EMPTY_THRESHOLD:
+            body = ""  # small-N empty-read quirk
+        elif n is not None:
+            body = "\n".join(screen.split("\n")[-n:])
         else:
-            keys.append(rest[i])
-            i += 1
-    return keys
+            body = screen
+    else:  # "visible": whole viewport, --lines ignored
+        body = screen
+
+    if (_flag(rest, "--format") or "text") == "ansi" and body:
+        body = ANSI_MARKER + body
+    return body
 
 
 def main(argv: list[str]) -> int:
@@ -408,8 +459,10 @@ def main(argv: list[str]) -> int:
         return 0
     command = rest[0]
 
-    if command == "version":
-        return _handle_version()
+    # ``api schema`` is session-independent (the protocol gate); handle it before
+    # the session guard, exactly as the real static schema dump needs no session.
+    if command == "api" and len(rest) > 1 and rest[1] == "schema":
+        return _handle_api_schema()
 
     if session is None:
         # The backend never emits a bare subcommand; guard anyway.

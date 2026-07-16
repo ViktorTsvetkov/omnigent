@@ -1147,6 +1147,30 @@ class TerminalBackend(ABC):
         """Synchronous sibling of :meth:`detach_display_clients` for the
         threaded idle watcher. Default no-op."""
 
+    async def busy_state(self) -> bool | None:
+        """Report whether the inner agent is mid-turn (busy), if the backend can.
+
+        Optional signal for machinery above the seam (a native complement to the
+        capture-diff idle watcher). The default returns ``None`` — "no native
+        busy signal" — for backends without
+        :attr:`TerminalBackendCapabilities.native_busy_state` (tmux, the
+        in-process fake); a backend that exposes a native agent state overrides
+        this. ``True`` = busy, ``False`` = idle, ``None`` = no usable signal (the
+        caller then relies on its own capture-diff watcher).
+        """
+        return None
+
+    async def input_ready(self) -> bool | None:
+        """Report whether the pane's composer is ready for a new prompt, if known.
+
+        Optional signal for the input-delivery dance (paste then submit). The
+        default returns ``None`` — "unknown, deliver optimistically" — for
+        backends that cannot observe composer readiness; a backend with a native
+        agent state overrides this. ``True`` = ready, ``False`` = not ready
+        (mid-turn or gone), ``None`` = unknown.
+        """
+        return None
+
 
 class TmuxBackend(TerminalBackend):
     """
@@ -1518,15 +1542,35 @@ class HerdrBackend(TerminalBackend):
     notation keys (``ctrl+c``), ``--format json`` output, CRLF captures — is
     confined to this class.
 
-    **Scope of this ticket (#11): session lifecycle.** launch (with husk
-    adopt/replace), liveness, close/kill, orphan reaping, geometry pinning,
-    Windows path translation, and CRLF stripping. Input delivery and capture are
-    implemented straightforwardly (the ABC requires them); their *quirk
-    hardening* — the full key-translation table, the min-line-count snapshot
-    workaround, and busy-state corroboration via ``agent_status`` — lands in
-    ticket #12. Explicit headless ``server`` management and threading the inner
-    process environment through that server are integration concerns for a later
-    change (#15); see :meth:`launch`.
+    **Session lifecycle (#11):** launch (with husk adopt/replace), liveness,
+    close/kill, orphan reaping, geometry pinning, Windows path translation, and
+    CRLF stripping.
+
+    **I/O operations (#12):** non-submitting multi-line paste (``pane
+    send-text``), atomic submit / named-key delivery with the full
+    key-translation table (:meth:`_translate_key`), plain + ANSI screen
+    snapshots (``pane read --format text|ansi``) with the min-line-count
+    workaround (:meth:`_read_argv` / :meth:`_tail_lines`), native busy-state
+    corroborated with output-diff (:meth:`busy_state`), and composer
+    input-readiness (:meth:`input_ready`). The protocol probe reads ``herdr api
+    schema`` (:meth:`ensure_available`), and every pane subcommand addresses the
+    pane positionally (:meth:`_pane_argv`).
+
+    **Pending real-herdr validation (#13).** The workspace/tab creation verbs in
+    :meth:`launch` (``workspace create --label`` then ``tab create --workspace
+    --cwd --cols --rows --command -- <argv>``) were *designed* by #11 and not
+    exercised by the spike, which spawned programs via ``agent start`` and
+    created panes as a side effect of ``workspace``/``tab create``; #13
+    reconciles them against real herdr. The ``pane get`` envelope shape is a
+    known #13 item: the real binary wraps results as ``{"id": "cli:<verb>",
+    "result": {..., "type": "<verb>"}}`` (errors as ``{"error": {"code": ...}}``),
+    so liveness result codes (:meth:`_interpret_pane_get`) and the
+    ``.result.pane.agent_status`` path (:meth:`_agent_status`) both read a
+    simplified top-level shape here and are reconciled together there. ``pane
+    send-text`` reading a very large paste (the OS argv length cap — see
+    :meth:`send_text`) is also a #13 item. Explicit headless ``server``
+    management and threading the inner process environment through that server
+    are #15 integration concerns; see :meth:`launch`.
 
     **No remain-on-exit.** herdr auto-destroys a pane when its process exits and
     the ``pane_exited`` event carries no exit code, so a dead endpoint cannot be
@@ -1578,8 +1622,46 @@ class HerdrBackend(TerminalBackend):
     _PROBE_SESSION = "omnigent-probe"
     _CLI_TIMEOUT_S = 15.0
     # Neutral key names herdr has no equivalent for; skipped rather than sent as
-    # a wrong key (the full table is #12).
-    _UNSUPPORTED_KEYS = frozenset({"Home", "End", "PageUp", "PageDown", "Delete", "Insert"})
+    # a wrong key. Covers both the plain spellings and tmux's aliases for the
+    # same keys (``PPage``/``NPage`` = PageUp/PageDown, ``DC``/``IC`` =
+    # Delete/Insert) because Omnigent's neutral vocabulary is tmux's key names.
+    # The spike confirmed herdr rejects every one of these as ``invalid_key``.
+    _UNSUPPORTED_KEYS = frozenset(
+        {
+            "Home",
+            "End",
+            "PageUp",
+            "PageDown",
+            "Delete",
+            "Insert",
+            "PPage",
+            "NPage",
+            "DC",
+            "IC",
+        }
+    )
+    # Explicit neutral-name → herdr-name renames for named keys whose herdr
+    # spelling differs from Omnigent's tmux-derived vocabulary. ``BSpace`` (tmux)
+    # is ``Backspace`` in herdr (herdr rejects ``BSpace``); ``BTab`` (tmux
+    # back-tab) is the ``shift+tab`` chord. Everything else herdr supports
+    # (``Enter``/``Escape``/``Tab``/``Space``/arrows/``F1``..) shares Omnigent's
+    # spelling and passes through unchanged.
+    _KEY_RENAMES = {"BSpace": "Backspace", "BTab": "shift+tab"}  # noqa: RUF012 (read-only)
+    # Native ``agent_status`` values that mean the agent is mid-turn (busy):
+    # ``working`` (running) and ``blocked`` (paused on input/approval, still in a
+    # turn). ``idle`` (at the composer) and ``done`` (turn finished) are not
+    # busy; anything else (incl. ``unknown``/missing) is treated as *no native
+    # signal* and falls back to the output-diff heuristic. See :meth:`busy_state`.
+    _NATIVE_BUSY_STATES = frozenset({"working", "blocked"})
+    _NATIVE_IDLE_STATES = frozenset({"idle", "done"})
+    # Defensive floor for ``pane read --lines``. The historical small-N empty-read
+    # quirk (a ``--lines`` below some threshold returning an empty capture) did
+    # NOT reproduce on herdr 0.7.4, but the ticket mandates the workaround as
+    # defense-in-depth: never ask herdr for fewer than this many logical lines,
+    # then tail locally to the size the caller actually requested (see
+    # :meth:`capture`). Large enough to clear any plausible small-N threshold yet
+    # cheap at ~31 ms/read.
+    _SNAPSHOT_MIN_FETCH_LINES = 500
 
     @classmethod
     def ensure_available(cls) -> None:
@@ -1588,24 +1670,32 @@ class HerdrBackend(TerminalBackend):
         Two distinct, loud, actionable failures: a missing/unspawnable binary
         (names the binary and the :envvar:`OMNIGENT_HERDR_BIN` override), and an
         unsupported wire protocol (names the binary, the protocol found, and the
-        minimum required). The protocol is discovered by running the CLI's
-        ``version`` report — a session-independent command, but still invoked
-        with an explicit ``--session`` (:data:`_PROBE_SESSION`) so the adapter
-        never emits a bare herdr subcommand.
+        minimum required).
+
+        The protocol is discovered by running ``herdr api schema`` — a static,
+        session-independent schema dump (``herdr status`` exposes the same number
+        less conveniently, and ``herdr --version`` prints only the version
+        *string*, never the protocol). The **real binary's default output is
+        human-readable text** with a ``protocol: <N>`` line (``herdr api schema
+        --json`` prints the full schema as JSON) — verified directly, correcting
+        the spike's shorthand that implied JSON — so the protocol is extracted
+        with a small regex tolerant of both the text ``protocol: 16`` and a JSON
+        ``"protocol": 16``. ``api schema`` cannot touch any session's panes, but
+        the probe still leads with an explicit ``--session``
+        (:data:`_PROBE_SESSION`) as a defensive global so nothing the adapter
+        emits is ever a bare subcommand — confirmed against the real binary,
+        which accepts the leading ``--session`` and still returns the schema.
 
         :raises RuntimeError: When herdr is not installed/spawnable, when the
-            version probe fails or is unparseable, or when the reported protocol
-            is below :data:`MIN_PROTOCOL`.
+            ``api schema`` probe fails or has no parseable protocol, or when the
+            reported protocol is below :data:`MIN_PROTOCOL`.
         """
-        import json
-
         argv = [
             *cls._command_prefix(),
             "--session",
             cls._PROBE_SESSION,
-            "version",
-            "--format",
-            "json",
+            "api",
+            "schema",
         ]
         try:
             proc = subprocess.run(
@@ -1620,25 +1710,28 @@ class HerdrBackend(TerminalBackend):
             ) from exc
         if proc.returncode != 0:
             raise RuntimeError(
-                f"herdr version probe failed (rc={proc.returncode}): "
+                f"herdr 'api schema' probe failed (rc={proc.returncode}): "
                 f"{proc.stderr.decode(errors='replace').strip()}. Ensure "
                 f"{cls._command_prefix()[0]!r} is a working herdr binary "
                 f"(override with {cls.BIN_ENV_VAR})."
             )
-        try:
-            report = json.loads(cls._normalize_newlines(proc.stdout.decode(errors="replace")))
-            protocol = int(report["protocol"])
-        except (ValueError, KeyError, TypeError) as exc:
+        text = cls._normalize_newlines(proc.stdout.decode(errors="replace"))
+        # Tolerant of the real text form (``protocol: 16``) and a JSON form
+        # (``"protocol": 16``): match the label, an optional closing quote, the
+        # colon, then the number.
+        match = re.search(r'protocol"?\s*:\s*(\d+)', text)
+        if match is None:
             raise RuntimeError(
-                f"could not determine herdr protocol from its version report "
-                f"({proc.stdout.decode(errors='replace')!r}): {exc}."
-            ) from exc
+                f"could not determine herdr protocol from its 'api schema' report "
+                f"({text!r}). Ensure {cls._command_prefix()[0]!r} is a working herdr "
+                f"binary (override with {cls.BIN_ENV_VAR})."
+            )
+        protocol = int(match.group(1))
         if protocol < cls.MIN_PROTOCOL:
             raise RuntimeError(
                 f"herdr protocol {protocol} is unsupported: the herdr backend "
                 f"requires protocol >= {cls.MIN_PROTOCOL} (binary "
-                f"{cls._command_prefix()[0]!r}, version "
-                f"{report.get('version', 'unknown')!r}). Upgrade herdr."
+                f"{cls._command_prefix()[0]!r}). Upgrade herdr."
             )
 
     @classmethod
@@ -1668,6 +1761,10 @@ class HerdrBackend(TerminalBackend):
         self._workspace_id: str | None = None
         self._tab_id: str | None = None
         self._pane_id: str | None = None
+        # Last plain snapshot seen by :meth:`busy_state`, for the output-diff
+        # corroboration heuristic (native ``agent_status`` reads idle during long
+        # foreground tool calls, so a changing screen overrides a native idle).
+        self._last_activity_snapshot: str | None = None
 
     # ------------------------------------------------------------- derivation
 
@@ -1727,22 +1824,36 @@ class HerdrBackend(TerminalBackend):
     def _translate_key(cls, key: str) -> str | None:
         """Translate an Omnigent neutral key name into herdr's key syntax.
 
-        Minimal but correct for the keys session lifecycle needs
-        (``Enter``/``Escape``/``C-c``). herdr uses plus-notation for chords
-        (``ctrl+c``, ``alt+x``) rather than tmux's ``C-x`` dash form, and lacks
-        Home/End/PageUp/PageDown/Delete/Insert; an unsupported key is skipped
-        (returns ``None``) rather than sent as a wrong key. The full translation
-        table (all modifier chords, ``shift+tab``) is ticket #12.
+        Omnigent's neutral vocabulary is tmux's key names (the seam contract);
+        herdr's is different, so every key is translated. The full table,
+        grounded in the spike's verified ``send-keys`` surface:
 
-        :param key: A neutral key name, e.g. ``"Enter"`` or ``"C-c"``.
+        - **Chords** use plus-notation, not tmux's dash form: ``C-x`` →
+          ``ctrl+x``, ``M-x`` → ``alt+x``, ``S-x`` → ``shift+x`` (herdr rejects
+          the dash form for everything except ``C-c``, but translating uniformly
+          means the accepted ``ctrl+c`` is always what we emit).
+        - **Renamed named keys** (:data:`_KEY_RENAMES`): ``BSpace`` →
+          ``Backspace`` (herdr rejects ``BSpace``), ``BTab`` → ``shift+tab``.
+        - **Pass-through named keys** herdr shares with Omnigent:
+          ``Enter``/``Escape``/``Tab``/``Space``/``Up``/``Down``/``Left``/
+          ``Right``/``F1``.. — returned unchanged.
+        - **Unsupported keys** (:data:`_UNSUPPORTED_KEYS`:
+          Home/End/PageUp/PageDown/Delete/Insert and their tmux aliases) are
+          skipped (returns ``None``) rather than sent as a wrong key.
+
+        :param key: A neutral key name, e.g. ``"Enter"``, ``"C-c"``, ``"BTab"``.
         :returns: The herdr key token, or ``None`` to skip an unsupported key.
         """
         if key in cls._UNSUPPORTED_KEYS:
             return None
+        if key in cls._KEY_RENAMES:
+            return cls._KEY_RENAMES[key]
         if key.startswith("C-") and len(key) > 2:
             return "ctrl+" + key[2:]
         if key.startswith("M-") and len(key) > 2:
             return "alt+" + key[2:]
+        if key.startswith("S-") and len(key) > 2:
+            return "shift+" + key[2:]
         return key
 
     # ------------------------------------------------------------- CLI plumbing
@@ -1903,17 +2014,29 @@ class HerdrBackend(TerminalBackend):
             with contextlib.suppress(RuntimeError):
                 await self._run("workspace", "close", "--workspace", husk_id)
 
+    def _pane_argv(self, action: str, *args: str) -> list[str]:
+        """Build a ``pane <action> <pane-id> [args...]`` suffix (no session prefix).
+
+        The pane id is a **positional** argument immediately after the action —
+        the spike-verified form (``pane read w1:p1 ...``, ``pane get <id>``,
+        ``pane send-text <id> <text>``, ``pane send-keys <id> <key...>``), not a
+        ``--pane <id>`` flag. Centralized here so every pane subcommand addresses
+        the pane identically. Returns only the subcommand suffix; callers that
+        run through :meth:`_run` / :meth:`_run_output` get the leading
+        ``--session`` prefix prepended for them, while direct-``subprocess``
+        callers wrap it with :meth:`_base_argv` themselves.
+        """
+        return ["pane", action, self._pane_id or "", *args]
+
     def _pane_get_argv(self) -> list[str]:
-        """Build the ``pane get`` argv used by both liveness probes."""
-        return [
-            *self._base_argv(),
-            "pane",
-            "get",
-            "--pane",
-            self._pane_id or "",
-            "--format",
-            "json",
-        ]
+        """Build the full ``pane get`` argv used by both liveness probes.
+
+        ``--format json`` requests the structured verdict the liveness mapping
+        parses (see :meth:`_interpret_pane_get`); the pane id is positional. This
+        one carries the ``--session`` prefix because it is handed straight to
+        ``subprocess`` (not through :meth:`_run`).
+        """
+        return [*self._base_argv(), *self._pane_argv("get", "--format", "json")]
 
     @classmethod
     def _interpret_pane_get(cls, returncode: int | None, stdout: bytes) -> Liveness:
@@ -2003,44 +2126,206 @@ class HerdrBackend(TerminalBackend):
     async def send_text(self, text: str) -> None:
         """Type literal *text* into the pane WITHOUT submitting it.
 
-        Delivered via the CLI's stdin (``pane send-text``), not argv, so a
-        multi-line paste needs no chunking and never hits the Windows command-
-        line length limit — herdr writes it verbatim and non-submitting.
+        Delivered as the positional ``<text>`` argument of ``pane send-text``
+        (the spike-verified form, which landed a multi-line payload as a
+        non-submitting draft with full Unicode fidelity). No trailing newline is
+        implied, so a multi-line paste arrives intact for the caller to submit
+        separately via :meth:`send_keys`.
+
+        .. note::
+            The whole paste rides in one argv element (no shell — the argv is
+            handed straight to the OS spawn), so quoting/newlines are never an
+            issue, but a *very* large paste is bounded by the OS command-line
+            length limit. #11 delivered the text on stdin to sidestep that cap;
+            the spike only verified the positional form, so we adopt it here and
+            leave any stdin/chunking fallback for very large pastes to #13's
+            real-herdr validation (``pane send-text`` reading stdin is
+            unverified).
         """
-        await self._run(
-            "pane", "send-text", "--pane", self._pane_id or "", stdin_data=text.encode("utf-8")
-        )
+        await self._run(*self._pane_argv("send-text", text))
 
     async def send_keys(self, keys: Sequence[str]) -> None:
         """Press named keys, translating each into herdr's key syntax.
 
-        See :meth:`_translate_key`: chords become plus-notation and unsupported
-        keys are skipped. A keystroke set that translates to nothing is a no-op.
+        Keys are positional after the pane id (``pane send-keys <id> <key...>``).
+        See :meth:`_translate_key`: chords become plus-notation, some named keys
+        are renamed, and unsupported keys are skipped. A keystroke set that
+        translates to nothing is a no-op.
         """
         wire = [translated for key in keys if (translated := self._translate_key(key)) is not None]
         if wire:
-            await self._run("pane", "send-keys", "--pane", self._pane_id or "", *wire)
+            await self._run(*self._pane_argv("send-keys", *wire))
 
     async def capture(self, *, ansi: bool = False, scrollback: int = 0) -> str:
         """Snapshot the pane via ``pane read``, normalizing CRLF → ``\\n``.
 
-        ANSI passthrough is off by default. ``scrollback`` is forwarded but the
-        min-line-count snapshot hardening is #12.
+        ANSI passthrough is off by default (``--format text`` vs ``--format
+        ansi`` — the spike-verified flag; ``--format ansi`` preserves 256-color
+        SGR for the browser feed). See :meth:`_read_argv` for the source /
+        min-line-count strategy; ``scrollback`` history is tailed locally to the
+        requested size (:meth:`_tail_lines`).
         """
-        return self._normalize_newlines(await self._run_output(*self._read_argv(ansi, scrollback)))
+        raw = self._normalize_newlines(await self._run_output(*self._read_argv(ansi, scrollback)))
+        return self._tail_lines(raw, scrollback)
 
     def capture_sync(self, *, ansi: bool = False, scrollback: int = 0) -> str:
         """Synchronous :meth:`capture` for the threaded idle watcher."""
-        return self._normalize_newlines(self._run_output_sync(*self._read_argv(ansi, scrollback)))
+        raw = self._normalize_newlines(self._run_output_sync(*self._read_argv(ansi, scrollback)))
+        return self._tail_lines(raw, scrollback)
 
     def _read_argv(self, ansi: bool, scrollback: int) -> list[str]:
-        """Build the ``pane read`` argv for a snapshot."""
-        args = ["pane", "read", "--pane", self._pane_id or ""]
-        if ansi:
-            args.append("--ansi")
+        """Build the ``pane read`` argv for a snapshot (spike-verified surface).
+
+        - ``--format text`` / ``--format ansi`` selects plain vs SGR-preserving
+          output (never ``--ansi``; that was a #11 placeholder).
+        - ``scrollback == 0`` reads ``--source visible`` — the current viewport,
+          which herdr returns whole regardless of ``--lines`` — matching tmux's
+          ``capture-pane`` default.
+        - ``scrollback > 0`` reads ``--source recent-unwrapped`` (logical,
+          non-wrapped lines) with ``--lines`` set to *at least*
+          :data:`_SNAPSHOT_MIN_FETCH_LINES` (the min-line-count workaround:
+          fetch large so a small-N read can never come back empty), then
+          :meth:`capture` tails the result to ``scrollback`` lines locally.
+        """
+        extra = ["--format", "ansi" if ansi else "text"]
         if scrollback > 0:
-            args.extend(["--scrollback", str(scrollback)])
-        return args
+            extra += ["--source", "recent-unwrapped"]
+            extra += ["--lines", str(max(scrollback, self._SNAPSHOT_MIN_FETCH_LINES))]
+        else:
+            extra += ["--source", "visible"]
+        return self._pane_argv("read", *extra)
+
+    @staticmethod
+    def _tail_lines(text: str, scrollback: int) -> str:
+        """Keep only the last *scrollback* lines of *text* (local tail).
+
+        The min-line-count workaround over-fetches (see :meth:`_read_argv`), so a
+        ``scrollback > 0`` request is narrowed back to the caller's size here. A
+        ``scrollback <= 0`` request (visible viewport) is returned unchanged — the
+        viewport is already exactly what the caller asked for.
+        """
+        if scrollback <= 0:
+            return text
+        # Split off a single trailing newline so it is not counted as an empty
+        # final line, then restore it, so a captured screen that ends in "\n"
+        # tails to the same visible line count a caller expects.
+        trailing = "\n" if text.endswith("\n") else ""
+        body = text[: -len(trailing)] if trailing else text
+        lines = body.split("\n")
+        if len(lines) <= scrollback:
+            return text
+        return "\n".join(lines[-scrollback:]) + trailing
+
+    # ------------------------------------------------------------- busy / ready
+
+    async def _agent_status(self) -> str | None:
+        """Return the pane's native ``agent_status`` string, or ``None``.
+
+        Read from ``pane get --format json`` (the spike found herdr's native
+        agent detection populates a pane ``agent_status`` of
+        ``idle``/``working``/``blocked``/``done``/``unknown``). ``None`` on any
+        failure — a gone pane, an unspawnable CLI, unparseable output, or a
+        missing field — so callers treat it as "no native signal" rather than
+        crashing.
+
+        .. note::
+            This reads the field at the top level of the parsed JSON, matching
+            the fake's simplified ``pane get`` shape that #11's
+            :meth:`_interpret_pane_get` also relies on. The real binary nests it
+            one deeper — ``{"id": "cli:pane.get", "result": {"pane":
+            {"agent_status": ...}, "type": ...}}`` (agent_status at
+            ``.result.pane.agent_status``). The whole ``pane get`` envelope
+            (liveness result codes AND this path) is one #13 reconciliation
+            unit; both are fixed together against real herdr there, so they are
+            deliberately kept on the same simplified shape here.
+        """
+        import json
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self._pane_get_argv(),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=self._CLI_TIMEOUT_S)
+        except (OSError, asyncio.TimeoutError):
+            return None
+        if proc.returncode != 0:
+            return None
+        try:
+            data = json.loads(self._normalize_newlines(stdout.decode(errors="replace")))
+        except ValueError:
+            return None
+        status = data.get("agent_status")
+        return status if isinstance(status, str) else None
+
+    async def busy_state(self) -> bool | None:
+        """Report whether the inner agent is mid-turn (busy), corroborated.
+
+        herdr's native ``agent_status`` is the primary signal, but the spike
+        found it reads *idle* during long foreground tool calls, so it is
+        corroborated with an output-diff of consecutive plain snapshots. The
+        truth table (native status vs. whether the screen changed since the last
+        call):
+
+        ===================  ==================  ==============  =============
+        native ``agent_status``  output changed?     no prior snap    verdict
+        ===================  ==================  ==============  =============
+        working / blocked    (ignored)           (ignored)       ``True``
+        idle / done          yes                 —               ``True``
+        idle / done          no                  —               ``False``
+        idle / done          —                   yes             ``False``
+        unknown / absent     yes                 —               ``True``
+        unknown / absent     no                  —               ``False``
+        unknown / absent     —                   yes             ``None``
+        ===================  ==================  ==============  =============
+
+        In words: a native *busy* status is authoritative. A native *idle*
+        status is trusted only until the screen contradicts it (a changing
+        screen under a native idle → the lying-idle case → busy). With no usable
+        native signal we fall back to output-diff alone; and with neither a
+        native signal nor a prior snapshot to diff against, there is no signal at
+        all → ``None`` (unknown).
+
+        :returns: ``True`` (busy), ``False`` (idle), or ``None`` (no signal).
+        """
+        native = await self._agent_status()
+        current = await self.capture()
+        prior = self._last_activity_snapshot
+        self._last_activity_snapshot = current
+        changed = prior is not None and current != prior
+
+        if native in self._NATIVE_BUSY_STATES:
+            return True
+        if native in self._NATIVE_IDLE_STATES:
+            return changed
+        # No usable native signal: output-diff only, degrading to unknown when
+        # there is not even a prior snapshot to diff against.
+        if prior is None:
+            return None
+        return changed
+
+    async def input_ready(self) -> bool | None:
+        """Report whether the composer is ready to accept a new prompt.
+
+        The "delivery dance" (paste then submit) needs the composer idle at its
+        prompt, not mid-turn. Derived from the native ``agent_status`` alone
+        (readiness is a composer-state question, not an output-activity one):
+        ``idle``/``done`` → ready; ``working``/``blocked`` → not ready; no
+        native signal → ``None`` (unknown). A gone endpoint reads as not-ready
+        (``False``) rather than unknown, since input can never be delivered to
+        it.
+
+        :returns: ``True`` (ready), ``False`` (busy/gone), or ``None`` (unknown).
+        """
+        if await self.liveness() != Liveness.ALIVE:
+            return False
+        native = await self._agent_status()
+        if native in self._NATIVE_IDLE_STATES:
+            return True
+        if native in self._NATIVE_BUSY_STATES:
+            return False
+        return None
 
 
 # ---------------------------------------------------------------------------

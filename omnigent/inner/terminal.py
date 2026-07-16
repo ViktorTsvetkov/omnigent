@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import enum
 import logging
 import os
 import re
@@ -16,6 +17,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -711,45 +713,16 @@ def _terminals_tmp_root() -> Path:
 
 def reap_orphaned_terminals() -> int:
     """
-    Kill terminal tmux servers whose owning process is gone.
+    Kill orphaned terminal multiplexer servers at runner startup.
 
-    Terminal tmux servers are deliberately detached so they survive
-    transient client disconnects; graceful shutdown closes them
-    (``TerminalRegistry.shutdown``), but a SIGKILL'd runner — or one
-    whose whole process group is torn down by a test harness — leaks
-    them forever, one per session now that runner-bound SDK sessions
-    auto-create the embedded REPL terminal. Each instance dir records
-    its owner pid at creation; this sweep (run at runner startup) kills
-    the tmux server of every instance whose owner no longer exists and
-    removes the instance dir. Dirs without an owner-pid marker are left
-    untouched — they are either from an older version or not ours.
+    Thin module-level entry point (the runner imports this name) that
+    delegates orphan enumeration and reaping to the tmux backend — the
+    default backend today. See :meth:`TmuxBackend.reap_orphans` for the sweep
+    semantics.
 
     :returns: The number of orphaned instance dirs reaped.
     """
-    if not _tmux_available():
-        return 0
-    reaped = 0
-    for entry in _terminals_tmp_root().glob(f"{_TERMINAL_DIR_PREFIX}*"):
-        try:
-            pid = int((entry / _OWNER_PID_FILENAME).read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            continue
-        if _process_alive(pid):
-            continue
-        socket_path = entry / "tmux.sock"
-        if socket_path.exists():
-            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-                subprocess.run(
-                    ["tmux", "-S", str(socket_path), "kill-server"],
-                    # kill-server on an already-dead server exits non-zero;
-                    # that is the common case for half-torn-down orphans.
-                    check=False,
-                    capture_output=True,
-                    timeout=_REAP_KILL_TIMEOUT_S,
-                )
-        shutil.rmtree(entry, ignore_errors=True)
-        reaped += 1
-    return reaped
+    return TmuxBackend.reap_orphans()
 
 
 def build_terminal_os_env_spec(
@@ -843,6 +816,421 @@ def build_terminal_os_env_spec(
         effective_os_env_spec.sandbox = sandbox
 
     return effective_os_env_spec
+
+
+class Liveness(enum.Enum):
+    """
+    Uniform liveness verdict for a hosted terminal session.
+
+    Answers the two questions the terminal machinery needs about a managed
+    terminal — does the *host endpoint* (the multiplexer's session/pane) still
+    exist, and is the *inner agent process* inside it still running — as a
+    single verdict every backend can produce. Modeling it as a verdict rather
+    than a raw ``pane_dead`` flag lets callers degrade safely without
+    per-backend branching, and lets backends that cannot observe an inner
+    exit collapse it into :attr:`ENDPOINT_GONE`.
+
+    Deliberately carries no exit code: herdr drops the pane (and its final
+    screen) the instant the inner process exits, so no backend may promise
+    one. :attr:`UNKNOWN` is the safe-degradation verdict when a probe cannot
+    run — callers treat it as not-alive without asserting the endpoint is
+    gone.
+    """
+
+    ALIVE = "alive"
+    """The host endpoint exists and the inner process is still running."""
+
+    INNER_EXITED = "inner_exited"
+    """The inner process exited but the host kept the endpoint and its final
+    screen (tmux ``remain-on-exit``). Backends that cannot preserve a dead
+    endpoint report :attr:`ENDPOINT_GONE` on exit instead."""
+
+    ENDPOINT_GONE = "endpoint_gone"
+    """The host endpoint (session / pane / server) no longer exists."""
+
+    UNKNOWN = "unknown"
+    """The probe could not determine liveness (it failed to run). Callers must
+    degrade safely — treat as not-alive without concluding the endpoint is
+    gone."""
+
+
+@dataclass(frozen=True)
+class TerminalBackendCapabilities:
+    """
+    Static capability declaration for a :class:`TerminalBackend`.
+
+    Read at backend-selection time (the terminal factory) and by machinery
+    above the seam. A feature a backend lacks degrades to a documented no-op:
+    callers read the flag and skip the feature rather than branching on the
+    backend's identity — a lesson imported from firstmate's backend contract.
+    """
+
+    native_popup: bool = False
+    """The backend can host a native popup over the pane (tmux's cost popup).
+    Where ``False`` the web approval card is the elicitation surface."""
+
+    start_on_attach: bool = False
+    """The backend can delay inner-command startup until the first client
+    attaches. Where ``False`` a backend watcher loop emulates it."""
+
+    native_busy_state: bool = False
+    """The backend exposes a native agent busy/idle signal. Where ``False``
+    the capture-diff idle watcher is the only truth."""
+
+    push_events: bool = False
+    """The backend can push output/state deltas over a control channel. Where
+    ``False`` polling is the truth."""
+
+    control_mode_attach: bool = False
+    """The backend offers a control-mode attach transport in addition to a
+    PTY attach (tmux ``-C``)."""
+
+
+@dataclass(frozen=True)
+class TerminalLaunchRequest:
+    """
+    Backend-neutral request to launch one hosted terminal session.
+
+    Speaks omnigent domain terms — a command argv, a working directory, an
+    environment, a viewport — plus cross-backend behavioral options. The
+    caller has already resolved everything process-shaped (sandbox/egress
+    wrapping of :attr:`command`, environment merging and leak-stripping of
+    :attr:`env`); the backend only hosts it. Options a backend cannot honor
+    degrade per its :class:`TerminalBackendCapabilities`.
+    """
+
+    command: list[str]
+    """The already-resolved argv to run inside the hosted pane. Hosted
+    verbatim."""
+
+    cwd: str
+    """Working directory for the inner process."""
+
+    env: dict[str, str]
+    """Full environment for the inner process (already merged and stripped)."""
+
+    size: tuple[int, int] = (80, 24)
+    """Initial viewport as ``(cols, rows)``. Deliberately small so the first
+    client attach grows it losslessly."""
+
+    scrollback: int = 10000
+    """Lines of scrollback history the host should retain."""
+
+    keep_alive_after_exit: bool = False
+    """Keep the host endpoint alive after the inner process exits so its final
+    screen stays capturable and liveness reports :attr:`Liveness.INNER_EXITED`
+    rather than racing endpoint teardown. Backends that cannot preserve a dead
+    endpoint ignore this and report :attr:`Liveness.ENDPOINT_GONE` on exit."""
+
+    allow_passthrough: bool = False
+    """Allow the inner program to drive the host terminal via passthrough
+    escapes. Ignored by backends without a passthrough concept."""
+
+    start_on_attach: bool = False
+    """Delay inner-command startup until the first client attaches. Needs the
+    :attr:`TerminalBackendCapabilities.start_on_attach` capability; otherwise
+    the backend emulates or ignores it."""
+
+    status_link: str | None = None
+    """Cosmetic conversation link to seed the host's status line, or ``None``.
+    Purely decorative; backends without a status line ignore it."""
+
+
+class TerminalBackend(ABC):
+    """
+    Backend interface for a terminal multiplexer's *session lifecycle*.
+
+    One instance backs one :class:`TerminalInstance` and owns how that
+    terminal's hosting endpoint is created on a specific multiplexer (tmux
+    today, herdr next), probed for liveness, and torn down. The machinery
+    above the seam — the registry, the ``sys_terminal`` tools, the native
+    bridges, the web attach routes — talks only to the
+    :class:`TerminalInstance` public surface and never to a multiplexer
+    directly. The factory is the single point that selects a backend.
+
+    **Scope: lifecycle only.** This revision covers launch, liveness, close,
+    and the class-level orphan sweep. Input delivery (send-keys / paste),
+    screen capture, and idle-watching still live on :class:`TerminalInstance`
+    and move behind this seam in a later change, which will grow this
+    interface with those methods and their capability flags.
+    """
+
+    name: str
+    """Stable backend identifier, e.g. ``"tmux"``. Selection fails loudly on
+    an unknown name."""
+
+    capabilities: TerminalBackendCapabilities
+    """Static capability declaration, checked at selection time."""
+
+    platforms: frozenset[str]
+    """Platform tags the backend supports (``"posix"`` / ``"windows"``)."""
+
+    @abstractmethod
+    async def launch(self, request: TerminalLaunchRequest) -> None:
+        """Create the hosted session/pane and start the inner command.
+
+        :param request: The backend-neutral launch request.
+        :raises RuntimeError: If the multiplexer rejects the launch.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def liveness(self) -> Liveness:
+        """Probe the hosted session's liveness as a :class:`Liveness` verdict.
+
+        Pure: never mutates caller state. Returns :attr:`Liveness.UNKNOWN`
+        when the probe itself cannot run.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def liveness_sync(self) -> Liveness:
+        """Synchronous sibling of :meth:`liveness` for callers without an
+        event loop (the threaded idle watcher). Same verdict semantics."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def close(self) -> None:
+        """Tear down the hosted session/server. Idempotent; must not raise."""
+        raise NotImplementedError
+
+
+class TmuxBackend(TerminalBackend):
+    """
+    tmux session-lifecycle backend.
+
+    Hosts each managed terminal in its own private tmux server (isolated
+    socket, no user ``~/.tmux.conf``). Owns launch, liveness, close, and the
+    class-level orphan sweep, translating the backend-neutral
+    :class:`TerminalLaunchRequest` into a tmux ``new-session`` plus option
+    argv. All tmux vocabulary — the socket path, ``-t`` targets, ``-F``
+    formats, ``#{pane_dead}`` — is confined to this class.
+
+    The instance's low-level capture/input helpers still build their own tmux
+    argv from :attr:`TerminalInstance.socket_path` for now; those move behind
+    this backend when input/capture are extracted.
+    """
+
+    name = "tmux"
+    capabilities = TerminalBackendCapabilities(
+        native_popup=True,
+        start_on_attach=True,
+        native_busy_state=False,
+        push_events=False,
+        control_mode_attach=True,
+    )
+    # tmux is POSIX-only; native Windows uses a different backend (the factory
+    # still hard-raises on Windows until backend selection lands).
+    platforms = frozenset({"posix"})
+
+    def __init__(
+        self,
+        *,
+        socket_path: Path,
+        target: str = "main",
+        config_path: str = _TMUX_CONFIG_PATH,
+    ) -> None:
+        """
+        :param socket_path: Private tmux socket path for this instance's
+            server.
+        :param target: Session/pane target name, e.g. ``"main"``.
+        :param config_path: tmux config file to load, ``os.devnull`` so a
+            managed session never inherits the user's ``~/.tmux.conf``.
+        """
+        self._socket_path = socket_path
+        self._target = target
+        self._config_path = config_path
+
+    def _base_cmd(self) -> list[str]:
+        """Build the tmux argv prefix for this instance's private server."""
+        return ["tmux", "-S", str(self._socket_path), "-f", self._config_path]
+
+    async def _run(self, *args: str) -> None:
+        """Run a tmux command against this server; raise on non-zero exit."""
+        proc = await asyncio.create_subprocess_exec(
+            *self._base_cmd(),
+            *args,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"tmux command failed: {' '.join(args)}: {stderr.decode().strip()}")
+
+    async def launch(self, request: TerminalLaunchRequest) -> None:
+        """Create the private tmux server and single session for *request*."""
+        inner_str = " ".join(_shell_quote(c) for c in request.command)
+        if request.start_on_attach:
+            inner_str = f"tmux wait-for {_TMUX_START_ON_ATTACH_CHANNEL}; exec {inner_str}"
+
+        option_commands = [
+            *_tmux_managed_option_commands(
+                request.scrollback,
+                allow_passthrough=request.allow_passthrough,
+                keep_alive_after_exit=request.keep_alive_after_exit,
+            ),
+            [
+                "set-option",
+                "-g",
+                _TMUX_CONVERSATION_LINK_OPTION,
+                request.status_link or _TMUX_EMPTY_OPTION_VALUE,
+            ],
+        ]
+        if request.start_on_attach:
+            option_commands.append(
+                [
+                    "set-hook",
+                    "-g",
+                    "client-attached",
+                    f"wait-for -S {_TMUX_START_ON_ATTACH_CHANNEL}",
+                ]
+            )
+        # ``pane-died`` is a window-scope hook that fires when remain-on-exit
+        # keeps the pane alive after the inner process exits. It is set AFTER
+        # new-session (not before) because window scope requires an existing
+        # window, and global scope (-g) does not fire for pane-died.
+        pane_died_hook: list[list[str]] = (
+            [["set-hook", "-w", "pane-died", "detach-client -a"]]
+            if request.keep_alive_after_exit
+            else []
+        )
+        cols, rows = request.size
+        cmd = [
+            *self._base_cmd(),
+            *_tmux_command_sequence(
+                [
+                    *option_commands,
+                    [
+                        "new-session",
+                        "-d",
+                        "-s",
+                        self._target,
+                        # Deliberately small: first attach GROWS (lossless).
+                        # The old 200x50 meant first attach SHRANK, and ink's
+                        # cursor-up repaint (counted in unwrapped rows)
+                        # stitched frames into rewrapped debris — garbled text.
+                        "-x",
+                        str(cols),
+                        "-y",
+                        str(rows),
+                        "-c",
+                        request.cwd,
+                        inner_str,
+                    ],
+                    *pane_died_hook,
+                ]
+            ),
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            env=request.env,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"tmux launch failed (rc={proc.returncode}): {stderr.decode().strip()}"
+            )
+
+    async def liveness(self) -> Liveness:
+        """Probe ``#{pane_dead}`` and map it to a :class:`Liveness` verdict.
+
+        ``list-panes`` errors on an unknown target (unlike ``display-message``,
+        which silently falls back to another pane), so a non-zero exit is a
+        reliable "session/server gone" signal.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self._base_cmd(),
+                "list-panes",
+                "-t",
+                self._target,
+                "-F",
+                "#{pane_dead}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await proc.communicate()
+        except OSError:
+            return Liveness.UNKNOWN
+        return self._verdict(proc.returncode, stdout.decode())
+
+    def liveness_sync(self) -> Liveness:
+        """Synchronous :meth:`liveness` for the daemon idle-watcher thread."""
+        try:
+            proc = subprocess.run(
+                [*self._base_cmd(), "list-panes", "-t", self._target, "-F", "#{pane_dead}"],
+                capture_output=True,
+                check=False,
+            )
+        except OSError:
+            return Liveness.UNKNOWN
+        return self._verdict(proc.returncode, proc.stdout.decode())
+
+    @staticmethod
+    def _verdict(returncode: int | None, stdout: str) -> Liveness:
+        """Map a ``list-panes -F #{pane_dead}`` result to a verdict.
+
+        rc != 0 or no panes → the session/server is gone; a ``1`` line → the
+        pane process exited but ``remain-on-exit`` kept the session; a ``0``
+        line → the pane is live.
+        """
+        panes = stdout.split()
+        if returncode != 0 or not panes:
+            return Liveness.ENDPOINT_GONE
+        if "1" in panes:
+            return Liveness.INNER_EXITED
+        return Liveness.ALIVE
+
+    async def close(self) -> None:
+        """Kill the private tmux server. Suppresses the already-gone case."""
+        with contextlib.suppress(RuntimeError):
+            await self._run("kill-server")
+
+    @classmethod
+    def reap_orphans(cls) -> int:
+        """
+        Kill terminal tmux servers whose owning process is gone.
+
+        Terminal tmux servers are deliberately detached so they survive
+        transient client disconnects; graceful shutdown closes them
+        (``TerminalRegistry.shutdown``), but a SIGKILL'd runner — or one whose
+        whole process group is torn down by a test harness — leaks them
+        forever, one per session now that runner-bound SDK sessions
+        auto-create the embedded REPL terminal. Each instance dir records its
+        owner pid at creation; this sweep (run at runner startup) kills the
+        tmux server of every instance whose owner no longer exists and removes
+        the instance dir. Dirs without an owner-pid marker are left untouched
+        — they are either from an older version or not ours.
+
+        :returns: The number of orphaned instance dirs reaped.
+        """
+        if not _tmux_available():
+            return 0
+        reaped = 0
+        for entry in _terminals_tmp_root().glob(f"{_TERMINAL_DIR_PREFIX}*"):
+            try:
+                pid = int((entry / _OWNER_PID_FILENAME).read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                continue
+            if _process_alive(pid):
+                continue
+            socket_path = entry / "tmux.sock"
+            if socket_path.exists():
+                with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                    subprocess.run(
+                        ["tmux", "-S", str(socket_path), "kill-server"],
+                        # kill-server on an already-dead server exits non-zero;
+                        # that is the common case for half-torn-down orphans.
+                        check=False,
+                        capture_output=True,
+                        timeout=_REAP_KILL_TIMEOUT_S,
+                    )
+            shutil.rmtree(entry, ignore_errors=True)
+            reaped += 1
+        return reaped
 
 
 @dataclass
@@ -946,6 +1334,18 @@ class TerminalInstance:
     # not read as agent activity. ``-inf`` until the first interaction.
     _last_client_interaction_at: float = field(default=float("-inf"), repr=False)
     _last_pane_snapshot: str | None = field(default=None, repr=False)
+    # Multiplexer lifecycle backend. Built in ``__post_init__`` from
+    # ``socket_path`` (tmux is the only backend today), so every existing
+    # construction path — including tests that build ``TerminalInstance``
+    # directly — gets one without a signature change. Lifecycle operations
+    # (launch, liveness, close, reaping) route through it; capture/input/idle
+    # still use the instance's own tmux helpers until they move behind the
+    # backend too.
+    _backend: TerminalBackend = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Wire up the tmux lifecycle backend for this instance's socket."""
+        self._backend = TmuxBackend(socket_path=self.socket_path, target=self.tmux_target)
 
     @property
     def tmux_target(self) -> str:
@@ -1085,79 +1485,23 @@ class TerminalInstance:
             inner_cmd = [launcher_path, *self.args]
         else:
             inner_cmd = [self.command, *self.args]
-        inner_str = " ".join(_shell_quote(c) for c in inner_cmd)
-        if self.tmux_start_on_attach:
-            inner_str = f"tmux wait-for {_TMUX_START_ON_ATTACH_CHANNEL}; exec {inner_str}"
-
-        option_commands = [
-            *_tmux_managed_option_commands(
-                self.scrollback,
-                allow_passthrough=self.tmux_allow_passthrough,
+        # Hand the resolved command + environment to the multiplexer backend,
+        # which owns session/pane creation and the tmux option translation.
+        # The behavioral toggles (keep-alive-after-exit, start-on-attach,
+        # passthrough, the cosmetic status link) travel as backend-neutral
+        # request fields.
+        await self._backend.launch(
+            TerminalLaunchRequest(
+                command=inner_cmd,
+                cwd=effective_cwd,
+                env=env,
+                scrollback=self.scrollback,
                 keep_alive_after_exit=self.keep_alive_after_exit,
-            ),
-            [
-                "set-option",
-                "-g",
-                _TMUX_CONVERSATION_LINK_OPTION,
-                self.conversation_link or _TMUX_EMPTY_OPTION_VALUE,
-            ],
-        ]
-        if self.tmux_start_on_attach:
-            option_commands.append(
-                [
-                    "set-hook",
-                    "-g",
-                    "client-attached",
-                    f"wait-for -S {_TMUX_START_ON_ATTACH_CHANNEL}",
-                ]
+                allow_passthrough=self.tmux_allow_passthrough,
+                start_on_attach=self.tmux_start_on_attach,
+                status_link=self.conversation_link,
             )
-        # ``pane-died`` is a window-scope hook that fires when remain-on-exit
-        # keeps the pane alive after the inner process exits. We need to set
-        # it AFTER new-session (not before) because window scope requires an
-        # existing window, and global scope (-g) does not fire for pane-died.
-        pane_died_hook: list[list[str]] = (
-            [["set-hook", "-w", "pane-died", "detach-client -a"]]
-            if self.keep_alive_after_exit
-            else []
         )
-        cmd = [
-            *self._tmux_base_cmd(),
-            *_tmux_command_sequence(
-                [
-                    *option_commands,
-                    [
-                        "new-session",
-                        "-d",
-                        "-s",
-                        self.tmux_target,
-                        # Deliberately small: first attach GROWS (lossless).
-                        # The old 200x50 meant first attach SHRANK, and ink's
-                        # cursor-up repaint (counted in unwrapped rows)
-                        # stitched frames into rewrapped debris — garbled text.
-                        "-x",
-                        "80",
-                        "-y",
-                        "24",
-                        "-c",
-                        effective_cwd,
-                        inner_str,
-                    ],
-                    *pane_died_hook,
-                ]
-            ),
-        ]
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"tmux launch failed (rc={proc.returncode}): {stderr.decode().strip()}"
-            )
 
         self.running = True
         self.launch_cwd = effective_cwd
@@ -1312,8 +1656,7 @@ class TerminalInstance:
         self._stop_idle_watcher_thread()
 
         if self.running:
-            with contextlib.suppress(RuntimeError):
-                await self._tmux("kill-server")
+            await self._backend.close()
             self.running = False
 
         if self.os_env is not None:
@@ -1642,18 +1985,13 @@ class TerminalInstance:
         to report the exit deterministically once ``capture-pane`` still
         succeeds against the surviving server.
 
-        :returns: ``True`` when tmux reports ``#{pane_dead}`` as ``1``.
-            ``False`` when the pane is live, or when the probe itself fails
-            (server already gone) — the caller's capture step already handles
-            the vanished-server path.
+        :returns: ``True`` when the backend reports the inner process exited
+            with the endpoint kept (:attr:`Liveness.INNER_EXITED`). ``False``
+            when the pane is live, or when the probe fails / the server is
+            already gone — the caller's capture step handles the
+            vanished-server path.
         """
-        try:
-            out = self._tmux_output_sync(
-                "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead}"
-            )
-        except RuntimeError:
-            return False
-        return "1" in out.split()
+        return self._backend.liveness_sync() is Liveness.INNER_EXITED
 
     def _fire_watch_callback(self, callback: Callable[[], None], kind: str) -> bool:
         """
@@ -1724,46 +2062,25 @@ class TerminalInstance:
         """
         if not self.running:
             return False
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *self._tmux_base_cmd(),
-                "list-panes",
-                "-t",
-                self.tmux_target,
-                "-F",
-                "#{pane_dead}",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            stdout, _ = await proc.communicate()
-            # rc != 0 → session/server gone; a "1" line → the pane process
-            # exited but the session was kept alive by remain-on-exit. Both mean
-            # not-alive. (``list-panes`` errors on an unknown target, unlike
-            # ``display-message``, which silently falls back to another pane.)
-            panes = stdout.decode().split()
-            if proc.returncode != 0 or not panes or "1" in panes:
-                self.running = False
-                return False
+        # The backend's verdict distinguishes endpoint-gone from inner-exited
+        # from a failed probe; any non-``ALIVE`` verdict means not-alive and
+        # flips ``running`` off so later pollers short-circuit without
+        # re-forking the multiplexer.
+        if await self._backend.liveness() is Liveness.ALIVE:
             return True
-        except OSError:
-            self.running = False
-            return False
+        self.running = False
+        return False
 
     async def _pane_is_dead_async(self) -> bool:
         """
         Async sibling of :meth:`_pane_is_dead` for the asyncio idle watcher.
 
-        :returns: ``True`` when tmux reports ``#{pane_dead}`` as ``1``;
-            ``False`` when the pane is live or the probe fails (server gone,
-            which the caller's capture step handles).
+        :returns: ``True`` when the backend reports
+            :attr:`Liveness.INNER_EXITED`; ``False`` when the pane is live or
+            the probe fails (server gone, which the caller's capture step
+            handles).
         """
-        try:
-            out = await self._tmux_output(
-                "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead}"
-            )
-        except RuntimeError:
-            return False
-        return "1" in out.split()
+        return await self._backend.liveness() is Liveness.INNER_EXITED
 
     async def _tmux(self, *args: str) -> None:
         """Run a tmux command against this instance's server."""

@@ -1001,6 +1001,34 @@ class TerminalBackend(ABC):
         """
         del cls  # base no-op; binary-backed backends override this
 
+    @classmethod
+    def construct_for_instance(cls, *, socket_path: Path, target: str) -> TerminalBackend | None:
+        """Optional construction hook used by :func:`_construct_terminal_backend`.
+
+        Each backend takes different constructor arguments, so a
+        :class:`TerminalInstance` cannot build one with a uniform call. Rather
+        than grow a per-backend ``if`` ladder in
+        :func:`_construct_terminal_backend`, a backend that an instance must be
+        able to build declares *how* to build itself here: it returns a fresh
+        instance bound to this terminal's private endpoint (*socket_path*) and
+        *target*.
+
+        The default returns ``None``, meaning "this backend provides no
+        construction hook" — :func:`_construct_terminal_backend` then fails
+        loudly with :class:`NotImplementedError` rather than silently falling
+        back to another backend. tmux keeps its own dedicated branch in the
+        dispatcher (so its construction stays byte-identical); the in-process
+        test :class:`FakeBackend` and the future ``HerdrBackend`` (#11) override
+        this and become constructible with no edit to the dispatcher.
+
+        :param socket_path: Private multiplexer socket path for this instance.
+        :param target: Session/pane target name, e.g. ``"main"``.
+        :returns: A fresh backend bound to this terminal, or ``None`` when the
+            backend has no construction hook.
+        """
+        del socket_path, target  # base: no hook; overriding backends build here
+        return None
+
     @abstractmethod
     async def launch(self, request: TerminalLaunchRequest) -> None:
         """Create the hosted session/pane and start the inner command.
@@ -1647,18 +1675,22 @@ def _construct_terminal_backend(name: str, *, socket_path: Path, target: str) ->
     """Construct the registered backend *name* for a terminal instance.
 
     The construction seam for :meth:`TerminalInstance.__post_init__`. Each
-    backend takes different constructor arguments, so this dispatches per
-    backend rather than calling a uniform constructor. tmux is the only
-    backend wired today; a new backend (herdr) adds its branch here when it
-    lands.
+    backend takes different constructor arguments, so this cannot call a uniform
+    constructor. tmux keeps its own dedicated branch (its construction stays
+    byte-identical); every other backend declares how to build itself via the
+    :meth:`TerminalBackend.construct_for_instance` hook, which this dispatcher
+    prefers when the backend overrides it. A backend that overrides neither path
+    (the base hook returns ``None``) fails loudly rather than falling back to
+    tmux — so herdr (#11) and the in-process ``FakeBackend`` become
+    constructible by overriding the hook, with no edit to this function.
 
     :param name: A registered backend name, e.g. ``"tmux"``.
     :param socket_path: Private multiplexer socket path for this instance.
     :param target: Session/pane target name, e.g. ``"main"``.
     :returns: A fresh backend instance bound to this terminal.
     :raises RuntimeError: When *name* is not registered.
-    :raises NotImplementedError: When *name* is registered but has no
-        constructor wired here yet.
+    :raises NotImplementedError: When *name* is registered but provides no
+        construction hook yet.
     """
     backend_cls = _TERMINAL_BACKENDS.get(name)
     if backend_cls is None:
@@ -1666,6 +1698,9 @@ def _construct_terminal_backend(name: str, *, socket_path: Path, target: str) ->
         raise RuntimeError(f"Unknown terminal backend {name!r}. Known backends: {known}.")
     if backend_cls is TmuxBackend:
         return TmuxBackend(socket_path=socket_path, target=target)
+    backend = backend_cls.construct_for_instance(socket_path=socket_path, target=target)
+    if backend is not None:
+        return backend
     raise NotImplementedError(
         f"terminal backend {name!r} is registered but its constructor is not "
         "wired into _construct_terminal_backend yet."

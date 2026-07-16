@@ -1562,13 +1562,19 @@ class HerdrBackend(TerminalBackend):
     exercised by the spike, which spawned programs via ``agent start`` and
     created panes as a side effect of ``workspace``/``tab create``; #13
     reconciles them against real herdr. The ``pane get`` envelope shape is a
-    known #13 item: the real binary wraps results as ``{"id": "cli:<verb>",
-    "result": {..., "type": "<verb>"}}`` (errors as ``{"error": {"code": ...}}``),
-    so liveness result codes (:meth:`_interpret_pane_get`) and the
-    ``.result.pane.agent_status`` path (:meth:`_agent_status`) both read a
-    simplified top-level shape here and are reconciled together there. ``pane
+    known #13 item: the real binary returns success as ``{"id": "cli:pane:get",
+    "result": {"pane": {"agent_status": ...}, "type": "pane_info"}}`` (``type``
+    is a semantic constant, not the verb) and a DEAD pane as an *error* envelope
+    ``{"error": {"code": "pane_not_found", ...}, "id": "cli:pane:get"}`` with
+    process exit code 1 — so ``pane_not_found`` + exit-1 is the ENDPOINT_GONE
+    signal, which #11's :meth:`_interpret_pane_get` currently maps to UNKNOWN (it
+    reads a simplified ``{"result": "alive"|"pane_not_found"}`` string). Liveness
+    result codes and the ``.result.pane.agent_status`` path (:meth:`_agent_status`)
+    read that simplified shape here and are reconciled together in #13. ``pane
     send-text`` reading a very large paste (the OS argv length cap — see
-    :meth:`send_text`) is also a #13 item. Explicit headless ``server``
+    :meth:`send_text`) is also a #13 item. (Write verbs printing nothing on
+    success and only an error envelope on failure is already matched: :meth:`_run`
+    ignores stdout and gates on exit code.) Explicit headless ``server``
     management and threading the inner process environment through that server
     are #15 integration concerns; see :meth:`launch`.
 

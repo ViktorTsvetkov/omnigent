@@ -1504,6 +1504,545 @@ class TmuxBackend(TerminalBackend):
         return reaped
 
 
+class HerdrBackend(TerminalBackend):
+    """
+    herdr multiplexer backend (native Windows).
+
+    Hosts each managed terminal in an omnigent-scoped herdr *session* (a
+    server-per-named-session), one durable-labeled *workspace* per terminal, one
+    *tab*/*pane* running the inner command. Every operation is driven purely
+    through the herdr **CLI as a subprocess** — no protocol library is linked or
+    vendored (a deliberate licensing posture) — and every invocation carries an
+    explicit ``--session`` (see :meth:`_base_argv`). All herdr vocabulary — the
+    ``--session`` target, ``workspace``/``tab``/``pane`` subcommands, plus-
+    notation keys (``ctrl+c``), ``--format json`` output, CRLF captures — is
+    confined to this class.
+
+    **Scope of this ticket (#11): session lifecycle.** launch (with husk
+    adopt/replace), liveness, close/kill, orphan reaping, geometry pinning,
+    Windows path translation, and CRLF stripping. Input delivery and capture are
+    implemented straightforwardly (the ABC requires them); their *quirk
+    hardening* — the full key-translation table, the min-line-count snapshot
+    workaround, and busy-state corroboration via ``agent_status`` — lands in
+    ticket #12. Explicit headless ``server`` management and threading the inner
+    process environment through that server are integration concerns for a later
+    change (#15); see :meth:`launch`.
+
+    **No remain-on-exit.** herdr auto-destroys a pane when its process exits and
+    the ``pane_exited`` event carries no exit code, so a dead endpoint cannot be
+    preserved: an inner exit maps to :attr:`Liveness.ENDPOINT_GONE` (there is no
+    reachable :attr:`Liveness.INNER_EXITED` for herdr) and
+    :attr:`TerminalLaunchRequest.keep_alive_after_exit` is ignored.
+    """
+
+    name = "herdr"
+    capabilities = TerminalBackendCapabilities(
+        # No native popup surface: the web approval card is the elicitation
+        # surface on Windows.
+        native_popup=False,
+        # start-on-attach is not modeled in #11 (no attach transport migrated
+        # yet); a watcher loop emulates delayed start where needed.
+        start_on_attach=False,
+        # herdr exposes a native agent busy/idle signal (``agent_status`` —
+        # claude auto-detected in the spike). The flag is declared now so
+        # machinery above the seam can prefer it; the actual wiring is #12.
+        native_busy_state=True,
+        # ``pane_output_changed`` events are reachable only via the session
+        # socket, not the CLI, so the CLI-only adapter cannot push deltas —
+        # polling is the truth here.
+        push_events=False,
+        # No control-mode attach transport is offered by the CLI adapter.
+        control_mode_attach=False,
+        # No host status line to carry the cosmetic conversation link, so
+        # :meth:`set_status_link` stays the inherited no-op (the link is
+        # droppable — the web UI is the primary surface).
+        status_line=False,
+    )
+    # The spike validated herdr on native Windows only; POSIX keeps tmux.
+    platforms = frozenset({"windows"})
+
+    # Env-var override for the herdr binary (see :meth:`_command_prefix`).
+    BIN_ENV_VAR = "OMNIGENT_HERDR_BIN"
+    DEFAULT_BIN = "herdr"
+    # Gate on the wire PROTOCOL number, not the version string: herdr's version
+    # moved (0.7.1 → 0.7.4-preview) without the protocol moving off 16, so the
+    # protocol is the stable compatibility axis.
+    MIN_PROTOCOL = 16
+    # omnigent-scoped prefixes so a derived session/label can NEVER collide with
+    # herdr's ``default`` session (the user's live panes).
+    _SESSION_PREFIX = "omnigent-"
+    _LABEL_PREFIX = "omnigent-ws-"
+    # A throwaway omnigent-scoped session for the version/protocol probe, so even
+    # the session-independent probe carries an explicit ``--session`` (uniform
+    # "never bare" posture — nothing the adapter emits can target ``default``).
+    _PROBE_SESSION = "omnigent-probe"
+    _CLI_TIMEOUT_S = 15.0
+    # Neutral key names herdr has no equivalent for; skipped rather than sent as
+    # a wrong key (the full table is #12).
+    _UNSUPPORTED_KEYS = frozenset({"Home", "End", "PageUp", "PageDown", "Delete", "Insert"})
+
+    @classmethod
+    def ensure_available(cls) -> None:
+        """Verify the herdr binary is present AND speaks a supported protocol.
+
+        Two distinct, loud, actionable failures: a missing/unspawnable binary
+        (names the binary and the :envvar:`OMNIGENT_HERDR_BIN` override), and an
+        unsupported wire protocol (names the binary, the protocol found, and the
+        minimum required). The protocol is discovered by running the CLI's
+        ``version`` report — a session-independent command, but still invoked
+        with an explicit ``--session`` (:data:`_PROBE_SESSION`) so the adapter
+        never emits a bare herdr subcommand.
+
+        :raises RuntimeError: When herdr is not installed/spawnable, when the
+            version probe fails or is unparseable, or when the reported protocol
+            is below :data:`MIN_PROTOCOL`.
+        """
+        import json
+
+        argv = [
+            *cls._command_prefix(),
+            "--session",
+            cls._PROBE_SESSION,
+            "version",
+            "--format",
+            "json",
+        ]
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, check=False, timeout=cls._CLI_TIMEOUT_S
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(
+                f"herdr is not installed or not spawnable ({cls._command_prefix()[0]!r}: "
+                f"{exc}). The herdr terminal backend hosts native Windows harnesses "
+                f"by driving the herdr CLI; install herdr and ensure it is on PATH, "
+                f"or point {cls.BIN_ENV_VAR} at the herdr binary."
+            ) from exc
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"herdr version probe failed (rc={proc.returncode}): "
+                f"{proc.stderr.decode(errors='replace').strip()}. Ensure "
+                f"{cls._command_prefix()[0]!r} is a working herdr binary "
+                f"(override with {cls.BIN_ENV_VAR})."
+            )
+        try:
+            report = json.loads(cls._normalize_newlines(proc.stdout.decode(errors="replace")))
+            protocol = int(report["protocol"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError(
+                f"could not determine herdr protocol from its version report "
+                f"({proc.stdout.decode(errors='replace')!r}): {exc}."
+            ) from exc
+        if protocol < cls.MIN_PROTOCOL:
+            raise RuntimeError(
+                f"herdr protocol {protocol} is unsupported: the herdr backend "
+                f"requires protocol >= {cls.MIN_PROTOCOL} (binary "
+                f"{cls._command_prefix()[0]!r}, version "
+                f"{report.get('version', 'unknown')!r}). Upgrade herdr."
+            )
+
+    @classmethod
+    def construct_for_instance(cls, *, socket_path: Path, target: str) -> TerminalBackend:
+        """Build a herdr backend bound to a terminal instance's endpoint.
+
+        The construction hook :func:`_construct_terminal_backend` prefers, so
+        herdr becomes constructible with no dispatcher edit (the seam the
+        in-process ``FakeBackend`` already uses).
+        """
+        return cls(socket_path=socket_path, target=target)
+
+    def __init__(self, *, socket_path: Path, target: str = "main") -> None:
+        """
+        :param socket_path: Private per-instance endpoint path. The herdr
+            ``--session`` name and workspace label are derived deterministically
+            from it (see :meth:`_session_name` / :meth:`_workspace_label`) so
+            they are unique per terminal and omnigent-scoped.
+        :param target: Session/pane target name, e.g. ``"main"``; folded into the
+            durable workspace label.
+        """
+        self._socket_path = socket_path
+        self._target = target
+        self._session = self._session_name(socket_path)
+        self._label = self._workspace_label(socket_path, target)
+        # Populated by :meth:`launch`; used by liveness/capture/input.
+        self._workspace_id: str | None = None
+        self._tab_id: str | None = None
+        self._pane_id: str | None = None
+
+    # ------------------------------------------------------------- derivation
+
+    @classmethod
+    def _session_name(cls, socket_path: Path) -> str:
+        """Derive this instance's omnigent-scoped herdr ``--session`` name.
+
+        A stable short hash of the private socket path: unique per terminal
+        instance and, by the :data:`_SESSION_PREFIX`, guaranteed distinct from
+        herdr's ``default`` session (the user's live panes).
+        """
+        import hashlib
+
+        digest = hashlib.sha1(str(socket_path).encode("utf-8")).hexdigest()[:12]
+        return f"{cls._SESSION_PREFIX}{digest}"
+
+    @classmethod
+    def _workspace_label(cls, socket_path: Path, target: str) -> str:
+        """Derive this terminal's durable workspace label.
+
+        Deterministic in ``(socket_path, target)`` so a restart that reuses the
+        same private endpoint sees the same label and can adopt/replace the
+        leftover as a husk (see :meth:`launch`). With per-launch socket paths the
+        label is effectively unique and husk adoption is a safe no-op.
+        """
+        import hashlib
+
+        slug = re.sub(r"[^A-Za-z0-9]+", "-", target).strip("-").lower() or "main"
+        digest = hashlib.sha1(str(socket_path).encode("utf-8")).hexdigest()[:12]
+        return f"{cls._LABEL_PREFIX}{digest}-{slug}"
+
+    @staticmethod
+    def _to_windows_path(cwd: str) -> str:
+        """Return *cwd* as a Windows-native (backslash, drive-letter) path.
+
+        herdr runs on native Windows and expects Windows-native paths; a
+        forward-slash spelling (from config or a POSIX default) is converted
+        deterministically via :class:`~pathlib.PureWindowsPath` — host-
+        independent, so it is unit-testable on any platform.
+        """
+        from pathlib import PureWindowsPath
+
+        return str(PureWindowsPath(cwd))
+
+    @staticmethod
+    def _normalize_newlines(text: str) -> str:
+        """Normalize CRLF/CR line endings to ``\\n``.
+
+        herdr captures on Windows carry CRLF; the backend strips that quirk so
+        callers above the seam never branch on line endings (the
+        :meth:`TerminalBackend.capture` contract). Applied to every parsed CLI
+        output, not just screen captures.
+        """
+        return text.replace("\r\n", "\n").replace("\r", "\n")
+
+    @classmethod
+    def _translate_key(cls, key: str) -> str | None:
+        """Translate an Omnigent neutral key name into herdr's key syntax.
+
+        Minimal but correct for the keys session lifecycle needs
+        (``Enter``/``Escape``/``C-c``). herdr uses plus-notation for chords
+        (``ctrl+c``, ``alt+x``) rather than tmux's ``C-x`` dash form, and lacks
+        Home/End/PageUp/PageDown/Delete/Insert; an unsupported key is skipped
+        (returns ``None``) rather than sent as a wrong key. The full translation
+        table (all modifier chords, ``shift+tab``) is ticket #12.
+
+        :param key: A neutral key name, e.g. ``"Enter"`` or ``"C-c"``.
+        :returns: The herdr key token, or ``None`` to skip an unsupported key.
+        """
+        if key in cls._UNSUPPORTED_KEYS:
+            return None
+        if key.startswith("C-") and len(key) > 2:
+            return "ctrl+" + key[2:]
+        if key.startswith("M-") and len(key) > 2:
+            return "alt+" + key[2:]
+        return key
+
+    # ------------------------------------------------------------- CLI plumbing
+
+    @classmethod
+    def _command_prefix(cls) -> list[str]:
+        """Return the argv prefix that invokes the herdr CLI.
+
+        Read from :envvar:`OMNIGENT_HERDR_BIN` at call time (default
+        ``"herdr"``). Normally a single binary path; tests point it at a scripted
+        fake by encoding a multi-token launcher as a JSON array (e.g.
+        ``'["/usr/bin/python", "/path/_fake_herdr.py"]'``) so an
+        interpreter+script can stand in for the binary without a ``.cmd``/PATHEXT
+        shim — unreliable under Windows ``CreateProcess``. A non-array value, a
+        JSON parse failure, or a non-string element falls back to treating the
+        whole value as one binary path.
+        """
+        import json
+
+        raw = os.environ.get(cls.BIN_ENV_VAR, cls.DEFAULT_BIN).strip() or cls.DEFAULT_BIN
+        if raw.startswith("["):
+            try:
+                tokens = json.loads(raw)
+            except json.JSONDecodeError:
+                return [raw]
+            if isinstance(tokens, list) and tokens and all(isinstance(t, str) for t in tokens):
+                return tokens
+        return [raw]
+
+    def _base_argv(self) -> list[str]:
+        """Return the herdr argv prefix carrying this instance's ``--session``.
+
+        Every invocation leads with ``--session <name>`` before the subcommand.
+        A bare herdr subcommand targets the ``default`` session — the user's LIVE
+        panes — and ambient targeting has destroyed live sessions in prior art;
+        the derived session name is omnigent-scoped so it can never be
+        ``default``.
+        """
+        return [*self._command_prefix(), "--session", self._session]
+
+    async def _run(self, *args: str, stdin_data: bytes | None = None) -> None:
+        """Run a herdr command against this session; raise on non-zero exit."""
+        proc = await asyncio.create_subprocess_exec(
+            *self._base_argv(),
+            *args,
+            stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate(stdin_data)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"herdr command failed: {' '.join(args)}: "
+                f"{self._normalize_newlines(stderr.decode(errors='replace')).strip()}"
+            )
+
+    async def _run_output(self, *args: str) -> str:
+        """Run a herdr command against this session and return its stdout."""
+        proc = await asyncio.create_subprocess_exec(
+            *self._base_argv(),
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"herdr command failed: {' '.join(args)}: "
+                f"{self._normalize_newlines(stderr.decode(errors='replace')).strip()}"
+            )
+        return stdout.decode(errors="replace")
+
+    async def _run_json(self, *args: str) -> dict[str, Any]:  # type: ignore[explicit-any]
+        """Run a herdr command whose args include ``--format json`` and parse it.
+
+        Callers place ``--format json`` themselves (never appended here) so it
+        can precede a trailing ``--command --`` without being swallowed as an
+        inner-command token.
+        """
+        import json
+
+        raw = await self._run_output(*args)
+        return json.loads(self._normalize_newlines(raw))
+
+    def _run_output_sync(self, *args: str) -> str:
+        """Synchronous sibling of :meth:`_run_output` for the threaded watcher."""
+        proc = subprocess.run(
+            [*self._base_argv(), *args],
+            capture_output=True,
+            check=False,
+            timeout=self._CLI_TIMEOUT_S,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"herdr command failed: {' '.join(args)}: "
+                f"{self._normalize_newlines(proc.stderr.decode(errors='replace')).strip()}"
+            )
+        return proc.stdout.decode(errors="replace")
+
+    # ---------------------------------------------------------------- protocol
+
+    async def launch(self, request: TerminalLaunchRequest) -> None:
+        """Create the workspace/tab/pane for *request* (adopt-or-replace husks).
+
+        Ordering is deliberately **create-before-close**: the fresh workspace and
+        its tab/pane are brought up FIRST, and only then are any same-label husks
+        (restart leftovers — herdr does not enforce label uniqueness) closed. A
+        crash mid-launch therefore never strands this terminal with zero
+        workspaces. Geometry is pinned from :attr:`TerminalLaunchRequest.size`
+        (headless herdr panes otherwise default to ~52 columns) and the cwd is
+        translated to a Windows-native path.
+
+        :attr:`~TerminalLaunchRequest.keep_alive_after_exit` is ignored (herdr
+        has no remain-on-exit). Threading the inner process environment
+        (``request.env``) through the per-session server is a #15 integration
+        concern; #11 pins geometry, cwd, and the command argv.
+
+        :param request: The backend-neutral launch request.
+        :raises RuntimeError: If herdr rejects the workspace/tab creation.
+        """
+        listing = await self._run_json("workspace", "list", "--format", "json")
+        husks = [
+            ws["id"]
+            for ws in listing.get("workspaces", [])
+            if ws.get("label") == self._label and ws.get("id") is not None
+        ]
+
+        created = await self._run_json(
+            "workspace", "create", "--label", self._label, "--format", "json"
+        )
+        self._workspace_id = created["workspace"]["id"]
+
+        cols, rows = request.size
+        tab = await self._run_json(
+            "tab",
+            "create",
+            "--workspace",
+            self._workspace_id,
+            "--cwd",
+            self._to_windows_path(request.cwd),
+            "--cols",
+            str(cols),
+            "--rows",
+            str(rows),
+            "--format",
+            "json",
+            # ``--command --`` must be LAST: everything after ``--`` is the inner
+            # argv, so no herdr flag may follow it.
+            "--command",
+            "--",
+            *request.command,
+        )
+        self._tab_id = tab["tab"]["id"]
+        self._pane_id = tab["pane"]["id"]
+
+        # Create-before-close: only now retire the husks.
+        for husk_id in husks:
+            with contextlib.suppress(RuntimeError):
+                await self._run("workspace", "close", "--workspace", husk_id)
+
+    def _pane_get_argv(self) -> list[str]:
+        """Build the ``pane get`` argv used by both liveness probes."""
+        return [
+            *self._base_argv(),
+            "pane",
+            "get",
+            "--pane",
+            self._pane_id or "",
+            "--format",
+            "json",
+        ]
+
+    @classmethod
+    def _interpret_pane_get(cls, returncode: int | None, stdout: bytes) -> Liveness:
+        """Map a ``pane get`` result to a :class:`Liveness` verdict.
+
+        A structured result the probe *could* produce is authoritative:
+        ``alive`` → :attr:`Liveness.ALIVE`; ``pane_not_found`` /
+        ``workspace_not_found`` (the inner process exited and herdr destroyed the
+        pane, or the workspace is gone) → :attr:`Liveness.ENDPOINT_GONE`.
+        Anything that means the probe could not produce a clean verdict — a
+        non-zero exit, unparseable output, an unknown result — degrades to
+        :attr:`Liveness.UNKNOWN` (never a false ENDPOINT_GONE).
+        """
+        import json
+
+        if returncode != 0:
+            return Liveness.UNKNOWN
+        try:
+            data = json.loads(cls._normalize_newlines(stdout.decode(errors="replace")))
+        except ValueError:
+            return Liveness.UNKNOWN
+        result = data.get("result")
+        if result == "alive":
+            return Liveness.ALIVE
+        if result in ("pane_not_found", "workspace_not_found"):
+            return Liveness.ENDPOINT_GONE
+        return Liveness.UNKNOWN
+
+    async def liveness(self) -> Liveness:
+        """Probe the pane and map it to a verdict (see :meth:`_interpret_pane_get`).
+
+        INNER_EXITED is unreachable for herdr: with no remain-on-exit an exited
+        pane is destroyed, so its verdict is ENDPOINT_GONE, not INNER_EXITED.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self._pane_get_argv(),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=self._CLI_TIMEOUT_S)
+        except (OSError, asyncio.TimeoutError):
+            return Liveness.UNKNOWN
+        return self._interpret_pane_get(proc.returncode, stdout)
+
+    def liveness_sync(self) -> Liveness:
+        """Synchronous :meth:`liveness` for the daemon idle-watcher thread."""
+        try:
+            proc = subprocess.run(
+                self._pane_get_argv(),
+                capture_output=True,
+                check=False,
+                timeout=self._CLI_TIMEOUT_S,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return Liveness.UNKNOWN
+        return self._interpret_pane_get(proc.returncode, proc.stdout)
+
+    async def close(self) -> None:
+        """Close this terminal's workspace, then reap same-label husks.
+
+        Idempotent and never raises: a workspace already gone (orphan-reaped, or
+        a crashed server) closes quietly. The reap sweep retires any leftover
+        same-label workspaces of THIS session (scope: same session + same label —
+        never another session, never ``default``).
+        """
+        if self._workspace_id is not None:
+            with contextlib.suppress(RuntimeError):
+                await self._run("workspace", "close", "--workspace", self._workspace_id)
+        await self._reap_labeled_workspaces()
+
+    async def _reap_labeled_workspaces(self, *, exclude: str | None = None) -> None:
+        """Close every same-label workspace of this session (orphan reaping).
+
+        :param exclude: A workspace id to leave alone (the freshly-created one).
+        """
+        try:
+            listing = await self._run_json("workspace", "list", "--format", "json")
+        except RuntimeError:
+            return
+        for ws in listing.get("workspaces", []):
+            wsid = ws.get("id")
+            if ws.get("label") == self._label and wsid is not None and wsid != exclude:
+                with contextlib.suppress(RuntimeError):
+                    await self._run("workspace", "close", "--workspace", wsid)
+
+    async def send_text(self, text: str) -> None:
+        """Type literal *text* into the pane WITHOUT submitting it.
+
+        Delivered via the CLI's stdin (``pane send-text``), not argv, so a
+        multi-line paste needs no chunking and never hits the Windows command-
+        line length limit — herdr writes it verbatim and non-submitting.
+        """
+        await self._run(
+            "pane", "send-text", "--pane", self._pane_id or "", stdin_data=text.encode("utf-8")
+        )
+
+    async def send_keys(self, keys: Sequence[str]) -> None:
+        """Press named keys, translating each into herdr's key syntax.
+
+        See :meth:`_translate_key`: chords become plus-notation and unsupported
+        keys are skipped. A keystroke set that translates to nothing is a no-op.
+        """
+        wire = [translated for key in keys if (translated := self._translate_key(key)) is not None]
+        if wire:
+            await self._run("pane", "send-keys", "--pane", self._pane_id or "", *wire)
+
+    async def capture(self, *, ansi: bool = False, scrollback: int = 0) -> str:
+        """Snapshot the pane via ``pane read``, normalizing CRLF → ``\\n``.
+
+        ANSI passthrough is off by default. ``scrollback`` is forwarded but the
+        min-line-count snapshot hardening is #12.
+        """
+        return self._normalize_newlines(await self._run_output(*self._read_argv(ansi, scrollback)))
+
+    def capture_sync(self, *, ansi: bool = False, scrollback: int = 0) -> str:
+        """Synchronous :meth:`capture` for the threaded idle watcher."""
+        return self._normalize_newlines(self._run_output_sync(*self._read_argv(ansi, scrollback)))
+
+    def _read_argv(self, ansi: bool, scrollback: int) -> list[str]:
+        """Build the ``pane read`` argv for a snapshot."""
+        args = ["pane", "read", "--pane", self._pane_id or ""]
+        if ansi:
+            args.append("--ansi")
+        if scrollback > 0:
+            args.extend(["--scrollback", str(scrollback)])
+        return args
+
+
 # ---------------------------------------------------------------------------
 # Backend registry + selection
 # ---------------------------------------------------------------------------
@@ -1531,15 +2070,19 @@ def register_terminal_backend(backend_cls: type[TerminalBackend]) -> None:
 
 
 register_terminal_backend(TmuxBackend)
+register_terminal_backend(HerdrBackend)
 
 
 # Platform → default backend name used when nothing is explicitly selected.
 # POSIX defaults to tmux (the compatibility contract: an absent backend field
 # means tmux, so every pre-existing persisted spec keeps working unchanged).
-# Windows has no native backend yet — herdr arrives in a later change — so it
-# has no entry, and selection raises a clear availability error there instead
-# of an incidental hard-raise.
-_PLATFORM_DEFAULT_BACKEND: dict[str, str] = {"posix": TmuxBackend.name}
+# Native Windows defaults to herdr, the Windows-native backend (#11); it fails
+# loudly via ``HerdrBackend.ensure_available`` if the herdr binary is missing or
+# speaks an unsupported protocol, rather than an incidental hard-raise.
+_PLATFORM_DEFAULT_BACKEND: dict[str, str] = {
+    "posix": TmuxBackend.name,
+    "windows": HerdrBackend.name,
+}
 
 
 def _current_platform_tag() -> str:

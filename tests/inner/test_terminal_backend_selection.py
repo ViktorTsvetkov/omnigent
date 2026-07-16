@@ -177,16 +177,30 @@ def test_config_without_terminal_table_falls_through(
 # ---------------------------------------------------------------------------
 
 
-def test_windows_has_no_default_and_raises_availability_error(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Native Windows with nothing selected → clear availability RuntimeError.
+def test_windows_defaults_to_herdr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Native Windows with nothing selected → the herdr backend (#11).
 
-    Same exception type as the old incidental hard-raise, so any caller (and
-    the two known keep-alive tests) sees a compatible failure.
+    The Windows-native default the herdr adapter registers; binary/protocol
+    availability is enforced separately by ``HerdrBackend.ensure_available`` at
+    the factory, so resolution itself just names herdr.
     """
     _force_windows(monkeypatch)
     _isolate_config(monkeypatch, tmp_path)
+    assert resolve_terminal_backend_name() == "herdr"
+
+
+def test_platform_without_default_raises_availability_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A platform with no default backend → clear availability RuntimeError.
+
+    Both registered platforms now have a default (tmux on POSIX, herdr on
+    Windows), so the no-default path is exercised via an unknown platform tag —
+    the same loud failure any future unsupported platform would hit, distinct
+    from the platform-mismatch error.
+    """
+    _isolate_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(terminal_mod, "_current_platform_tag", lambda: "plan9")
     with pytest.raises(RuntimeError, match=r"No terminal multiplexer backend"):
         resolve_terminal_backend_name()
 

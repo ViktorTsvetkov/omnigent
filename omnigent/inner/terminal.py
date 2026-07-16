@@ -1592,6 +1592,21 @@ class TerminalInstance:
         """Store a pane capture for later exit diagnostics."""
         self._last_pane_snapshot = snapshot
 
+    def _tmux_base_cmd(self) -> list[str]:
+        """
+        Build the tmux argv prefix for this instance's private server.
+
+        Managed terminal sessions must not inherit the user's
+        ``~/.tmux.conf``. The terminal integration owns the server
+        lifecycle and applies the supported options explicitly during
+        launch, so user config would make identical agent specs behave
+        differently across machines.
+
+        :returns: Base argv for subprocess calls, e.g.
+            ``["tmux", "-S", "/tmp/.../tmux.sock", "-f", "/dev/null"]``.
+        """
+        return ["tmux", "-S", str(self.socket_path), "-f", _TMUX_CONFIG_PATH]
+
     async def set_conversation_link(self, conversation_link: str | None) -> None:
         """
         Update the link shown in this terminal's status bar.
@@ -2248,6 +2263,53 @@ class TerminalInstance:
             handles).
         """
         return await self._backend.liveness() is Liveness.INNER_EXITED
+
+    async def _tmux(self, *args: str) -> None:
+        """Run a tmux command against this instance's server."""
+        proc = await asyncio.create_subprocess_exec(
+            *self._tmux_base_cmd(),
+            *args,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"tmux command failed: {' '.join(args)}: {stderr.decode().strip()}")
+
+    async def _tmux_output(self, *args: str) -> str:
+        """Run a tmux command and return stdout."""
+        proc = await asyncio.create_subprocess_exec(
+            *self._tmux_base_cmd(),
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"tmux command failed: {' '.join(args)}: {stderr.decode().strip()}")
+        return stdout.decode()
+
+    def _tmux_output_sync(self, *args: str) -> str:
+        """
+        Synchronous sibling of :meth:`_tmux_output`.
+
+        Used by :meth:`_idle_watch_loop_threaded` because that
+        watcher runs on a daemon thread without an event loop.
+        Same error semantics as the async version: non-zero exit
+        codes raise :class:`RuntimeError` carrying the stderr.
+
+        :param args: Args to pass after ``tmux -S <socket>``,
+            e.g. ``("capture-pane", "-t", "main", "-p", "-e")``.
+        :returns: The captured stdout, decoded as UTF-8.
+        :raises RuntimeError: When the tmux subprocess exits
+            non-zero (typically because the server has gone away).
+        """
+        proc = subprocess.run([*self._tmux_base_cmd(), *args], capture_output=True, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"tmux command failed: {' '.join(args)}: {proc.stderr.decode().strip()}"
+            )
+        return proc.stdout.decode()
 
 
 def _shell_quote(s: str) -> str:

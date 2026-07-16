@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TypeAlias
@@ -885,6 +885,12 @@ class TerminalBackendCapabilities:
     """The backend offers a control-mode attach transport in addition to a
     PTY attach (tmux ``-C``)."""
 
+    status_line: bool = False
+    """The backend has a host status line that can carry the cosmetic
+    conversation link (tmux's status-left). Where ``False``,
+    :meth:`TerminalBackend.set_status_link` is a documented no-op — the link
+    is droppable because the web UI is the primary surface."""
+
 
 @dataclass(frozen=True)
 class TerminalLaunchRequest:
@@ -938,21 +944,30 @@ class TerminalLaunchRequest:
 
 class TerminalBackend(ABC):
     """
-    Backend interface for a terminal multiplexer's *session lifecycle*.
+    Backend interface for a terminal multiplexer.
 
     One instance backs one :class:`TerminalInstance` and owns how that
     terminal's hosting endpoint is created on a specific multiplexer (tmux
-    today, herdr next), probed for liveness, and torn down. The machinery
-    above the seam — the registry, the ``sys_terminal`` tools, the native
-    bridges, the web attach routes — talks only to the
+    today, herdr next), driven (input, capture), probed for liveness, and torn
+    down. The machinery above the seam — the registry, the ``sys_terminal``
+    tools, the native bridges, the web attach routes — talks only to the
     :class:`TerminalInstance` public surface and never to a multiplexer
     directly. The factory is the single point that selects a backend.
 
-    **Scope: lifecycle only.** This revision covers launch, liveness, close,
-    and the class-level orphan sweep. Input delivery (send-keys / paste),
-    screen capture, and idle-watching still live on :class:`TerminalInstance`
-    and move behind this seam in a later change, which will grow this
-    interface with those methods and their capability flags.
+    **Scope.** The backend owns session lifecycle (launch, liveness, close,
+    the class-level orphan sweep), input delivery (non-submitting text
+    injection and named-key send), screen capture (plain or ANSI), and the
+    cosmetic status-line link. The idle/activity *watcher loops* themselves —
+    the diff logic, timers, and edge callbacks — stay on
+    :class:`TerminalInstance`; only their multiplexer touchpoints (capture,
+    liveness, detach-on-exit) route through this seam. The per-harness native
+    bridges and web-attach transports are migrated in later changes.
+
+    **Vocabulary.** Methods speak Omnigent domain terms, not one multiplexer's
+    CLI flags: "capture the screen as text (optionally with ANSI)", "type this
+    literal text", "press these named keys". Each backend translates that
+    vocabulary into its own CLI itself, and normalizes captured output (line
+    endings, etc.) so callers never see backend-specific quirks.
     """
 
     name: str
@@ -994,21 +1009,107 @@ class TerminalBackend(ABC):
         """Tear down the hosted session/server. Idempotent; must not raise."""
         raise NotImplementedError
 
+    @abstractmethod
+    async def send_text(self, text: str) -> None:
+        """Type literal text into the hosted pane WITHOUT submitting it.
+
+        The text is delivered verbatim and non-submitting (bracketed-paste
+        safe): no trailing newline is implied, so a multi-line prompt or a
+        pasted code block arrives intact for the caller to submit separately
+        via :meth:`send_keys`. The backend chunks internally as needed to stay
+        under any wire-protocol size cap; the inner program sees one
+        contiguous stream in submission order.
+
+        :param text: The literal characters to type.
+        :raises RuntimeError: If the multiplexer rejects the input (e.g. the
+            host endpoint is gone).
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def send_keys(self, keys: Sequence[str]) -> None:
+        """Press named keys in the hosted pane, in order.
+
+        Keys use Omnigent's backend-neutral key vocabulary — ``"Enter"``,
+        ``"Escape"``, ``"Tab"``, ``"Up"``, and ``"C-a"``-style modifier
+        notation for control/meta chords (the form Omnigent already uses
+        internally). Each backend translates these names into its own key
+        syntax itself: herdr, for example, uses ``ctrl+a`` plus-notation and
+        lacks Home/End/PageUp/Delete. A backend that cannot express a given
+        key should skip it rather than send a wrong key.
+
+        :param keys: Ordered key names, e.g. ``["Enter"]`` or ``["C-c"]``.
+        :raises RuntimeError: If the multiplexer rejects the input (e.g. the
+            host endpoint is gone).
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def capture(self, *, ansi: bool = False, scrollback: int = 0) -> str:
+        """Snapshot the hosted pane's rendered screen as text.
+
+        :param ansi: When ``True``, include ANSI styling escapes (for human
+            display and the idle watcher's diff); when ``False``, plain text
+            only (the ``read`` path).
+        :param scrollback: Extra lines of scrollback history to include above
+            the visible viewport. ``0`` captures only the visible screen.
+        :returns: The screen text with line endings normalized to ``\\n`` —
+            the backend strips any native line-ending quirk (e.g. CRLF) so
+            callers never branch on it.
+        :raises RuntimeError: If the snapshot command fails (typically because
+            the host endpoint has gone away); the caller reads this as "host
+            went away" and stops.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def capture_sync(self, *, ansi: bool = False, scrollback: int = 0) -> str:
+        """Synchronous sibling of :meth:`capture` for callers without an event
+        loop (the threaded idle watcher). Same params, verdict, and line-ending
+        normalization."""
+        raise NotImplementedError
+
+    async def set_status_link(self, link: str | None) -> None:
+        """Update the cosmetic conversation link on the host's status line.
+
+        Capability-gated by :attr:`TerminalBackendCapabilities.status_line`:
+        the link is purely decorative (the web UI is the primary surface), so
+        a backend without a status line implements this as a documented no-op.
+        The default implementation here is that no-op; backends that declare
+        ``status_line=True`` override it.
+
+        :param link: Conversation URL to show, e.g. ``"/c/conv_abc123"``, or
+            ``None`` to clear it.
+        """
+        del link  # base no-op; backends with a status line override this
+
+    async def detach_display_clients(self) -> None:  # noqa: B027 — optional override hook; default is a no-op
+        """Detach any attached human display clients from the hosted session.
+
+        Called after the inner process exits while the host keeps the endpoint
+        alive (see :attr:`Liveness.INNER_EXITED`), so attached display clients
+        — a ``tmux attach`` subprocess, the server-side bridge PTY — exit
+        cleanly instead of hanging on the frozen final frame. The default is a
+        no-op: backends that drop the endpoint on exit, or that have no
+        attachable display client, have nothing to detach.
+        """
+
+    def detach_display_clients_sync(self) -> None:  # noqa: B027 — optional override hook; default is a no-op
+        """Synchronous sibling of :meth:`detach_display_clients` for the
+        threaded idle watcher. Default no-op."""
+
 
 class TmuxBackend(TerminalBackend):
     """
-    tmux session-lifecycle backend.
+    tmux multiplexer backend.
 
     Hosts each managed terminal in its own private tmux server (isolated
-    socket, no user ``~/.tmux.conf``). Owns launch, liveness, close, and the
-    class-level orphan sweep, translating the backend-neutral
-    :class:`TerminalLaunchRequest` into a tmux ``new-session`` plus option
-    argv. All tmux vocabulary — the socket path, ``-t`` targets, ``-F``
-    formats, ``#{pane_dead}`` — is confined to this class.
-
-    The instance's low-level capture/input helpers still build their own tmux
-    argv from :attr:`TerminalInstance.socket_path` for now; those move behind
-    this backend when input/capture are extracted.
+    socket, no user ``~/.tmux.conf``). Owns launch, liveness, close, the
+    class-level orphan sweep, input delivery (``send-keys``), screen capture
+    (``capture-pane``), and the status-line link (``set-option``), translating
+    the backend-neutral protocol into tmux argv. All tmux vocabulary — the
+    socket path, ``-t`` targets, ``-F`` formats, ``#{pane_dead}``, ``-l``
+    literal keys, ``-p``/``-e`` capture flags — is confined to this class.
     """
 
     name = "tmux"
@@ -1018,6 +1119,7 @@ class TmuxBackend(TerminalBackend):
         native_busy_state=False,
         push_events=False,
         control_mode_attach=True,
+        status_line=True,
     )
     # tmux is POSIX-only; native Windows uses a different backend (the factory
     # still hard-raises on Windows until backend selection lands).
@@ -1056,6 +1158,50 @@ class TmuxBackend(TerminalBackend):
         _, stderr = await proc.communicate()
         if proc.returncode != 0:
             raise RuntimeError(f"tmux command failed: {' '.join(args)}: {stderr.decode().strip()}")
+
+    async def _run_output(self, *args: str) -> str:
+        """Run a tmux command against this server and return its stdout."""
+        proc = await asyncio.create_subprocess_exec(
+            *self._base_cmd(),
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"tmux command failed: {' '.join(args)}: {stderr.decode().strip()}")
+        return stdout.decode()
+
+    def _run_output_sync(self, *args: str) -> str:
+        """Synchronous sibling of :meth:`_run_output` for the threaded watcher.
+
+        Same error semantics: a non-zero exit raises :class:`RuntimeError`
+        carrying the stderr (typically because the server has gone away).
+        """
+        proc = subprocess.run([*self._base_cmd(), *args], capture_output=True, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"tmux command failed: {' '.join(args)}: {proc.stderr.decode().strip()}"
+            )
+        return proc.stdout.decode()
+
+    def _capture_args(self, *, ansi: bool, scrollback: int) -> list[str]:
+        """Build the ``capture-pane`` argv for a screen snapshot.
+
+        ``-p`` prints to stdout; ``-e`` preserves ANSI styling; ``-S -N``
+        reaches ``N`` lines back into scrollback above the visible screen.
+
+        :param ansi: Include ANSI escapes (``-e``).
+        :param scrollback: Extra scrollback lines to include; ``0`` for the
+            visible viewport only.
+        :returns: The tmux argv, e.g. ``["capture-pane", "-t", "main", "-p"]``.
+        """
+        args = ["capture-pane", "-t", self._target, "-p"]
+        if ansi:
+            args.append("-e")
+        if scrollback > 0:
+            args.extend(["-S", f"-{scrollback}"])
+        return args
 
     async def launch(self, request: TerminalLaunchRequest) -> None:
         """Create the private tmux server and single session for *request*."""
@@ -1188,6 +1334,62 @@ class TmuxBackend(TerminalBackend):
         """Kill the private tmux server. Suppresses the already-gone case."""
         with contextlib.suppress(RuntimeError):
             await self._run("kill-server")
+
+    async def send_text(self, text: str) -> None:
+        """Type literal text via ``send-keys -l``, chunked under tmux's cap.
+
+        tmux's client->server protocol rejects any single command over its
+        16KB imsg cap, so the literal is split into
+        :data:`_SEND_KEYS_LITERAL_CHARS_PER_CALL`-char invocations; tmux writes
+        each in submission order so the pane sees one contiguous stream.
+        """
+        for start in range(0, len(text), _SEND_KEYS_LITERAL_CHARS_PER_CALL):
+            await self._run(
+                "send-keys",
+                "-l",
+                "-t",
+                self._target,
+                text[start : start + _SEND_KEYS_LITERAL_CHARS_PER_CALL],
+            )
+
+    async def send_keys(self, keys: Sequence[str]) -> None:
+        """Press each named key via ``send-keys``.
+
+        tmux's key names are Omnigent's neutral vocabulary verbatim
+        (``Enter``, ``Escape``, ``C-c``, ...), so no translation is needed.
+        """
+        for key in keys:
+            await self._run("send-keys", "-t", self._target, key)
+
+    async def capture(self, *, ansi: bool = False, scrollback: int = 0) -> str:
+        """Capture the pane via ``capture-pane``.
+
+        tmux ``capture-pane -p`` already emits logical lines joined by ``\\n``
+        (no CR), so the :meth:`TerminalBackend.capture` ``\\n``-normalization
+        contract holds with no extra transform.
+        """
+        return await self._run_output(*self._capture_args(ansi=ansi, scrollback=scrollback))
+
+    def capture_sync(self, *, ansi: bool = False, scrollback: int = 0) -> str:
+        """Synchronous :meth:`capture` for the threaded idle watcher."""
+        return self._run_output_sync(*self._capture_args(ansi=ansi, scrollback=scrollback))
+
+    async def set_status_link(self, link: str | None) -> None:
+        """Set the status-left conversation link option on the server."""
+        await self._run(
+            "set-option",
+            "-g",
+            _TMUX_CONVERSATION_LINK_OPTION,
+            link or _TMUX_EMPTY_OPTION_VALUE,
+        )
+
+    async def detach_display_clients(self) -> None:
+        """Detach all clients from the session via ``detach-client -s``."""
+        await self._run_output("detach-client", "-s", self._target)
+
+    def detach_display_clients_sync(self) -> None:
+        """Synchronous :meth:`detach_display_clients` for the threaded watcher."""
+        self._run_output_sync("detach-client", "-s", self._target)
 
     @classmethod
     def reap_orphans(cls) -> int:
@@ -1334,13 +1536,13 @@ class TerminalInstance:
     # not read as agent activity. ``-inf`` until the first interaction.
     _last_client_interaction_at: float = field(default=float("-inf"), repr=False)
     _last_pane_snapshot: str | None = field(default=None, repr=False)
-    # Multiplexer lifecycle backend. Built in ``__post_init__`` from
-    # ``socket_path`` (tmux is the only backend today), so every existing
-    # construction path — including tests that build ``TerminalInstance``
-    # directly — gets one without a signature change. Lifecycle operations
-    # (launch, liveness, close, reaping) route through it; capture/input/idle
-    # still use the instance's own tmux helpers until they move behind the
-    # backend too.
+    # Multiplexer backend. Built in ``__post_init__`` from ``socket_path``
+    # (tmux is the only backend today), so every existing construction path —
+    # including tests that build ``TerminalInstance`` directly — gets one
+    # without a signature change. All multiplexer touchpoints route through it:
+    # lifecycle (launch, liveness, close, reaping), input (send text / keys),
+    # capture (read + idle snapshots), the status-line link, and detach-on-exit.
+    # The idle-watch loops themselves stay on this instance.
     _backend: TerminalBackend = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -1390,41 +1592,26 @@ class TerminalInstance:
         """Store a pane capture for later exit diagnostics."""
         self._last_pane_snapshot = snapshot
 
-    def _tmux_base_cmd(self) -> list[str]:
-        """
-        Build the tmux argv prefix for this instance's private server.
-
-        Managed terminal sessions must not inherit the user's
-        ``~/.tmux.conf``. The terminal integration owns the server
-        lifecycle and applies the supported options explicitly during
-        launch, so user config would make identical agent specs behave
-        differently across machines.
-
-        :returns: Base argv for subprocess calls, e.g.
-            ``["tmux", "-S", "/tmp/.../tmux.sock", "-f", "/dev/null"]``.
-        """
-        return ["tmux", "-S", str(self.socket_path), "-f", _TMUX_CONFIG_PATH]
-
     async def set_conversation_link(self, conversation_link: str | None) -> None:
         """
-        Update the link shown in this terminal's tmux status bar.
+        Update the link shown in this terminal's status bar.
+
+        Cosmetic: delegates to the backend's capability-gated
+        :meth:`TerminalBackend.set_status_link`, which no-ops on backends
+        without a status line. The in-memory :attr:`conversation_link` is
+        always updated so a later launch seeds the link regardless of backend.
 
         :param conversation_link: Conversation URL to show, e.g.
             ``"/c/conv_abc123"``, or ``None`` to clear the status
             value.
         :returns: None.
-        :raises RuntimeError: If the running tmux server rejects the
-            option update.
+        :raises RuntimeError: If a running backend with a status line rejects
+            the update.
         """
         self.conversation_link = conversation_link
         if not self.running:
             return
-        await self._tmux(
-            "set-option",
-            "-g",
-            _TMUX_CONVERSATION_LINK_OPTION,
-            conversation_link or "",
-        )
+        await self._backend.set_status_link(conversation_link)
 
     async def launch(self, *, cwd: Path | None = None) -> None:
         """Start the tmux session."""
@@ -1515,36 +1702,27 @@ class TerminalInstance:
         """Send keystrokes to the terminal.
 
         Args:
-            text: Literal text to type.  Sent via ``tmux send-keys -l`` so
-                special characters are not interpreted.  Long text is split
-                across multiple invocations of
-                :data:`_SEND_KEYS_LITERAL_CHARS_PER_CALL` characters each —
-                a single invocation over ~16KB exceeds tmux's per-command
-                cap and fails with "command too long".
-            keys: Tmux key names to press after the text, space-separated.
-                Defaults to ``"Enter"``.  Set to ``""`` to type text without
-                pressing any key after.  Examples: ``"Enter"``, ``"Tab"``,
-                ``"C-c"``, ``"Escape"``, ``"C-d"``, ``"Up"``.
+            text: Literal text to type. Delivered verbatim and non-submitting
+                via :meth:`TerminalBackend.send_text`, which chunks it as
+                needed so special characters are never interpreted and large
+                prompts arrive intact.
+            keys: Named keys to press after the text, space-separated, in
+                Omnigent's backend-neutral vocabulary. Defaults to ``"Enter"``.
+                Set to ``""`` to type text without pressing any key after.
+                Examples: ``"Enter"``, ``"Tab"``, ``"C-c"``, ``"Escape"``,
+                ``"C-d"``, ``"Up"``.
         """
         if not self.running:
             return {"error": "Terminal is not running"}
 
         try:
             if text:
-                for start in range(0, len(text), _SEND_KEYS_LITERAL_CHARS_PER_CALL):
-                    await self._tmux(
-                        "send-keys",
-                        "-l",
-                        "-t",
-                        self.tmux_target,
-                        text[start : start + _SEND_KEYS_LITERAL_CHARS_PER_CALL],
-                    )
+                await self._backend.send_text(text)
 
             if keys:
                 if text:
                     await asyncio.sleep(0.05)
-                for key in keys.split():
-                    await self._tmux("send-keys", "-t", self.tmux_target, key)
+                await self._backend.send_keys(keys.split())
         except RuntimeError:
             self.running = False
             return {
@@ -1561,12 +1739,8 @@ class TerminalInstance:
         if not self.running:
             return {"error": "Terminal is not running"}
 
-        args = ["capture-pane", "-t", self.tmux_target, "-p"]
-        if scrollback > 0:
-            args.extend(["-S", f"-{scrollback}"])
-
         try:
-            result = await self._tmux_output(*args)
+            result = await self._backend.capture(ansi=False, scrollback=scrollback)
         except RuntimeError:
             self.running = False
             return {
@@ -1750,13 +1924,7 @@ class TerminalInstance:
             if not self.running:
                 return
             try:
-                snapshot = await self._tmux_output(
-                    "capture-pane",
-                    "-t",
-                    self.tmux_target,
-                    "-p",
-                    "-e",
-                )
+                snapshot = await self._backend.capture(ansi=True)
             except RuntimeError:
                 # tmux server likely gone.
                 self.running = False
@@ -1774,7 +1942,7 @@ class TerminalInstance:
                 # when keep_alive_after_exit is set (remain-on-exit was enabled).
                 if self.keep_alive_after_exit:
                     with contextlib.suppress(Exception):
-                        await self._tmux_output("detach-client", "-s", self.tmux_target)
+                        await self._backend.detach_display_clients()
                 self.running = False
                 if on_exit is not None:
                     await _fire(on_exit, "exit")
@@ -1931,7 +2099,7 @@ class TerminalInstance:
                 # relevant when keep_alive_after_exit is set.
                 if self.keep_alive_after_exit:
                     with contextlib.suppress(Exception):
-                        self._tmux_output_sync("detach-client", "-s", self.tmux_target)
+                        self._backend.detach_display_clients_sync()
                 self.running = False
                 if on_exit is not None:
                     self._fire_watch_callback(on_exit, "exit")
@@ -1962,15 +2130,14 @@ class TerminalInstance:
 
     def _capture_pane_for_idle_or_none(self) -> str | None:
         """
-        Capture the pane for an idle tick, or signal "tmux gone".
+        Capture the pane for an idle tick, or signal "host gone".
 
-        :returns: Pane bytes from ``tmux capture-pane -p -e``, or
-            ``None`` when the tmux subprocess raised — the
-            threaded loop reads ``None`` as "stop watching, the
-            server is no longer there".
+        :returns: The ANSI pane snapshot from the backend, or ``None`` when the
+            capture raised — the threaded loop reads ``None`` as "stop
+            watching, the host is no longer there".
         """
         try:
-            return self._tmux_output_sync("capture-pane", "-t", self.tmux_target, "-p", "-e")
+            return self._backend.capture_sync(ansi=True)
         except RuntimeError:
             return None
 
@@ -2081,53 +2248,6 @@ class TerminalInstance:
             handles).
         """
         return await self._backend.liveness() is Liveness.INNER_EXITED
-
-    async def _tmux(self, *args: str) -> None:
-        """Run a tmux command against this instance's server."""
-        proc = await asyncio.create_subprocess_exec(
-            *self._tmux_base_cmd(),
-            *args,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(f"tmux command failed: {' '.join(args)}: {stderr.decode().strip()}")
-
-    async def _tmux_output(self, *args: str) -> str:
-        """Run a tmux command and return stdout."""
-        proc = await asyncio.create_subprocess_exec(
-            *self._tmux_base_cmd(),
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(f"tmux command failed: {' '.join(args)}: {stderr.decode().strip()}")
-        return stdout.decode()
-
-    def _tmux_output_sync(self, *args: str) -> str:
-        """
-        Synchronous sibling of :meth:`_tmux_output`.
-
-        Used by :meth:`_idle_watch_loop_threaded` because that
-        watcher runs on a daemon thread without an event loop.
-        Same error semantics as the async version: non-zero exit
-        codes raise :class:`RuntimeError` carrying the stderr.
-
-        :param args: Args to pass after ``tmux -S <socket>``,
-            e.g. ``("capture-pane", "-t", "main", "-p", "-e")``.
-        :returns: The captured stdout, decoded as UTF-8.
-        :raises RuntimeError: When the tmux subprocess exits
-            non-zero (typically because the server has gone away).
-        """
-        proc = subprocess.run([*self._tmux_base_cmd(), *args], capture_output=True, check=False)
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"tmux command failed: {' '.join(args)}: {proc.stderr.decode().strip()}"
-            )
-        return proc.stdout.decode()
 
 
 def _shell_quote(s: str) -> str:

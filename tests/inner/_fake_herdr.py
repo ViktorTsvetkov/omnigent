@@ -86,6 +86,20 @@ import os
 import sys
 from pathlib import Path
 
+# Cross-process exclusive file locking for the invocation log (stdlib-only, to
+# keep the fake dependency-free). The backend spawns the detached ``server``
+# process, whose log append races the concurrent poll invocations; multi-process
+# appends are not atomic, so without a lock lines interleave and corrupt the JSON
+# (flaky ``read_log`` under load). ``fcntl`` on POSIX, ``msvcrt`` on Windows.
+try:
+    import fcntl
+
+    _HAVE_FCNTL = True
+except ImportError:  # pragma: no cover - Windows
+    import msvcrt
+
+    _HAVE_FCNTL = False
+
 # ---------------------------------------------------------------------------
 # Env vars the fake reads (set by the test that installs it).
 # ---------------------------------------------------------------------------
@@ -307,14 +321,50 @@ def _argv_after_double_dash(tokens: list[str]) -> list[str]:
     return tokens[tokens.index("--") + 1 :]
 
 
+def _lock_exclusive(handle: object) -> None:
+    """Acquire an exclusive cross-process lock on *handle* (blocking)."""
+    if _HAVE_FCNTL:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    else:  # Windows: lock byte 0 of the (shared) lock file for all writers.
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+
+
+def _unlock(handle: object) -> None:
+    """Release the lock acquired by :func:`_lock_exclusive`."""
+    if _HAVE_FCNTL:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    else:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 def _log(argv: list[str]) -> None:
-    """Append this invocation's argv to the log file, if one is configured."""
+    """Append this invocation's argv to the log file, if one is configured.
+
+    The whole append is serialized under an exclusive lock on a sibling ``.lock``
+    file so concurrent processes (notably the detached ``server`` process racing
+    the poll invocations) never interleave partial lines — keeping ``read_log``'s
+    JSON parse and ordering assertions trustworthy. The line (including its
+    trailing newline) is written in a single ``write`` while the lock is held.
+    """
     log_path = os.environ.get(LOG_ENV_VAR)
     if not log_path:
         return
+    line = json.dumps(argv) + "\n"
     with contextlib.suppress(OSError):
-        with open(log_path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(argv) + "\n")
+        # All writers contend on the same sibling lock file (a fixed offset),
+        # which gives whole-file mutual exclusion on both POSIX and Windows —
+        # unlike locking the append-mode log itself, whose per-process EOF offset
+        # would leave Windows writers locking disjoint ranges.
+        with open(log_path + ".lock", "a+", encoding="utf-8") as lock:
+            _lock_exclusive(lock)
+            try:
+                with open(log_path, "a", encoding="utf-8") as handle:
+                    handle.write(line)
+                    handle.flush()
+            finally:
+                _unlock(lock)
 
 
 # ---------------------------------------------------------------------------

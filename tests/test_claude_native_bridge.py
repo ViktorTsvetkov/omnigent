@@ -5627,3 +5627,64 @@ def test_hook_record_non_stop_event_has_zero_background_tasks() -> None:
         )
     )
     assert record.background_task_count == 0
+
+
+def _fake_dir_stat(uid: int) -> os.stat_result:
+    """A fake ``os.lstat`` result for a directory owned by *uid* (mode 0o700)."""
+    import stat as _stat
+
+    return os.stat_result((_stat.S_IFDIR | 0o700, 0, 0, 1, uid, 0, 0, 0, 0, 0))
+
+
+def _fake_symlink_stat(_path: object) -> os.stat_result:
+    """A fake ``os.lstat`` result for a symlink."""
+    import stat as _stat
+
+    return os.stat_result((_stat.S_IFLNK | 0o777, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+
+
+def test_ensure_secure_dir_skips_posix_uid_check_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Windows the void POSIX uid-ownership check is skipped (#13).
+
+    ``os.getuid`` is absent (-1) and ``st_uid`` is unpopulated (0) on Windows, so
+    the check always fails and fail-closes the omnigent MCP relay. Gated on
+    IS_POSIX, a foreign-uid directory no longer raises there.
+    """
+    root = tmp_path / "bridgeroot"
+    child = root / "child"
+    child.mkdir(parents=True)
+    monkeypatch.setattr(claude_native_bridge, "_trusted_parent_for_bridge_dir", lambda _t: root)
+    monkeypatch.setattr("omnigent._platform.IS_POSIX", False)  # simulate Windows
+    monkeypatch.setattr(claude_native_bridge.os, "lstat", lambda _p: _fake_dir_stat(4242))
+    claude_native_bridge._ensure_secure_dir(child)  # must not raise
+
+
+def test_ensure_secure_dir_uid_mismatch_still_raises_on_posix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POSIX ownership enforcement is byte-identical — a foreign-uid dir still raises."""
+    root = tmp_path / "bridgeroot"
+    child = root / "child"
+    child.mkdir(parents=True)
+    monkeypatch.setattr(claude_native_bridge, "_trusted_parent_for_bridge_dir", lambda _t: root)
+    monkeypatch.setattr("omnigent._platform.IS_POSIX", True)  # POSIX behavior
+    monkeypatch.setattr(claude_native_bridge.os, "lstat", lambda _p: _fake_dir_stat(4242))
+    with pytest.raises(RuntimeError, match="owned by uid"):
+        claude_native_bridge._ensure_secure_dir(child)
+
+
+def test_ensure_secure_dir_symlink_rejected_on_both_platforms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The symlink ancestor rejection stays active on both platforms (unchanged)."""
+    root = tmp_path / "bridgeroot"
+    child = root / "child"
+    child.mkdir(parents=True)
+    monkeypatch.setattr(claude_native_bridge, "_trusted_parent_for_bridge_dir", lambda _t: root)
+    monkeypatch.setattr(claude_native_bridge.os, "lstat", _fake_symlink_stat)
+    for is_posix in (True, False):
+        monkeypatch.setattr("omnigent._platform.IS_POSIX", is_posix)
+        with pytest.raises(RuntimeError, match="symlink"):
+            claude_native_bridge._ensure_secure_dir(child)

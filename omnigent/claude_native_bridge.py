@@ -695,6 +695,16 @@ def _ensure_secure_dir(target: Path) -> None:
         raise RuntimeError(f"bridge dir {target!s} is not under trusted parent {trusted_parent!s}")
     ancestors.reverse()
     my_uid = getattr(os, "getuid", lambda: -1)()
+    # The POSIX ownership + permission-bit checks below are gated on IS_POSIX: on
+    # Windows they are semantically void — ``os.getuid`` does not exist (``my_uid``
+    # falls back to -1) and ``os.lstat`` leaves ``st_uid`` unpopulated (0), so
+    # ``st_uid != my_uid`` tests nothing and ALWAYS fails, fail-closing the feature
+    # (the omnigent MCP relay) with zero real protection. Windows-equivalent
+    # protection is the per-user ACL on ``%USERPROFILE%``. The symlink and
+    # is-directory checks below stay active on BOTH platforms. (#13; sanctioned
+    # upstream security-boundary change — flagged for the owner in the issue.)
+    from omnigent._platform import IS_POSIX
+
     for ancestor in ancestors:
         try:
             os.mkdir(ancestor, mode=0o700)
@@ -706,12 +716,12 @@ def _ensure_secure_dir(target: Path) -> None:
             raise RuntimeError(f"refusing to use bridge ancestor {ancestor!s}: is a symlink")
         if not stat.S_ISDIR(st.st_mode):
             raise RuntimeError(f"refusing to use bridge ancestor {ancestor!s}: not a directory")
-        if st.st_uid != my_uid:
+        if IS_POSIX and st.st_uid != my_uid:
             raise RuntimeError(
                 f"refusing to use bridge ancestor {ancestor!s}: owned by uid "
                 f"{st.st_uid}, not current user ({my_uid})"
             )
-        if (st.st_mode & 0o077) != 0:
+        if IS_POSIX and (st.st_mode & 0o077) != 0:
             os.chmod(ancestor, 0o700)
 
 

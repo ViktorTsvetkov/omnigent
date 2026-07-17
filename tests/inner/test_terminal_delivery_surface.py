@@ -255,6 +255,24 @@ async def test_send_keys_repeated_presses_key_n_times() -> None:
     assert delivery.snapshot().count(key_marker("BSpace")) == 3
 
 
+async def test_send_keys_atomic_delivers_all_keys_in_one_call() -> None:
+    """``send_keys_atomic`` delivers every key, recorded as a single call.
+
+    The atomic multi-key primitive (goose's packed ``Down Down Enter``): the fake
+    records one ``sent_keys`` entry holding the whole sequence, and every key's
+    marker lands on the screen in order.
+    """
+    backend = await _launched_fake()
+    delivery = TerminalDelivery(backend)
+
+    delivery.send_keys_atomic(["Down", "Down", "Enter"])
+
+    assert backend.sent_keys == [["Down", "Down", "Enter"]]
+    screen = delivery.snapshot()
+    assert screen.count(key_marker("Down")) == 2
+    assert key_marker("Enter") in screen
+
+
 async def test_send_keys_repeated_zero_count_is_noop() -> None:
     """A non-positive count sends nothing (an empty burst emits no key)."""
     backend = await _launched_fake()
@@ -417,6 +435,50 @@ def test_tmux_type_literal_pins_argv(
     ]
 
 
+def test_tmux_type_literal_flag_order_before_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``literal_flag_before_target`` swaps the literal argv to ``-t <target> -l``.
+
+    Preserves cursor's ``/model`` picker order (``send-keys -t <target> -l``); the
+    default keeps claude's ``-l -t <target>`` (pinned by the test above).
+    """
+    recorder = _TmuxRecorder()
+    monkeypatch.setattr("subprocess.run", recorder)
+    style = TmuxDeliveryStyle(literal_flag_before_target=True)
+    delivery = TerminalDelivery(
+        TmuxBackend(socket_path=_SOCKET, target=_TARGET, delivery_style=style)
+    )
+
+    delivery.type_literal("/model gpt-5.2")
+
+    assert recorder.calls == [
+        ["tmux", "-S", _SOCKET, "send-keys", "-t", _TARGET, "-l", "/model gpt-5.2"],
+    ]
+
+
+def test_tmux_send_keys_atomic_pins_single_call(
+    tmux_delivery: tuple[TerminalDelivery, _TmuxRecorder],
+) -> None:
+    """``send_keys_atomic`` emits ONE ``send-keys -t <target> k1 k2 …`` call.
+
+    Byte-identical to goose's packed permission-dialog keystroke — a single
+    atomic client command, not one call per key.
+    """
+    delivery, recorder = tmux_delivery
+    delivery.send_keys_atomic(["Down", "Down", "Enter"])
+    assert recorder.calls == [
+        ["tmux", "-S", _SOCKET, "send-keys", "-t", _TARGET, "Down", "Down", "Enter"],
+    ]
+
+
+def test_tmux_send_keys_atomic_empty_emits_no_command(
+    tmux_delivery: tuple[TerminalDelivery, _TmuxRecorder],
+) -> None:
+    """An empty key sequence emits no tmux command."""
+    delivery, recorder = tmux_delivery
+    delivery.send_keys_atomic([])
+    assert recorder.calls == []
+
+
 def test_tmux_kill_pins_kill_session(
     tmux_delivery: tuple[TerminalDelivery, _TmuxRecorder],
 ) -> None:
@@ -557,6 +619,7 @@ def test_build_prompt_delivery_threads_tmux_style() -> None:
     style = TmuxDeliveryStyle(
         paste_buffer="omnigent-goose-paste",
         capture_flag_before_target=True,
+        literal_flag_before_target=True,
         command_timeout_s=10.0,
     )
     delivery = build_prompt_delivery(

@@ -342,6 +342,26 @@ class BackendConformanceSuite:
         finally:
             await backend.close()
 
+    async def test_send_keys_atomic_sync_delivers_all_keys(
+        self, adapter: ConformanceAdapter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``send_keys_atomic_sync`` delivers every key in the sequence, in order.
+
+        The atomic multi-key primitive (goose's packed ``Down Down Enter``): tmux
+        emits one ``send-keys`` with every key, herdr one ``pane send-keys``, the
+        fake one recorded call — all observable as each key's marker on screen.
+        """
+        backend = adapter.make_backend(tmp_path, monkeypatch)
+        await backend.launch(adapter.launch_request(adapter.alive_command()))
+        try:
+            keys = list(adapter.sample_keys)
+            backend.send_keys_atomic_sync(keys)
+            snapshot = backend.delivery_snapshot_sync()
+            for key in keys:
+                assert adapter.key_marker(key) in snapshot
+        finally:
+            await backend.close()
+
     async def test_inner_exit_without_keep_alive_is_endpoint_gone(
         self, adapter: ConformanceAdapter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

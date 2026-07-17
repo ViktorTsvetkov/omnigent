@@ -1352,6 +1352,27 @@ class TerminalBackend(ABC):
             return
         self.send_keys_sync([key] * count)
 
+    def send_keys_atomic_sync(self, keys: Sequence[str]) -> None:
+        """Press all *keys* in ONE multiplexer client command (atomic multi-key).
+
+        Backs :meth:`TerminalDelivery.send_keys_atomic`, for a source stream that
+        packed several named keys into a single injection — e.g. goose's
+        permission-dialog ``Down Down Enter``. A single client command is atomic
+        relative to any other attached client, so the sequence cannot be
+        interleaved by a concurrent client and mis-answer the dialog. Distinct
+        from :meth:`send_keys_sync`, which the tmux backend sends as one command
+        PER key.
+
+        The default delegates to :meth:`send_keys_sync`, which already packs every
+        key into a single command on backends whose send path is inherently atomic
+        (herdr's one ``pane send-keys``; the in-process fake records one call);
+        tmux overrides this to emit a single ``send-keys``.
+
+        :param keys: The ordered keys to deliver as one command, e.g.
+            ``["Down", "Down", "Enter"]``.
+        """
+        self.send_keys_sync(keys)
+
     def native_popup_launch(
         self,
         *,
@@ -1409,6 +1430,11 @@ class TmuxDeliveryStyle:
         delivery snapshot. ``False`` (default) → ``capture-pane -t <target> -p``
         (claude's order, the #8 surface); ``True`` → ``capture-pane -p -t
         <target>`` (cursor/goose/kimi's order).
+    :param literal_flag_before_target: ``send-keys -l`` flag order for literal
+        typing (:meth:`TmuxBackend.send_text_sync`). ``False`` (default) →
+        ``send-keys -l -t <target> <text>`` (claude's order, the #8 surface);
+        ``True`` → ``send-keys -t <target> -l <text>`` (cursor's ``/model``
+        picker order). Only cursor differs here (goose/kimi type no literals).
     :param command_timeout_s: Per-command subprocess timeout for every delivery
         client command (send/paste/kill/snapshot/liveness). Default matches
         claude's :data:`_DELIVERY_SEND_TIMEOUT_S`; cursor/goose pass ``10.0``,
@@ -1417,6 +1443,7 @@ class TmuxDeliveryStyle:
 
     paste_buffer: str = _TMUX_PASTE_BUFFER
     capture_flag_before_target: bool = False
+    literal_flag_before_target: bool = False
     command_timeout_s: float = _DELIVERY_SEND_TIMEOUT_S
 
 
@@ -1794,16 +1821,18 @@ class TmuxBackend(TerminalBackend):
     def send_text_sync(self, text: str) -> None:
         """Type literal *text* via ``send-keys -l``, chunked under tmux's cap.
 
-        Synchronous, byte-identical sibling of :meth:`send_text`.
+        Synchronous, byte-identical sibling of :meth:`send_text`. The ``-l`` / ``-t``
+        flag order follows the bound bridge's dialect
+        (:attr:`TmuxDeliveryStyle.literal_flag_before_target`) so cursor's
+        ``send-keys -t <target> -l`` picker order is preserved; the default keeps
+        claude's ``-l -t <target>`` order.
         """
         for start in range(0, len(text), _SEND_KEYS_LITERAL_CHARS_PER_CALL):
-            self._delivery_run_sync(
-                "send-keys",
-                "-l",
-                "-t",
-                self._target,
-                text[start : start + _SEND_KEYS_LITERAL_CHARS_PER_CALL],
-            )
+            chunk = text[start : start + _SEND_KEYS_LITERAL_CHARS_PER_CALL]
+            if self._delivery_style.literal_flag_before_target:
+                self._delivery_run_sync("send-keys", "-t", self._target, "-l", chunk)
+            else:
+                self._delivery_run_sync("send-keys", "-l", "-t", self._target, chunk)
 
     def send_keys_sync(self, keys: Sequence[str]) -> None:
         """Press each named key via ``send-keys`` (sync sibling of :meth:`send_keys`)."""
@@ -1888,6 +1917,19 @@ class TmuxBackend(TerminalBackend):
         if count <= 0:
             return
         self._delivery_run_sync("send-keys", "-t", self._target, "-N", str(count), key)
+
+    def send_keys_atomic_sync(self, keys: Sequence[str]) -> None:
+        """Press all *keys* in one ``send-keys -t <target> k1 k2 …`` call.
+
+        Byte-identical to goose's packed permission-dialog keystroke
+        (``send-keys -t <target> Down Down Enter``): one client command, so the
+        sequence is atomic against any other attached tmux client. An empty
+        sequence emits no command.
+        """
+        keys = list(keys)
+        if not keys:
+            return
+        self._delivery_run_sync("send-keys", "-t", self._target, *keys)
 
     def delivery_snapshot_sync(self) -> str:
         """Snapshot the pane via ``capture-pane -p`` for the delivery dance.
@@ -3384,6 +3426,18 @@ class TerminalDelivery:
         *count* single presses.
         """
         self._backend.send_keys_repeated_sync(key, count)
+
+    def send_keys_atomic(self, keys: Sequence[str]) -> None:
+        """Press all *keys* in ONE multiplexer client command (atomic multi-key).
+
+        Use when the source stream packed several named keys into a single
+        injection — e.g. a permission dialog's ``Down Down Enter`` — so a
+        concurrent client cannot interleave the sequence and mis-answer the
+        dialog. The tmux backend emits one ``send-keys`` with every key; herdr's
+        one ``pane send-keys`` is already atomic. Single-key callers should use
+        :meth:`send_keys`.
+        """
+        self._backend.send_keys_atomic_sync(list(keys))
 
     def type_literal(self, text: str) -> None:
         """Type *text* literally into the composer without submitting (e.g. a

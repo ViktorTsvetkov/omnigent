@@ -27,6 +27,10 @@ Modeled vocabulary (nothing else)
   old protocol). Models the real ``herdr api schema`` default output, which is
   human-readable text (NOT JSON) — the #12 protocol probe regex-extracts the
   number. Session-independent, but still invoked with an explicit ``--session``.
+- ``server`` (``herdr --session <s> server``) — start the session's headless
+  server; until it runs, the socket verbs below fail with the real OS NotFound
+  (``Os { code: 2, kind: NotFound }`` + exit 1). The :data:`SERVER_REFUSE_ENV_VAR`
+  knob makes it refuse, exercising the backend's readiness-timeout path.
 - ``workspace list`` / ``workspace create --label --cwd --no-focus`` / ``workspace
   close --workspace`` — labels are NOT unique (a create never dedupes), so the
   backend can leave and later adopt same-label husks. ``create`` auto-spawns a
@@ -96,6 +100,10 @@ VERSION_ENV_VAR = "OMNIGENT_HERDR_VERSION"
 #: native reads ``idle`` while the screen keeps changing). Unset → the pane's
 #: own stored status (default ``"idle"``).
 AGENT_STATUS_ENV_VAR = "OMNIGENT_HERDR_AGENT_STATUS"
+#: When set (to any non-empty value), the fake's ``server`` command REFUSES to
+#: start (marks nothing running and exits non-zero), so a test can drive the
+#: backend's "server did not become ready" failure path.
+SERVER_REFUSE_ENV_VAR = "OMNIGENT_HERDR_SERVER_REFUSE"
 
 DEFAULT_PROTOCOL = "16"
 DEFAULT_VERSION = "0.7.4-preview"
@@ -160,8 +168,19 @@ def _save(state_dir: str, session: str, state: dict[str, object]) -> None:
 
 
 def _blank_state(session: str) -> dict[str, object]:
-    """Return an empty per-session server state (no workspaces yet)."""
-    return {"session": session, "counter": 0, "workspaces": {}, "tabs": {}, "panes": {}}
+    """Return an empty per-session server state (no workspaces yet).
+
+    ``server_running`` starts ``False``: a named session's server does not
+    auto-start, so socket verbs fail with an OS NotFound until ``server`` runs.
+    """
+    return {
+        "session": session,
+        "counter": 0,
+        "server_running": False,
+        "workspaces": {},
+        "tabs": {},
+        "panes": {},
+    }
 
 
 def seed_workspace(state_dir: str | Path, session: str, label: str) -> str:
@@ -285,6 +304,44 @@ def _write_error(envelope_id: str, code: str, message: str = "") -> None:
     exercises its stdout-then-stderr envelope parsing.
     """
     sys.stderr.write(json.dumps({"error": {"code": code, "message": message}, "id": envelope_id}))
+
+
+def _write_os_not_found() -> None:
+    """Emit the OS NotFound a serverless herdr session raises on a socket verb.
+
+    Real herdr surfaces a missing session-server socket as a raw Rust
+    ``Error: Os { code: 2, kind: NotFound, ... }`` on stderr with a non-zero
+    exit — NOT a JSON envelope. Reproduced verbatim so the backend's server
+    bring-up is exercised against the real failure shape.
+    """
+    sys.stderr.write(
+        "Error: Os { code: 2, kind: NotFound, "
+        'message: "The system cannot find the file specified." }\n'
+    )
+
+
+def _server_running(state_dir: str, session: str) -> bool:
+    """Return whether *session*'s headless server has been started."""
+    state = _load(state_dir, session)
+    return bool(state and state.get("server_running"))
+
+
+def _handle_server(state_dir: str, session: str) -> int:
+    """Handle ``herdr --session <s> server`` — start the headless session server.
+
+    Marks the session's server running so subsequent socket verbs succeed. The
+    real command is a long-lived foreground process; the fake just records the
+    running state (the sidecar IS the socket) and returns. The
+    :data:`SERVER_REFUSE_ENV_VAR` knob makes it refuse (nothing marked running),
+    so a test can drive the backend's readiness-timeout failure path.
+    """
+    if os.environ.get(SERVER_REFUSE_ENV_VAR):
+        sys.stderr.write("error: herdr server refused to start (probe knob)\n")
+        return 1
+    state = _load(state_dir, session) or _blank_state(session)
+    state["server_running"] = True
+    _save(state_dir, session, state)
+    return 0
 
 
 def _handle_api_schema() -> int:
@@ -630,6 +687,20 @@ def main(argv: list[str]) -> int:
     if not state_dir:
         sys.stderr.write(f"{STATE_DIR_ENV_VAR} not set\n")
         return 2
+
+    # ``herdr --session <s> server`` — bring up the session's headless server. A
+    # named session's server does NOT auto-start; until it does, socket verbs
+    # below fail with the OS NotFound (see _require_server).
+    if command == "server":
+        return _handle_server(state_dir, session)
+
+    # Socket-API verbs require a running server (their real transport is the
+    # session socket). Without one they fail exactly like real herdr does.
+    if command in ("workspace", "tab", "agent", "pane") and not _server_running(
+        state_dir, session
+    ):
+        _write_os_not_found()
+        return 1
 
     if command == "workspace":
         return _handle_workspace(state_dir, session, rest)

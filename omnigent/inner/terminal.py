@@ -1544,7 +1544,10 @@ class HerdrBackend(TerminalBackend):
 
     **Session lifecycle (#11):** launch (with husk adopt/replace), liveness,
     close/kill, orphan reaping, geometry pinning, Windows path translation, and
-    CRLF stripping.
+    CRLF stripping. **Server bring-up (#13):** a named session's server does not
+    auto-start, so :meth:`launch` starts it headless before the first socket verb
+    (:meth:`_ensure_server_running`); stopping the idle server and crash-safe
+    server reaping remain #15.
 
     **I/O operations (#12):** non-submitting multi-line paste (``pane
     send-text``), atomic submit / named-key delivery with the full
@@ -1634,6 +1637,12 @@ class HerdrBackend(TerminalBackend):
     # "never bare" posture — nothing the adapter emits can target ``default``).
     _PROBE_SESSION = "omnigent-probe"
     _CLI_TIMEOUT_S = 15.0
+    # A named herdr session's server does NOT auto-start: the first socket-API
+    # verb against a session with no server fails with an OS NotFound. :meth:`launch`
+    # starts it headless and waits up to this long for the socket to answer,
+    # polling at this interval (a headless server binds its socket in ~1 s).
+    _SERVER_READY_TIMEOUT_S = 10.0
+    _SERVER_POLL_INTERVAL_S = 0.2
     # Neutral key names herdr has no equivalent for; skipped rather than sent as
     # a wrong key. Covers both the plain spellings and tmux's aliases for the
     # same keys (``PPage``/``NPage`` = PageUp/PageDown, ``DC``/``IC`` =
@@ -2027,6 +2036,83 @@ class HerdrBackend(TerminalBackend):
             )
         return proc.stdout.decode(errors="replace")
 
+    # ------------------------------------------------------------- server mgmt
+
+    async def _server_responsive(self) -> bool:
+        """Return whether this session's herdr server answers a socket verb.
+
+        A cheap read-only ``workspace list`` against the session: exit 0 means the
+        server is up and reachable; a non-zero exit (the OS NotFound when no
+        server is bound) or a spawn failure means not yet.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self._base_argv(),
+                "workspace",
+                "list",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            returncode = await asyncio.wait_for(proc.wait(), timeout=self._CLI_TIMEOUT_S)
+        except (OSError, asyncio.TimeoutError):
+            return False
+        return returncode == 0
+
+    async def _ensure_server_running(self) -> None:
+        """Start this session's headless herdr server and wait until it answers.
+
+        A named herdr session's server does not auto-start — the first socket-API
+        verb against a serverless session fails with an OS NotFound (``Os { code:
+        2, kind: NotFound }``), the failure #13's first real-herdr contact hit. So
+        ``launch`` starts the server explicitly with ``herdr --session <s> server``
+        (headless, long-lived) BEFORE any socket verb.
+
+        **Idempotent** and cheap on the hot path: if the server is already up (a
+        husk restart on the same endpoint) the fast-path check returns immediately
+        and no second server is spawned; a redundant real ``server`` start would in
+        any case exit with "already running" (verified), which the readiness poll
+        simply rides through. The server is spawned in its own process group
+        (:func:`_proc.spawn_kwargs`) so it is not tied to this call, and its output
+        is discarded (herdr keeps its own log file).
+
+        **Lifetime / ownership.** The session is omnigent-scoped and per-endpoint
+        (:meth:`_session_name`), so its server is exclusively this terminal's. It
+        is intentionally NOT stopped in :meth:`close`: closing the workspace makes
+        liveness read the clean ``workspace_not_found`` ENDPOINT_GONE signal (a
+        *stopped server* would instead give an ambiguous NotFound), and a later
+        restart on the same endpoint reuses the still-running server. Stopping the
+        idle server on close and crash-safe server reaping (the herdr analog of
+        :func:`reap_orphaned_terminals`) are the residual #15 "explicit headless
+        server management" items — the leaked server is an empty idle process, and
+        the inner pane's process is already reaped by the workspace close.
+
+        :raises RuntimeError: If the server does not answer within
+            :data:`_SERVER_READY_TIMEOUT_S`.
+        """
+        if await self._server_responsive():
+            return
+        # Fire-and-forget headless server: a plain (non-awaited) Popen because it
+        # is long-lived — its own process group, output discarded.
+        with contextlib.suppress(OSError):
+            subprocess.Popen(
+                [*self._command_prefix(), "--session", self._session, "server"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **_proc.spawn_kwargs(),
+            )
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + self._SERVER_READY_TIMEOUT_S
+        while loop.time() < deadline:
+            if await self._server_responsive():
+                return
+            await asyncio.sleep(self._SERVER_POLL_INTERVAL_S)
+        raise RuntimeError(
+            f"herdr session server for {self._session!r} did not become ready within "
+            f"{self._SERVER_READY_TIMEOUT_S:.0f}s (a headless 'herdr --session <s> server' "
+            f"could not be started or did not bind its socket)."
+        )
+
     # ---------------------------------------------------------------- protocol
 
     async def launch(self, request: TerminalLaunchRequest) -> None:
@@ -2069,8 +2155,13 @@ class HerdrBackend(TerminalBackend):
         per-session server stays a #15 integration concern.
 
         :param request: The backend-neutral launch request.
-        :raises RuntimeError: If herdr rejects the workspace/agent creation.
+        :raises RuntimeError: If herdr rejects the workspace/agent creation, or if
+            the session's headless server cannot be started (see
+            :meth:`_ensure_server_running`).
         """
+        # A named session's server does not auto-start; bring it up before the
+        # first socket-API verb (else ``workspace list`` fails with an OS NotFound).
+        await self._ensure_server_running()
         listing = await self._run_json("workspace", "list")
         husks = [
             ws["id"]

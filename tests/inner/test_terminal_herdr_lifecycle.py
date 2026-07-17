@@ -390,6 +390,50 @@ async def test_launch_threads_env_as_agent_start_flags(herdr_env: _HerdrEnv) -> 
         await backend.close()
 
 
+async def test_launch_starts_session_server_before_socket_verbs(herdr_env: _HerdrEnv) -> None:
+    """launch() brings up the session's headless server before any socket verb.
+
+    A named herdr session's server does not auto-start (the first socket verb
+    would fail with an OS NotFound), so launch must start it via ``--session <s>
+    server`` before ``workspace create``.
+    """
+    backend = herdr_env.make_backend()
+    await backend.launch(_request(["sleep", "1000000"]))
+    try:
+        log = herdr_env.log()
+        assert any(a[2:3] == ["server"] for a in log), "expected a 'server' bring-up"
+        server_idx = next(i for i, a in enumerate(log) if a[2:3] == ["server"])
+        create_idx = next(i for i, a in enumerate(log) if a[2:4] == ["workspace", "create"])
+        assert server_idx < create_idx  # server up before the first mutating verb
+        assert herdr_env.load_state(backend)["server_running"] is True
+    finally:
+        await backend.close()
+
+
+async def test_ensure_server_is_idempotent_when_already_running(herdr_env: _HerdrEnv) -> None:
+    """A redundant server-ensure on a live session spawns no second server."""
+    backend = herdr_env.make_backend()
+    await backend.launch(_request(["sleep", "1000000"]))
+    try:
+        before = sum(1 for a in herdr_env.log() if a[2:3] == ["server"])
+        await backend._ensure_server_running()  # already up → fast-path, no spawn
+        after = sum(1 for a in herdr_env.log() if a[2:3] == ["server"])
+        assert after == before
+    finally:
+        await backend.close()
+
+
+async def test_launch_fails_clearly_when_server_cannot_start(herdr_env: _HerdrEnv) -> None:
+    """A session server that never comes up fails launch with an actionable error."""
+    herdr_env.monkeypatch.setenv(_fake_herdr.SERVER_REFUSE_ENV_VAR, "1")
+    herdr_env.monkeypatch.setattr(HerdrBackend, "_SERVER_READY_TIMEOUT_S", 0.6)
+    herdr_env.monkeypatch.setattr(HerdrBackend, "_SERVER_POLL_INTERVAL_S", 0.1)
+    backend = herdr_env.make_backend()
+    with pytest.raises(RuntimeError) as excinfo:
+        await backend.launch(_request(["sleep", "1000000"]))
+    assert "server" in str(excinfo.value).lower()
+
+
 async def test_launch_with_empty_env_emits_no_env_flags(herdr_env: _HerdrEnv) -> None:
     """An empty ``request.env`` threads zero ``--env`` flags (POSIX-neutral)."""
     backend = herdr_env.make_backend()

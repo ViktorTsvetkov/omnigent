@@ -1092,6 +1092,10 @@ class TerminalBackend(ABC):
         del socket_path, target  # base: no hook; overriding backends build here
         return None
 
+    def advertised_target(self, *, fallback: str) -> str:
+        """Return the address persisted for later delivery reconstruction."""
+        return fallback
+
     @abstractmethod
     async def launch(self, request: TerminalLaunchRequest) -> None:
         """Create the hosted session/pane and start the inner command.
@@ -2268,7 +2272,10 @@ class HerdrBackend(TerminalBackend):
         herdr becomes constructible with no dispatcher edit (the seam the
         in-process ``FakeBackend`` already uses).
         """
-        return cls(socket_path=socket_path, target=target)
+        backend = cls(socket_path=socket_path)
+        if target != "main":
+            backend._pane_id = target
+        return backend
 
     def __init__(self, *, socket_path: Path, target: str = "main") -> None:
         """
@@ -2292,6 +2299,10 @@ class HerdrBackend(TerminalBackend):
         # corroboration heuristic (native ``agent_status`` reads idle during long
         # foreground tool calls, so a changing screen overrides a native idle).
         self._last_activity_snapshot: str | None = None
+
+    def advertised_target(self, *, fallback: str) -> str:
+        """Return the live herdr pane id used by delivery commands."""
+        return self._pane_id or fallback
 
     # ------------------------------------------------------------- derivation
 
@@ -3777,6 +3788,11 @@ class TerminalInstance:
         platform-driven.
         """
         return self._backend.capabilities
+
+    @property
+    def delivery_target(self) -> str:
+        """Return the backend-native target for a persisted delivery handle."""
+        return self._backend.advertised_target(fallback=self.tmux_target)
 
     def note_client_interaction(self) -> None:
         """Record that a web client just interacted with this terminal.

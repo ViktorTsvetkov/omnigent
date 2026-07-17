@@ -18,10 +18,12 @@ import pytest
 import omnigent.inner.terminal as terminal_mod
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import (
+    HerdrBackend,
     Liveness,
     TerminalBackend,
     TerminalLaunchRequest,
     TmuxBackend,
+    build_prompt_delivery,
     create_terminal_instance,
     resolve_terminal_backend_name,
     select_terminal_backend_class,
@@ -316,6 +318,28 @@ def test_construct_terminal_backend_unknown_name_raises(tmp_path: Path) -> None:
         terminal_mod._construct_terminal_backend(
             "nope", socket_path=tmp_path / "s.sock", target="main"
         )
+
+
+def test_build_prompt_delivery_binds_advertised_herdr_pane(tmp_path: Path) -> None:
+    """A herdr advertisement reconstructs delivery against its live pane id."""
+    delivery = build_prompt_delivery(
+        socket_path=tmp_path / "terminal.endpoint",
+        target="w1:p2",
+        backend_name="herdr",
+    )
+
+    assert isinstance(delivery.backend, HerdrBackend)
+    assert delivery.backend._pane_id == "w1:p2"
+
+
+def test_build_prompt_delivery_without_backend_remains_tmux(tmp_path: Path) -> None:
+    """Legacy advertisements retain the byte-identical tmux default."""
+    socket_path = tmp_path / "tmux.sock"
+    delivery = build_prompt_delivery(socket_path=socket_path, target="main")
+
+    assert isinstance(delivery.backend, TmuxBackend)
+    assert delivery.backend._socket_path == socket_path
+    assert delivery.backend._target == "main"
 
 
 def test_construct_terminal_backend_registered_but_unwired_raises(

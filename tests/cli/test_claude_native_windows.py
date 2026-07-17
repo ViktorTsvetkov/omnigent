@@ -6,6 +6,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import click
 import pytest
@@ -119,3 +120,45 @@ def test_windows_attach_degrades_without_pty_and_keeps_session(
     )
 
     assert outcome is claude_native._AttachOutcome.DETACHED
+
+
+def test_runner_advertises_herdr_backend_and_pane(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The runner publishes the live herdr pane address for bridge delivery."""
+    from omnigent.runner import app as runner_app
+
+    captured: dict[str, object] = {}
+    instance = SimpleNamespace(
+        running=True,
+        socket_path=tmp_path / "terminal.endpoint",
+        tmux_target="main",
+        backend_name="herdr",
+        delivery_target="w1:p2",
+    )
+    terminal_registry = SimpleNamespace(get=lambda *_args: instance)
+    resource_registry = SimpleNamespace(terminal_registry=terminal_registry)
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge.bridge_dir_for_bridge_id",
+        lambda _bridge_id: tmp_path / "bridge",
+    )
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge.write_tmux_target",
+        lambda bridge_dir, **kwargs: captured.update(bridge_dir=bridge_dir, **kwargs),
+    )
+
+    runner_app._publish_tmux_target_for_bridge(
+        resource_registry=resource_registry,
+        session_id="conv_1",
+        bridge_id="bridge_1",
+        terminal_name="claude",
+        session_key="main",
+    )
+
+    assert captured == {
+        "bridge_dir": tmp_path / "bridge",
+        "socket_path": tmp_path / "terminal.endpoint",
+        "tmux_target": "main",
+        "backend": "herdr",
+        "pane_id": "w1:p2",
+    }

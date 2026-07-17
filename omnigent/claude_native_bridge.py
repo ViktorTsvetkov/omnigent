@@ -2468,6 +2468,8 @@ def write_tmux_target(
     socket_path: Path,
     tmux_target: str,
     pid: int | None = None,
+    backend: str | None = None,
+    pane_id: str | None = None,
 ) -> None:
     """
     Advertise the tmux socket + target for the Claude terminal.
@@ -2482,6 +2484,9 @@ def write_tmux_target(
         socket, e.g. ``Path("/tmp/.../tmux.sock")``.
     :param tmux_target: tmux pane target string, e.g. ``"claude:0.0"``.
     :param pid: Optional Claude process pid, recorded for diagnostics.
+    :param backend: Optional hosting backend. ``None``/``"tmux"`` preserves the
+        legacy advertisement; non-tmux delivery records the backend name.
+    :param pane_id: Backend-native pane address, required by herdr delivery.
     :returns: None.
     """
     _ensure_secure_dir(bridge_dir)
@@ -2492,7 +2497,29 @@ def write_tmux_target(
     }
     if pid is not None:
         payload["pid"] = pid
+    if backend is not None and backend != "tmux":
+        payload["backend"] = backend
+        if pane_id is not None:
+            payload["pane_id"] = pane_id
     _write_json_file(bridge_dir / _TMUX_FILE, payload)
+
+
+def _build_advertised_prompt_delivery(info: dict[str, str]) -> TerminalDelivery:
+    """Build delivery from an advertisement, defaulting legacy records to tmux."""
+    backend = info.get("backend")
+    if backend is None:
+        return build_prompt_delivery(
+            socket_path=info["socket_path"],
+            target=info["tmux_target"],
+        )
+    pane_id = info.get("pane_id")
+    if backend == "herdr" and pane_id is None:
+        raise RuntimeError("Claude herdr terminal advertisement is missing pane_id")
+    return build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=pane_id or info["tmux_target"],
+        backend_name=backend,
+    )
 
 
 def inject_user_message(
@@ -2542,10 +2569,7 @@ def inject_user_message(
         after repeated submit Enters (message not delivered).
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-    )
+    delivery = _build_advertised_prompt_delivery(info)
     # tmux.json only means the tmux session exists; Claude Code's input
     # box mounts a few seconds later. Block until the prompt renders so
     # the first message isn't typed into a still-booting TUI and dropped.
@@ -2615,10 +2639,7 @@ def inject_interrupt(
         time, or if the ``tmux send-keys`` invocation fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-    )
+    delivery = _build_advertised_prompt_delivery(info)
     # A single named ``Escape`` key (Claude Code cancels an in-flight response
     # on one Escape). Sent as a named key — not literal — so it is the key, not
     # the bytes of the word.
@@ -2660,10 +2681,7 @@ def kill_session(
         time, or if the ``tmux kill-session`` invocation fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-    )
+    delivery = _build_advertised_prompt_delivery(info)
     delivery.kill()
 
 
@@ -2702,10 +2720,7 @@ def inject_slash_command(
     if "\n" in command:
         raise ValueError("slash command must be a single line")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-    )
+    delivery = _build_advertised_prompt_delivery(info)
     # ``C-u`` clears any draft the user is mid-typing; otherwise the
     # literal type below concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
@@ -2786,10 +2801,7 @@ def display_cost_approval_popup(
         best-effort miss and the web card remains answerable.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-    )
+    delivery = _build_advertised_prompt_delivery(info)
     # Capability-gated: the tmux backend overlays the popup on the pane; a
     # backend without a native popup no-ops and the web ApprovalCard remains
     # the answer surface.
@@ -3199,7 +3211,14 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
         socket_path = payload.get("socket_path") if isinstance(payload, dict) else None
         tmux_target = payload.get("tmux_target") if isinstance(payload, dict) else None
         if isinstance(socket_path, str) and isinstance(tmux_target, str):
-            return {"socket_path": socket_path, "tmux_target": tmux_target}
+            info = {"socket_path": socket_path, "tmux_target": tmux_target}
+            backend = payload.get("backend")
+            pane_id = payload.get("pane_id")
+            if isinstance(backend, str):
+                info["backend"] = backend
+            if isinstance(pane_id, str):
+                info["pane_id"] = pane_id
+            return info
         time.sleep(0.05)
     raise RuntimeError(
         "Claude terminal tmux target is not advertised yet. Wait for the "

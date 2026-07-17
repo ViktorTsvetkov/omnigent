@@ -2381,7 +2381,83 @@ def test_write_tmux_target_persists_socket_and_target(tmp_path: Path) -> None:
     assert payload["socket_path"] == "/tmp/example/tmux.sock"
     assert payload["tmux_target"] == "claude:0.0"
     assert payload["pid"] == 12345
+    assert "backend" not in payload
+    assert "pane_id" not in payload
     assert before <= payload["updated_at"] <= after
+
+
+def test_write_tmux_target_persists_herdr_delivery_address(tmp_path: Path) -> None:
+    """A herdr-hosted Claude pane advertises its backend-native pane id."""
+    bridge_dir = tmp_path / "bridge"
+
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("C:/omnigent/terminal.endpoint"),
+        tmux_target="main",
+        backend="herdr",
+        pane_id="w1:p2",
+    )
+
+    payload = json.loads((bridge_dir / "tmux.json").read_text(encoding="utf-8"))
+    assert payload["backend"] == "herdr"
+    assert payload["pane_id"] == "w1:p2"
+
+
+@pytest.mark.parametrize("injector", ["user", "interrupt", "slash"])
+def test_claude_injectors_select_advertised_herdr_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    injector: str,
+) -> None:
+    """Prompt, interrupt, and slash delivery all bind the advertised herdr pane."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("C:/omnigent/terminal.endpoint"),
+        tmux_target="main",
+        backend="herdr",
+        pane_id="w1:p2",
+    )
+    captured: dict[str, object] = {}
+
+    class _Delivery:
+        def snapshot(self) -> str:
+            return "â•­ prompt\nâ¯ "
+
+        def send_keys(self, keys: list[str]) -> None:
+            captured.setdefault("keys", []).append(keys)  # type: ignore[union-attr]
+
+        def paste_without_submit(self, text: str) -> None:
+            captured["paste"] = text
+
+        def submit_and_verify(self, **_kwargs: object) -> None:
+            return None
+
+        def type_literal(self, text: str) -> None:
+            captured["literal"] = text
+
+    def _build(**kwargs: object) -> _Delivery:
+        captured["builder"] = kwargs
+        return _Delivery()
+
+    monkeypatch.setattr(claude_native_bridge, "build_prompt_delivery", _build)
+    if injector == "user":
+        monkeypatch.setattr(
+            claude_native_bridge,
+            "_wait_for_claude_prompt_ready",
+            lambda *_a, **_k: None,
+        )
+        inject_user_message(bridge_dir, content="hello")
+    elif injector == "interrupt":
+        inject_interrupt(bridge_dir)
+    else:
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
+
+    assert captured["builder"] == {
+        "socket_path": str(Path("C:/omnigent/terminal.endpoint")),
+        "target": "w1:p2",
+        "backend_name": "herdr",
+    }
 
 
 @pytest.mark.parametrize(

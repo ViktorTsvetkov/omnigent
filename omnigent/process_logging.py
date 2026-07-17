@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO
 
-from omnigent._platform import IS_POSIX
+from omnigent._platform import IS_POSIX, reconfigure_std_streams_for_windows
 
 DATA_DIR_ENV_VAR = "OMNIGENT_DATA_DIR"
 LOG_LEVEL_ENV_VAR = "OMNIGENT_LOG_LEVEL"
@@ -279,6 +279,12 @@ def configure_process_logging(
     The returned file always receives logs. Stderr receives logs only when
     requested and an interactive terminal stream is available.
     """
+    # Shared entry setup for every daemon-spawned process (host daemon, runner,
+    # background server): make stdout/stderr UTF-8 tolerant BEFORE any output, so
+    # a legacy-code-page redirected stream on Windows can never crash a `✓`/emoji
+    # print (which in the host tunnel loop would wedge the daemon offline). No-op
+    # off Windows and on streams that cannot be reconfigured.
+    reconfigure_std_streams_for_windows()
     resolved_level = effective_log_level() if level is None else level
     path = Path(log_path).expanduser() if log_path is not None else _process_log_file_from_env()
     if path is None:

@@ -66,6 +66,40 @@ WINDOWS_ENV_PASSTHROUGH: tuple[str, ...] = (
 )
 
 
+def reconfigure_std_streams_for_windows() -> None:
+    """Make this process's stdout/stderr tolerate any Unicode on Windows.
+
+    A detached daemon / runner / background-server process on Windows inherits
+    ``stdout``/``stderr`` that the parent redirected to a log file, and their
+    text codec defaults to the legacy Windows code page (cp1252 / ``charmap``).
+    Any of the codebase's many ``✓``/emoji ``print`` statements then raises
+    ``UnicodeEncodeError`` on those streams — and in the host tunnel's serve loop
+    that error unwinds into a *permanent* reconnect cycle, so the daemon never
+    comes online (observed on the codex-native Windows path, whose daemon path
+    was unreachable before Windows enablement).
+
+    Reconfigure both streams to UTF-8 with ``errors="backslashreplace"`` so no
+    conceivable character can ever crash a background process's output again.
+    Best-effort and **Windows-only**: a stream that cannot be reconfigured (not a
+    ``TextIOWrapper``, already detached, or ``None``) is left untouched. Call this
+    once, as early as possible, at each daemon-spawned process's entry (it is
+    invoked from :func:`omnigent.process_logging.configure_process_logging`, the
+    shared setup every such process runs before its first output).
+
+    :returns: None.
+    """
+    if not IS_WINDOWS:
+        return
+    import contextlib
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        with contextlib.suppress(Exception):
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+
+
 def default_shell_argv(command: str) -> list[str]:
     """
     Build the argv to run ``command`` through the host's default shell.

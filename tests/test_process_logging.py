@@ -166,3 +166,72 @@ def test_terminal_supports_color_checks_explicit_log_fd(
                 continue
             with contextlib.suppress(OSError):
                 os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# reconfigure_std_streams_for_windows — the daemon UTF-8 output guard
+# ---------------------------------------------------------------------------
+
+
+def test_reconfigure_makes_checkmark_printable_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On Windows, cp1252 stdout/stderr are reconfigured so a ``✓`` print survives.
+
+    Reproduces the daemon crash: a detached process on Windows inherits a legacy
+    code-page stream, so ``print("✓ ...")`` raised ``UnicodeEncodeError`` and (in
+    the host tunnel loop) wedged the daemon in a permanent reconnect cycle. After
+    the guard runs, the checkmark writes cleanly.
+    """
+    import io
+
+    import omnigent._platform as platform_mod
+
+    # Precondition: an independent cp1252 stream cannot encode the checkmark.
+    probe = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    with pytest.raises(UnicodeEncodeError):
+        probe.write("✓")
+        probe.flush()
+
+    out = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    err = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    monkeypatch.setattr(platform_mod, "IS_WINDOWS", True)
+    monkeypatch.setattr(platform_mod.sys, "stdout", out)
+    monkeypatch.setattr(platform_mod.sys, "stderr", err)
+
+    platform_mod.reconfigure_std_streams_for_windows()
+
+    # Both streams now accept the checkmark (and any Unicode) without raising.
+    out.write("✓ connected")
+    out.flush()
+    err.write("✓ err")
+    err.flush()
+    assert out.encoding.lower() == "utf-8"
+    assert err.encoding.lower() == "utf-8"
+
+
+def test_reconfigure_is_noop_off_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Off Windows the guard leaves the stream codec untouched (byte-identical)."""
+    import io
+
+    import omnigent._platform as platform_mod
+
+    out = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    monkeypatch.setattr(platform_mod, "IS_WINDOWS", False)
+    monkeypatch.setattr(platform_mod.sys, "stdout", out)
+    platform_mod.reconfigure_std_streams_for_windows()
+    assert out.encoding.lower() == "cp1252"
+
+
+def test_reconfigure_tolerates_streams_without_reconfigure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream that cannot be reconfigured (or is None) is skipped, never raises."""
+    import io
+
+    import omnigent._platform as platform_mod
+
+    monkeypatch.setattr(platform_mod, "IS_WINDOWS", True)
+    monkeypatch.setattr(platform_mod.sys, "stdout", io.StringIO())  # no .reconfigure
+    monkeypatch.setattr(platform_mod.sys, "stderr", None)  # no stream at all
+    platform_mod.reconfigure_std_streams_for_windows()  # must not raise

@@ -47,6 +47,7 @@ from websockets.exceptions import ConnectionClosed, ConnectionClosedError, WebSo
 from websockets.frames import Close
 
 from omnigent._native_resume_hint import echo_native_resume_hint
+from omnigent._platform import IS_WINDOWS
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._startup_profile import StartupProfiler
 from omnigent._terminal_picker_theme import (
@@ -2148,6 +2149,9 @@ async def _attach_with_transcript_forwarder(
         :attr:`_AttachOutcome.EXITED`.
     """
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
+    if IS_WINDOWS:
+        _print_herdr_local_attach_guidance(prepared)
+        return _AttachOutcome.DETACHED
     # ``start_at_end`` covers both reattach (terminal still live,
     # transcript JSONL still growing) and cold resume (new terminal
     # but ``claude --resume <sid>`` reopens the prior transcript so
@@ -2236,6 +2240,38 @@ async def _attach_with_transcript_forwarder(
                 terminal_id=prepared.terminal_id,
             )
     return outcome
+
+
+def _print_herdr_local_attach_guidance(prepared: PreparedClaudeTerminal) -> None:
+    """Point a Windows user at the herdr GUI for the hosted Claude pane."""
+    label: str | None = None
+    if prepared.tmux_socket is not None:
+        from omnigent.inner.terminal import HerdrBackend
+
+        label = HerdrBackend.workspace_label_for(
+            prepared.tmux_socket, prepared.tmux_target or "main"
+        )
+    click.echo(
+        "\nClaude is running in a herdr terminal on this Windows host.", err=True
+    )
+    click.echo(
+        "Local terminal attach is POSIX-only; to watch the native TUI, open the "
+        "herdr app",
+        err=True,
+    )
+    if label is not None:
+        click.echo(f"and select the workspace labeled '{label}'.", err=True)
+    else:
+        click.echo(
+            "and select this session's omnigent workspace (label prefix "
+            "'omnigent-ws-').",
+            err=True,
+        )
+    click.echo(
+        "The session keeps running on the runner; you can also drive it from the "
+        "Web UI above.",
+        err=True,
+    )
 
 
 async def _attach_with_reconnect(
@@ -3890,6 +3926,8 @@ def _preflight_local_tools(command: str) -> None:
             f"Claude Code CLI command {command!r} was not found on local PATH. "
             "--server selects the Omnigent server only; Claude still runs locally."
         )
+    if IS_WINDOWS:
+        return
     if shutil.which("tmux") is None:
         raise click.ClickException(
             "tmux was not found on local PATH. The native Claude wrapper "

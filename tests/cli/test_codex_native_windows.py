@@ -26,9 +26,11 @@ import click
 import pytest
 
 import omnigent.cli as cli_mod
+import omnigent.codex_native as codex_native
 import omnigent.inner.terminal as terminal_mod
 from omnigent.codex_native import (
     PreparedCodexTerminal,
+    _preflight_local_tools,
     _print_herdr_local_attach_guidance,
 )
 from omnigent.inner.terminal import HerdrBackend
@@ -87,6 +89,40 @@ def test_availability_check_is_noop_on_posix(
     monkeypatch.setenv(HerdrBackend.BIN_ENV_VAR, str(tmp_path / "no-such-herdr"))
     # Returns without raising — the POSIX path never gained an early gate.
     cli_mod._ensure_native_terminal_backend_available("codex")
+
+
+# ---------------------------------------------------------------------------
+# Local-tools preflight (the run_codex_native entry gate)
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_is_noop_on_windows_without_tmux(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On Windows the codex preflight skips the tmux requirement (herdr hosts codex).
+
+    This is the entry-path gate the live run first hit: ``_preflight_local_tools``
+    runs at the top of ``run_codex_native``, before any of the Windows attach /
+    availability branches, so it must not reject a Windows host for lacking tmux.
+    """
+    monkeypatch.setattr(codex_native, "IS_WINDOWS", True)
+    monkeypatch.setattr("omnigent.codex_native.shutil.which", lambda _name: None)
+    # Must not raise even though tmux is absent.
+    _preflight_local_tools()
+
+
+def test_preflight_still_requires_tmux_on_posix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On POSIX the tmux requirement is byte-identical (still raises without tmux)."""
+    monkeypatch.setattr(codex_native, "IS_WINDOWS", False)
+    monkeypatch.setattr("omnigent.codex_native.shutil.which", lambda _name: None)
+    with pytest.raises(click.ClickException) as excinfo:
+        _preflight_local_tools()
+    assert "tmux" in str(excinfo.value).lower()
+
+
+def test_preflight_passes_on_posix_with_tmux(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On POSIX with tmux present the preflight passes (unchanged happy path)."""
+    monkeypatch.setattr(codex_native, "IS_WINDOWS", False)
+    monkeypatch.setattr("omnigent.codex_native.shutil.which", lambda _name: "/usr/bin/tmux")
+    _preflight_local_tools()
 
 
 # ---------------------------------------------------------------------------

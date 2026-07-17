@@ -896,6 +896,7 @@ async def _start_capturing_spawn(
     async def fake_spawn(*argv: object, **kwargs: object) -> object:
         captured["argv"] = list(argv)
         captured["executable"] = kwargs.get("executable")
+        captured["env"] = kwargs.get("env")
         raise _StopSpawn()
 
     monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_spawn)
@@ -998,3 +999,48 @@ def test_codex_terminal_env_always_carries_codex_home(tmp_path: Path) -> None:
     server = _test_app_server(tmp_path, codex_home, bridge_dir, workspace)
     env = codex_terminal_env(server)
     assert env["CODEX_HOME"] == str(codex_home)
+
+
+async def test_start_windows_env_carries_windows_passthrough(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Windows the app-server child env gains SYSTEMROOT + the passthrough names.
+
+    The filtered codex env drops the Windows system/profile constants; without
+    SYSTEMROOT the child dies at Winsock init (os error 10106). The spawn merges
+    WINDOWS_ENV_PASSTHROUGH from the live environment.
+    """
+    from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "real-home"))
+    (tmp_path / "real-home").mkdir()
+    monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
+    server = _make_server(tmp_path, listen_url="ws://127.0.0.1:9999")
+    captured = await _start_capturing_spawn(server, monkeypatch, is_windows=True)
+    env = captured["env"]
+    assert env["SYSTEMROOT"] == r"C:\Windows"
+    # Every passthrough name present in os.environ was merged in.
+    import os
+
+    for name in WINDOWS_ENV_PASSTHROUGH:
+        if name in os.environ:
+            assert name in env
+
+
+async def test_start_posix_env_has_no_passthrough_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POSIX spawn env is byte-identical — no WINDOWS_ENV_PASSTHROUGH merge.
+
+    Even with SYSTEMROOT present in the environment, the POSIX branch must not
+    inject it (the server was built with env={}, so the child env is just
+    CODEX_HOME).
+    """
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "real-home"))
+    (tmp_path / "real-home").mkdir()
+    monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
+    server = _make_server(tmp_path, listen_url="ws://127.0.0.1:9999")
+    captured = await _start_capturing_spawn(server, monkeypatch, is_windows=False)
+    env = captured["env"]
+    assert env == {"CODEX_HOME": str(server.codex_home)}
+    assert "SYSTEMROOT" not in env

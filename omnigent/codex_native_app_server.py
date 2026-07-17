@@ -23,7 +23,7 @@ import websockets
 if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
 
-from omnigent._platform import IS_WINDOWS
+from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
 from omnigent.codex_native_bridge import write_policy_hook_config
 from omnigent.codex_native_process_registry import (
     CodexNativeProcessOwnerLock,
@@ -617,6 +617,17 @@ class CodexNativeAppServer:
         for override in self.config_overrides:
             argv.extend(["-c", override])
         proc_env = {**self.env, "CODEX_HOME": str(self.codex_home)}
+        # ``self.env`` is a FILTERED env (``_clean_codex_env``), which drops the
+        # Windows system/profile constants Winsock and ``Path.home()`` hard-require
+        # — without ``SYSTEMROOT`` the codex child dies at Winsock init
+        # (WSAEPROVIDERFAILEDINIT, os error 10106). Merge the
+        # ``WINDOWS_ENV_PASSTHROUGH`` names from the live environment (only those
+        # present; never clobbering an already-set key), mirroring
+        # ``omnigent/host/connect.py``. No-op on POSIX.
+        if IS_WINDOWS:
+            for _name in WINDOWS_ENV_PASSTHROUGH:
+                if _name not in proc_env and _name in os.environ:
+                    proc_env[_name] = os.environ[_name]
         self.process_owner_lock = acquire_codex_native_process_owner_lock()
         try:
             self.proc = await asyncio.create_subprocess_exec(

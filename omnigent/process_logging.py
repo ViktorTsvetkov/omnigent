@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO
 
-from omnigent._platform import IS_POSIX, reconfigure_std_streams_for_windows
+from omnigent._platform import IS_POSIX
 
 DATA_DIR_ENV_VAR = "OMNIGENT_DATA_DIR"
 LOG_LEVEL_ENV_VAR = "OMNIGENT_LOG_LEVEL"
@@ -283,7 +283,11 @@ def configure_process_logging(
     # background server): make stdout/stderr UTF-8 tolerant BEFORE any output, so
     # a legacy-code-page redirected stream on Windows can never crash a `✓`/emoji
     # print (which in the host tunnel loop would wedge the daemon offline). No-op
-    # off Windows and on streams that cannot be reconfigured.
+    # off Windows and on streams that cannot be reconfigured. Imported locally so
+    # the module-top ``from omnigent._platform import IS_POSIX`` line stays
+    # byte-identical (this ticket's strictly-additive discipline).
+    from omnigent._platform import reconfigure_std_streams_for_windows
+
     reconfigure_std_streams_for_windows()
     resolved_level = effective_log_level() if level is None else level
     path = Path(log_path).expanduser() if log_path is not None else _process_log_file_from_env()

@@ -321,18 +321,45 @@ async def test_every_invocation_carries_explicit_omnigent_session(herdr_env: _He
 
 
 # ---------------------------------------------------------------------------
-# Geometry pinning + Windows path translation + CRLF (acceptance criterion 5)
+# Launch verb reconciliation + Windows path translation + CRLF (acceptance criterion 5)
 # ---------------------------------------------------------------------------
 
 
-async def test_launch_pins_geometry_from_request_size(herdr_env: _HerdrEnv) -> None:
-    """The request's viewport size reaches herdr at pane creation."""
+async def test_launch_does_not_emit_nonexistent_geometry_flags(herdr_env: _HerdrEnv) -> None:
+    """Reconciled launch never passes ``--cols``/``--rows`` (real herdr rejects them).
+
+    Geometry pinning is dropped in #13: real herdr's ``workspace``/``tab``/``agent``
+    creation verbs take no absolute geometry (``pane resize`` is relative), so a
+    ``--cols``/``--rows`` at spawn would be an unknown-flag error. The request
+    size is accepted but not forwarded as those flags.
+    """
     backend = herdr_env.make_backend()
     await backend.launch(_request(["sleep", "1000000"], size=(123, 45)))
     try:
-        pane = next(iter(herdr_env.load_state(backend)["panes"].values()))
-        assert pane["cols"] == "123"
-        assert pane["rows"] == "45"
+        for argv in herdr_env.log():
+            assert "--cols" not in argv, argv
+            assert "--rows" not in argv, argv
+    finally:
+        await backend.close()
+
+
+async def test_launch_runs_inner_command_via_agent_start(herdr_env: _HerdrEnv) -> None:
+    """The inner argv is spawned with ``agent start ... -- <argv>`` (the real verb).
+
+    ``tab create --command`` does not exist in real herdr; the reconciled launch
+    uses ``agent start`` and the pane it creates hosts the inner command.
+    """
+    backend = herdr_env.make_backend()
+    await backend.launch(_request(["my-inner-cli", "--flag"]))
+    try:
+        log = herdr_env.log()
+        start = next(a for a in log if a[2:4] == ["agent", "start"])
+        # The argv rides after the terminal ``--`` marker.
+        assert start[start.index("--") + 1 :] == ["my-inner-cli", "--flag"]
+        assert "--workspace" in start
+        # The resolved pane hosts that command in the fake's state.
+        pane = herdr_env.load_state(backend)["panes"][backend._pane_id]
+        assert pane["command"] == ["my-inner-cli", "--flag"]
     finally:
         await backend.close()
 

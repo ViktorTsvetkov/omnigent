@@ -315,6 +315,22 @@ async def test_busy_state_no_signal_no_prior_is_unknown(herdr_env: _HerdrEnv) ->
         await backend.close()
 
 
+async def test_busy_state_gone_pane_degrades_without_raising(herdr_env: _HerdrEnv) -> None:
+    """A dead pane makes busy_state degrade to None, not raise (gone-pane hardening).
+
+    ``busy_state`` corroborates the native status with a screen capture, which
+    raises once herdr has destroyed the pane. The codex-path caller polls
+    busy_state on a possibly-just-exited terminal, so a gone pane must yield a
+    graceful ``None`` (no usable signal) rather than propagating the capture
+    error.
+    """
+    backend = herdr_env.make_backend()
+    await backend.launch(_request(["sleep", "1000000"]))
+    await backend.close()  # the pane (and workspace) are now gone
+    # Must not raise; no output to diff and no live native status → None.
+    assert await backend.busy_state() is None
+
+
 async def test_busy_state_no_native_falls_back_to_output_diff(herdr_env: _HerdrEnv) -> None:
     """With no native signal, output-diff alone drives busy/idle once primed."""
     herdr_env.monkeypatch.setenv(_fake_herdr.AGENT_STATUS_ENV_VAR, "unknown")

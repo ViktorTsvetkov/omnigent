@@ -7789,6 +7789,10 @@ def test_attach_terminal_resource_runner_owned_missing_socket_fails_loud(
         """
         raise AssertionError("Runner-owned Codex attach must not use WebSocket")
 
+    # This asserts POSIX attach semantics (a tmux socket + WebSocket fallback);
+    # on native Windows the terminal is herdr-hosted and the degrade is herdr-UI
+    # guidance instead (see test_codex_native_windows.py), so pin the platform.
+    monkeypatch.setattr(codex_native, "IS_WINDOWS", False)
     monkeypatch.setattr("omnigent.codex_native.shutil.which", lambda _name: "/usr/bin/tmux")
     monkeypatch.setattr(codex_native, "_attach_with_reconnect", fail_attach_with_reconnect)
 
@@ -7868,6 +7872,9 @@ def test_attach_with_forwarder_falls_back_when_tmux_socket_is_not_local(
         assert active_session_id_reader() == "conv_rotated"
         websocket_attaches.append(attach_url)
 
+    # POSIX attach semantics (non-local tmux socket → WebSocket bridge fallback);
+    # the Windows herdr-hosted degrade is covered in test_codex_native_windows.py.
+    monkeypatch.setattr(codex_native, "IS_WINDOWS", False)
     monkeypatch.setattr("omnigent.codex_native.shutil.which", lambda _name: "/usr/bin/tmux")
     monkeypatch.setattr(codex_native, "_attach_direct_tmux", fail_attach_direct_tmux)
     monkeypatch.setattr(codex_native, "_attach_with_reconnect", fake_attach_with_reconnect)

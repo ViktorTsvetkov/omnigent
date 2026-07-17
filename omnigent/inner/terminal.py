@@ -1538,9 +1538,9 @@ class HerdrBackend(TerminalBackend):
     through the herdr **CLI as a subprocess** — no protocol library is linked or
     vendored (a deliberate licensing posture) — and every invocation carries an
     explicit ``--session`` (see :meth:`_base_argv`). All herdr vocabulary — the
-    ``--session`` target, ``workspace``/``tab``/``pane`` subcommands, plus-
-    notation keys (``ctrl+c``), ``--format json`` output, CRLF captures — is
-    confined to this class.
+    ``--session`` target, ``workspace``/``agent``/``pane`` subcommands, plus-
+    notation keys (``ctrl+c``), the default ``{"id": .., "result": ..}`` JSON
+    envelope, CRLF captures — is confined to this class.
 
     **Session lifecycle (#11):** launch (with husk adopt/replace), liveness,
     close/kill, orphan reaping, geometry pinning, Windows path translation, and
@@ -1556,27 +1556,30 @@ class HerdrBackend(TerminalBackend):
     schema`` (:meth:`ensure_available`), and every pane subcommand addresses the
     pane positionally (:meth:`_pane_argv`).
 
-    **Pending real-herdr validation (#13).** The workspace/tab creation verbs in
-    :meth:`launch` (``workspace create --label`` then ``tab create --workspace
-    --cwd --cols --rows --command -- <argv>``) were *designed* by #11 and not
-    exercised by the spike, which spawned programs via ``agent start`` and
-    created panes as a side effect of ``workspace``/``tab create``; #13
-    reconciles them against real herdr. The ``pane get`` envelope shape is a
-    known #13 item: the real binary returns success as ``{"id": "cli:pane:get",
-    "result": {"pane": {"agent_status": ...}, "type": "pane_info"}}`` (``type``
-    is a semantic constant, not the verb) and a DEAD pane as an *error* envelope
-    ``{"error": {"code": "pane_not_found", ...}, "id": "cli:pane:get"}`` with
-    process exit code 1 — so ``pane_not_found`` + exit-1 is the ENDPOINT_GONE
-    signal, which #11's :meth:`_interpret_pane_get` currently maps to UNKNOWN (it
-    reads a simplified ``{"result": "alive"|"pane_not_found"}`` string). Liveness
-    result codes and the ``.result.pane.agent_status`` path (:meth:`_agent_status`)
-    read that simplified shape here and are reconciled together in #13. ``pane
-    send-text`` reading a very large paste (the OS argv length cap — see
-    :meth:`send_text`) is also a #13 item. (Write verbs printing nothing on
-    success and only an error envelope on failure is already matched: :meth:`_run`
-    ignores stdout and gates on exit code.) Explicit headless ``server``
-    management and threading the inner process environment through that server
-    are #15 integration concerns; see :meth:`launch`.
+    **Real-herdr reconciliation (#13).** The #11-designed launch verbs did not
+    match real herdr and are reconciled in :meth:`launch`: ``workspace create``
+    and ``tab create`` take no command/geometry and the socket-API commands emit
+    their JSON envelope by default (no ``--format`` — an unknown flag is
+    rejected), so the inner command is now spawned with ``agent start <name> --
+    <argv>`` (the spike-verified verb) and its pane isolated by a ``pane list``
+    diff. The ``pane get`` envelope is reconciled to the real shape: success is
+    ``{"id": "cli:pane:get", "result": {"pane": {"agent_status": ...}, "type":
+    "pane_info"}}`` (``type`` a semantic constant, not the verb), a DEAD pane an
+    *error* envelope ``{"error": {"code": "pane_not_found", ...}}`` with process
+    exit code 1 — so ``pane_not_found`` + exit-1 is the ENDPOINT_GONE signal
+    (:meth:`_interpret_pane_get`), and the native status is read at
+    ``.result.pane.agent_status`` (:meth:`_agent_status`). Write verbs print
+    nothing on success and only an error envelope on failure — already matched
+    (:meth:`_run` ignores stdout and gates on exit code). **Live-run-only
+    (verified via ``--help`` syntax, not exercised — the tech lead's live run):**
+    the exact ``.result`` id-paths of ``workspace create`` / ``agent start`` /
+    ``pane list`` (the adapter avoids depending on them by re-listing by label and
+    diffing pane ids), whether ``agent start`` reuses the workspace root pane or
+    adds one, ~52-col headless geometry, and ``pane send-text`` reading a very
+    large paste (the OS argv length cap — see :meth:`send_text`). Explicit
+    headless ``server`` management and threading the full inner-process
+    environment through that server are #15 integration concerns; see
+    :meth:`launch`.
 
     **No remain-on-exit.** herdr auto-destroys a pane when its process exits and
     the ``pane_exited`` event carries no exit code, so a dead endpoint cannot be
@@ -1622,6 +1625,10 @@ class HerdrBackend(TerminalBackend):
     # herdr's ``default`` session (the user's live panes).
     _SESSION_PREFIX = "omnigent-"
     _LABEL_PREFIX = "omnigent-ws-"
+    # Prefix for the omnigent-scoped herdr *agent name* passed to ``agent start``
+    # (the spike-verified spawn verb). Scoped so it can never collide with a
+    # user's own detected/named agents.
+    _AGENT_PREFIX = "omnigent-agent-"
     # A throwaway omnigent-scoped session for the version/protocol probe, so even
     # the session-independent probe carries an explicit ``--session`` (uniform
     # "never bare" posture — nothing the adapter emits can target ``default``).
@@ -1763,6 +1770,7 @@ class HerdrBackend(TerminalBackend):
         self._target = target
         self._session = self._session_name(socket_path)
         self._label = self._workspace_label(socket_path, target)
+        self._agent = self._agent_name(socket_path)
         # Populated by :meth:`launch`; used by liveness/capture/input.
         self._workspace_id: str | None = None
         self._tab_id: str | None = None
@@ -1801,6 +1809,64 @@ class HerdrBackend(TerminalBackend):
         slug = re.sub(r"[^A-Za-z0-9]+", "-", target).strip("-").lower() or "main"
         digest = hashlib.sha1(str(socket_path).encode("utf-8")).hexdigest()[:12]
         return f"{cls._LABEL_PREFIX}{digest}-{slug}"
+
+    @classmethod
+    def workspace_label_for(cls, socket_path: Path, target: str = "main") -> str:
+        """Public deriver for a terminal's durable herdr workspace label.
+
+        The label (``omnigent-ws-<hash>-<slug>``) is a pure function of the
+        terminal's private endpoint and target, so a client that only has the
+        terminal resource's socket path + target (e.g. the ``omnigent codex`` CLI
+        pointing a Windows user at the herdr GUI, where the equivalent of ``tmux
+        attach`` is opening the herdr app and finding this workspace by its label)
+        can recompute the exact label without reaching into the running backend.
+        Delegates to :meth:`_workspace_label`.
+        """
+        return cls._workspace_label(socket_path, target)
+
+    @classmethod
+    def _agent_name(cls, socket_path: Path) -> str:
+        """Derive this terminal's omnigent-scoped herdr agent name.
+
+        The inner command is launched with ``agent start <name> -- <argv>`` (the
+        spike-verified spawn verb — real herdr's ``tab create`` cannot run a
+        command; see :meth:`launch`). The name is a stable short hash of the
+        private endpoint, :data:`_AGENT_PREFIX`-scoped so it is unique per
+        terminal and never collides with a user's own agents.
+        """
+        import hashlib
+
+        digest = hashlib.sha1(str(socket_path).encode("utf-8")).hexdigest()[:12]
+        return f"{cls._AGENT_PREFIX}{digest}"
+
+    @staticmethod
+    def _result_payload(data: dict[str, Any]) -> dict[str, Any]:  # type: ignore[explicit-any]
+        """Unwrap real herdr's ``{"id": .., "result": {..}}`` success envelope.
+
+        Real herdr wraps every socket-API success as ``{"id": "cli:<group>:<verb>",
+        "result": {<payload>, "type": "<semantic_const>"}}`` (spike-verified). The
+        adapter reads the inner ``result`` payload. Tolerant of a bare (already
+        unwrapped) mapping so a probe result that is not enveloped still parses —
+        which keeps the mapping robust if a future herdr flattens a verb.
+        """
+        result = data.get("result")
+        return result if isinstance(result, dict) else data
+
+    @classmethod
+    def _workspaces_of(cls, data: dict[str, Any]) -> list[dict[str, Any]]:  # type: ignore[explicit-any]
+        """Return the ``workspaces`` list from a ``workspace list`` envelope."""
+        workspaces = cls._result_payload(data).get("workspaces")
+        if not isinstance(workspaces, list):
+            return []
+        return [ws for ws in workspaces if isinstance(ws, dict)]
+
+    @classmethod
+    def _pane_ids_of(cls, data: dict[str, Any]) -> list[str]:  # type: ignore[explicit-any]
+        """Return the pane ids from a ``pane list`` envelope, in listed order."""
+        panes = cls._result_payload(data).get("panes")
+        if not isinstance(panes, list):
+            return []
+        return [p["id"] for p in panes if isinstance(p, dict) and isinstance(p.get("id"), str)]
 
     @staticmethod
     def _to_windows_path(cwd: str) -> str:
@@ -1933,11 +1999,13 @@ class HerdrBackend(TerminalBackend):
         return stdout.decode(errors="replace")
 
     async def _run_json(self, *args: str) -> dict[str, Any]:  # type: ignore[explicit-any]
-        """Run a herdr command whose args include ``--format json`` and parse it.
+        """Run a herdr socket-API command and parse its JSON envelope.
 
-        Callers place ``--format json`` themselves (never appended here) so it
-        can precede a trailing ``--command --`` without being swallowed as an
-        inner-command token.
+        Real herdr's ``workspace``/``tab``/``pane``/``agent`` socket-API commands
+        emit a ``{"id": "cli:<group>:<verb>", "result": {..}}`` JSON envelope by
+        default — there is no ``--format json`` flag (an unknown flag is
+        rejected). Callers unwrap the ``result`` payload via
+        :meth:`_result_payload` / :meth:`_workspaces_of` / :meth:`_pane_ids_of`.
         """
         import json
 
@@ -1962,58 +2030,100 @@ class HerdrBackend(TerminalBackend):
     # ---------------------------------------------------------------- protocol
 
     async def launch(self, request: TerminalLaunchRequest) -> None:
-        """Create the workspace/tab/pane for *request* (adopt-or-replace husks).
+        """Create the workspace + agent pane for *request* (adopt-or-replace husks).
 
-        Ordering is deliberately **create-before-close**: the fresh workspace and
-        its tab/pane are brought up FIRST, and only then are any same-label husks
-        (restart leftovers — herdr does not enforce label uniqueness) closed. A
-        crash mid-launch therefore never strands this terminal with zero
-        workspaces. Geometry is pinned from :attr:`TerminalLaunchRequest.size`
-        (headless herdr panes otherwise default to ~52 columns) and the cwd is
-        translated to a Windows-native path.
+        Reconciled against real herdr 0.7.4 in #13. The #11-designed
+        ``tab create --cols --rows --command -- <argv>`` launch path does **not
+        exist** in real herdr — ``tab create`` takes no command or geometry, and
+        the socket-API commands reject an unknown ``--format`` flag (they emit
+        their ``{"id": .., "result": ..}`` JSON envelope by default). The real,
+        spike-verified spawn sequence the adapter now uses:
 
-        :attr:`~TerminalLaunchRequest.keep_alive_after_exit` is ignored (herdr
-        has no remain-on-exit). Threading the inner process environment
-        (``request.env``) through the per-session server is a #15 integration
-        concern; #11 pins geometry, cwd, and the command argv.
+        1. ``workspace create --label <L> --cwd <winpath> --no-focus`` — creates a
+           labeled workspace (herdr auto-spawns a root shell pane in it). The new
+           workspace is then re-found by label in ``workspace list`` rather than
+           parsed out of the create envelope, so the adapter does not depend on
+           the (live-only) shape of the create result.
+        2. ``agent start <name> --workspace <id> --cwd <winpath> --no-focus --
+           <argv>`` — runs the inner command as a herdr *agent* (the spike
+           launched real Claude Code this way; it also arms native agent-status
+           detection). The command's pane is identified by diffing ``pane list``
+           for the workspace across the ``agent start`` call, so no assumption is
+           made about the ``agent start`` result envelope.
+
+        Ordering stays **create-before-close**: the fresh workspace/pane come up
+        FIRST, then any same-label husks (restart leftovers) are closed, so a
+        crash mid-launch never strands this terminal with zero workspaces.
+
+        Geometry pinning is **dropped**: real ``pane resize`` is *relative*
+        (``--direction``/``--amount``), so an absolute ``--cols``/``--rows`` at
+        spawn is not expressible; headless panes come up ~52 columns and the
+        capture path relies on ``--source recent-unwrapped`` for logical lines
+        (see :meth:`_read_argv`). :attr:`~TerminalLaunchRequest.keep_alive_after_exit`
+        is ignored (herdr has no remain-on-exit). Threading the inner process
+        environment (``request.env``) through the per-session server is a #15
+        integration concern (real herdr's per-pane ``--env KEY=VALUE`` is a
+        few-vars vehicle, not the full merged env).
 
         :param request: The backend-neutral launch request.
-        :raises RuntimeError: If herdr rejects the workspace/tab creation.
+        :raises RuntimeError: If herdr rejects the workspace/agent creation.
         """
-        listing = await self._run_json("workspace", "list", "--format", "json")
+        listing = await self._run_json("workspace", "list")
         husks = [
             ws["id"]
-            for ws in listing.get("workspaces", [])
+            for ws in self._workspaces_of(listing)
             if ws.get("label") == self._label and ws.get("id") is not None
         ]
 
-        created = await self._run_json(
-            "workspace", "create", "--label", self._label, "--format", "json"
+        win_cwd = self._to_windows_path(request.cwd)
+        # ``workspace create`` emits its JSON envelope by default; no ``--format``
+        # (real herdr rejects the unknown flag). Re-find the new workspace by
+        # label so we never depend on the create result's id path.
+        await self._run(
+            "workspace", "create", "--label", self._label, "--cwd", win_cwd, "--no-focus"
         )
-        self._workspace_id = created["workspace"]["id"]
+        after_create = self._workspaces_of(await self._run_json("workspace", "list"))
+        mine = [
+            ws["id"]
+            for ws in after_create
+            if ws.get("label") == self._label and ws.get("id") not in husks and ws.get("id")
+        ]
+        if not mine:
+            raise RuntimeError(
+                f"herdr 'workspace create' did not yield a workspace labeled {self._label!r}"
+            )
+        self._workspace_id = mine[-1]
 
-        cols, rows = request.size
-        tab = await self._run_json(
-            "tab",
-            "create",
+        # Panes already in the workspace (herdr auto-spawned a root shell pane);
+        # ``agent start`` adds the inner-command pane, which we isolate by diff.
+        before = set(
+            self._pane_ids_of(
+                await self._run_json("pane", "list", "--workspace", self._workspace_id)
+            )
+        )
+        # ``-- <argv>`` must be LAST: everything after ``--`` is the inner argv,
+        # so no herdr flag may follow it.
+        await self._run(
+            "agent",
+            "start",
+            self._agent,
             "--workspace",
             self._workspace_id,
             "--cwd",
-            self._to_windows_path(request.cwd),
-            "--cols",
-            str(cols),
-            "--rows",
-            str(rows),
-            "--format",
-            "json",
-            # ``--command --`` must be LAST: everything after ``--`` is the inner
-            # argv, so no herdr flag may follow it.
-            "--command",
+            win_cwd,
+            "--no-focus",
             "--",
             *request.command,
         )
-        self._tab_id = tab["tab"]["id"]
-        self._pane_id = tab["pane"]["id"]
+        after = self._pane_ids_of(
+            await self._run_json("pane", "list", "--workspace", self._workspace_id)
+        )
+        new_panes = [pid for pid in after if pid not in before]
+        # The agent's pane is the one that appeared; fall back to the last pane in
+        # the workspace if the spawn reused the root pane rather than adding one.
+        self._pane_id = new_panes[-1] if new_panes else (after[-1] if after else None)
+        if self._pane_id is None:
+            raise RuntimeError("herdr 'agent start' did not create a pane for the inner command")
 
         # Create-before-close: only now retire the husks.
         for husk_id in husks:
@@ -2037,38 +2147,68 @@ class HerdrBackend(TerminalBackend):
     def _pane_get_argv(self) -> list[str]:
         """Build the full ``pane get`` argv used by both liveness probes.
 
-        ``--format json`` requests the structured verdict the liveness mapping
-        parses (see :meth:`_interpret_pane_get`); the pane id is positional. This
-        one carries the ``--session`` prefix because it is handed straight to
-        ``subprocess`` (not through :meth:`_run`).
+        Real herdr's ``pane get <id>`` emits its ``{"id": .., "result": ..}`` JSON
+        envelope by default — no ``--format`` (the unknown flag would be
+        rejected). The pane id is positional. This one carries the ``--session``
+        prefix because it is handed straight to ``subprocess`` (not through
+        :meth:`_run`).
         """
-        return [*self._base_argv(), *self._pane_argv("get", "--format", "json")]
+        return [*self._base_argv(), *self._pane_argv("get")]
 
     @classmethod
-    def _interpret_pane_get(cls, returncode: int | None, stdout: bytes) -> Liveness:
-        """Map a ``pane get`` result to a :class:`Liveness` verdict.
+    def _parse_envelope(
+        cls, stdout: bytes, stderr: bytes = b""
+    ) -> dict[str, Any] | None:  # type: ignore[explicit-any]
+        """Parse a herdr CLI JSON envelope from stdout, falling back to stderr.
 
-        A structured result the probe *could* produce is authoritative:
-        ``alive`` → :attr:`Liveness.ALIVE`; ``pane_not_found`` /
-        ``workspace_not_found`` (the inner process exited and herdr destroyed the
-        pane, or the workspace is gone) → :attr:`Liveness.ENDPOINT_GONE`.
-        Anything that means the probe could not produce a clean verdict — a
-        non-zero exit, unparseable output, an unknown result — degrades to
-        :attr:`Liveness.UNKNOWN` (never a false ENDPOINT_GONE).
+        herdr prints a success envelope on stdout and — for a failed command —
+        an ``{"error": {"code": ..}}`` envelope (which may ride on stderr, with a
+        non-zero exit). Try stdout first, then stderr; return the first mapping
+        that parses, else ``None``.
         """
         import json
 
-        if returncode != 0:
+        for raw in (stdout, stderr):
+            if not raw:
+                continue
+            try:
+                data = json.loads(cls._normalize_newlines(raw.decode(errors="replace")))
+            except ValueError:
+                continue
+            if isinstance(data, dict):
+                return data
+        return None
+
+    @classmethod
+    def _interpret_pane_get(
+        cls, returncode: int | None, stdout: bytes, stderr: bytes = b""
+    ) -> Liveness:
+        """Map a real-herdr ``pane get`` result to a :class:`Liveness` verdict.
+
+        Reconciled to real herdr's envelope in #13. A **live** pane is a success
+        envelope ``{"id": "cli:pane:get", "result": {"pane": {..}, "type":
+        "pane_info"}}`` with exit 0 → :attr:`Liveness.ALIVE`. A **dead** pane (the
+        inner process exited and herdr destroyed the pane) or a gone workspace is
+        an *error* envelope ``{"error": {"code": "pane_not_found" |
+        "workspace_not_found", ..}}`` **with process exit code 1** →
+        :attr:`Liveness.ENDPOINT_GONE`. #11 mapped any non-zero exit to UNKNOWN,
+        which would misread a real dead pane; the error envelope is now parsed on
+        a non-zero exit (from stdout or stderr) so the ENDPOINT_GONE signal is not
+        lost. Anything that leaves no clean verdict — an unparseable output, an
+        unrecognized error code — degrades to :attr:`Liveness.UNKNOWN` (never a
+        false ENDPOINT_GONE).
+        """
+        data = cls._parse_envelope(stdout, stderr)
+        if data is None:
             return Liveness.UNKNOWN
-        try:
-            data = json.loads(cls._normalize_newlines(stdout.decode(errors="replace")))
-        except ValueError:
+        error = data.get("error")
+        if isinstance(error, dict):
+            if error.get("code") in ("pane_not_found", "workspace_not_found"):
+                return Liveness.ENDPOINT_GONE
             return Liveness.UNKNOWN
-        result = data.get("result")
-        if result == "alive":
+        result = cls._result_payload(data)
+        if returncode == 0 and isinstance(result.get("pane"), dict):
             return Liveness.ALIVE
-        if result in ("pane_not_found", "workspace_not_found"):
-            return Liveness.ENDPOINT_GONE
         return Liveness.UNKNOWN
 
     async def liveness(self) -> Liveness:
@@ -2076,17 +2216,21 @@ class HerdrBackend(TerminalBackend):
 
         INNER_EXITED is unreachable for herdr: with no remain-on-exit an exited
         pane is destroyed, so its verdict is ENDPOINT_GONE, not INNER_EXITED.
+        stderr is captured (not discarded) because a dead pane's error envelope
+        can ride there.
         """
         try:
             proc = await asyncio.create_subprocess_exec(
                 *self._pane_get_argv(),
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=self._CLI_TIMEOUT_S)
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=self._CLI_TIMEOUT_S
+            )
         except (OSError, asyncio.TimeoutError):
             return Liveness.UNKNOWN
-        return self._interpret_pane_get(proc.returncode, stdout)
+        return self._interpret_pane_get(proc.returncode, stdout, stderr)
 
     def liveness_sync(self) -> Liveness:
         """Synchronous :meth:`liveness` for the daemon idle-watcher thread."""
@@ -2099,7 +2243,7 @@ class HerdrBackend(TerminalBackend):
             )
         except (OSError, subprocess.TimeoutExpired):
             return Liveness.UNKNOWN
-        return self._interpret_pane_get(proc.returncode, proc.stdout)
+        return self._interpret_pane_get(proc.returncode, proc.stdout, proc.stderr)
 
     async def close(self) -> None:
         """Close this terminal's workspace, then reap same-label husks.
@@ -2120,10 +2264,10 @@ class HerdrBackend(TerminalBackend):
         :param exclude: A workspace id to leave alone (the freshly-created one).
         """
         try:
-            listing = await self._run_json("workspace", "list", "--format", "json")
+            listing = await self._run_json("workspace", "list")
         except RuntimeError:
             return
-        for ws in listing.get("workspaces", []):
+        for ws in self._workspaces_of(listing):
             wsid = ws.get("id")
             if ws.get("label") == self._label and wsid is not None and wsid != exclude:
                 with contextlib.suppress(RuntimeError):
@@ -2227,26 +2371,18 @@ class HerdrBackend(TerminalBackend):
     async def _agent_status(self) -> str | None:
         """Return the pane's native ``agent_status`` string, or ``None``.
 
-        Read from ``pane get --format json`` (the spike found herdr's native
-        agent detection populates a pane ``agent_status`` of
+        Read from ``pane get`` (the spike found herdr's native agent detection
+        populates a pane ``agent_status`` of
         ``idle``/``working``/``blocked``/``done``/``unknown``). ``None`` on any
         failure — a gone pane, an unspawnable CLI, unparseable output, or a
         missing field — so callers treat it as "no native signal" rather than
         crashing.
 
-        .. note::
-            This reads the field at the top level of the parsed JSON, matching
-            the fake's simplified ``pane get`` shape that #11's
-            :meth:`_interpret_pane_get` also relies on. The real binary nests it
-            one deeper — ``{"id": "cli:pane.get", "result": {"pane":
-            {"agent_status": ...}, "type": ...}}`` (agent_status at
-            ``.result.pane.agent_status``). The whole ``pane get`` envelope
-            (liveness result codes AND this path) is one #13 reconciliation
-            unit; both are fixed together against real herdr there, so they are
-            deliberately kept on the same simplified shape here.
+        Reconciled to real herdr's envelope in #13: the status is nested at
+        ``.result.pane.agent_status`` (``{"id": "cli:pane:get", "result":
+        {"pane": {"agent_status": ..}, "type": "pane_info"}}``), read via
+        :meth:`_result_payload`.
         """
-        import json
-
         try:
             proc = await asyncio.create_subprocess_exec(
                 *self._pane_get_argv(),
@@ -2258,11 +2394,11 @@ class HerdrBackend(TerminalBackend):
             return None
         if proc.returncode != 0:
             return None
-        try:
-            data = json.loads(self._normalize_newlines(stdout.decode(errors="replace")))
-        except ValueError:
+        data = self._parse_envelope(stdout)
+        if data is None:
             return None
-        status = data.get("agent_status")
+        pane = self._result_payload(data).get("pane")
+        status = pane.get("agent_status") if isinstance(pane, dict) else None
         return status if isinstance(status, str) else None
 
     async def busy_state(self) -> bool | None:
@@ -2293,10 +2429,24 @@ class HerdrBackend(TerminalBackend):
         native signal nor a prior snapshot to diff against, there is no signal at
         all → ``None`` (unknown).
 
+        A **gone pane** is handled gracefully rather than by raising: the
+        corroborating :meth:`capture` raises ``RuntimeError`` once herdr has
+        destroyed the pane, so it is guarded — a native *busy* status still wins,
+        otherwise a gone pane yields ``None`` (no usable signal). This keeps the
+        codex-path caller (which polls ``busy_state`` on a possibly-just-exited
+        terminal) from seeing an exception instead of a verdict.
+
         :returns: ``True`` (busy), ``False`` (idle), or ``None`` (no signal).
         """
         native = await self._agent_status()
-        current = await self.capture()
+        try:
+            current = await self.capture()
+        except RuntimeError:
+            # The pane is gone (capture raises once herdr destroys it). Trust a
+            # native busy status if we somehow still have one; otherwise there is
+            # no output to diff, so degrade to "no signal" instead of raising.
+            self._last_activity_snapshot = None
+            return True if native in self._NATIVE_BUSY_STATES else None
         prior = self._last_activity_snapshot
         self._last_activity_snapshot = current
         changed = prior is not None and current != prior
@@ -2677,6 +2827,19 @@ class TerminalInstance:
     def tmux_target(self) -> str:
         """The tmux target for send-keys/capture-pane (always 'main')."""
         return "main"
+
+    @property
+    def backend_capabilities(self) -> TerminalBackendCapabilities:
+        """The multiplexer backend's static capability declaration.
+
+        Read by machinery above the seam to degrade a feature the backend cannot
+        host to its documented fallback — e.g. the native cost popup checks
+        :attr:`TerminalBackendCapabilities.native_popup` and, where ``False``
+        (herdr on Windows), routes the ASK verdict to the web approval card
+        instead of a pane overlay. Capability-driven, never backend-identity- or
+        platform-driven.
+        """
+        return self._backend.capabilities
 
     def note_client_interaction(self) -> None:
         """Record that a web client just interacted with this terminal.

@@ -27,13 +27,24 @@ Modeled vocabulary (nothing else)
   old protocol). Models the real ``herdr api schema`` default output, which is
   human-readable text (NOT JSON) — the #12 protocol probe regex-extracts the
   number. Session-independent, but still invoked with an explicit ``--session``.
-- ``workspace list`` / ``workspace create --label`` / ``workspace close
-  --workspace`` — labels are NOT unique (a create never dedupes), so the backend
-  can leave and later adopt same-label husks.
-- ``tab create --workspace --cwd --cols --rows --command -- <argv...>`` — creates
-  the tab and its single pane, pinning geometry.
-- ``pane get <id>`` (liveness: alive / pane_not_found / workspace_not_found,
-  plus ``agent_status``), ``pane read <id> --source S --format F [--lines N]``
+- ``workspace list`` / ``workspace create --label --cwd --no-focus`` / ``workspace
+  close --workspace`` — labels are NOT unique (a create never dedupes), so the
+  backend can leave and later adopt same-label husks. ``create`` auto-spawns a
+  root shell pane in the new workspace (as real herdr does). All emit the real
+  ``{"id": "cli:<group>:<verb>", "result": {<payload>, "type": <const>}}``
+  success envelope.
+- ``agent start <name> --workspace <id> --cwd <P> --no-focus -- <argv...>`` — the
+  real spawn verb for the inner command: creates a new pane in the workspace
+  running the argv. (``tab create ... --command`` was a #11 design that does not
+  exist in real herdr; :func:`_handle_tab_create` is retained but unused by the
+  reconciled adapter.)
+- ``pane list [--workspace <id>]`` — the pane roster the backend diffs across
+  ``agent start`` to isolate the inner-command pane.
+- ``pane get <id>`` (liveness: a live pane is a success envelope with the pane
+  nested at ``.result.pane`` incl. ``agent_status``; a dead pane / gone workspace
+  is an ERROR envelope ``{"error": {"code": "pane_not_found" |
+  "workspace_not_found"}}`` **with process exit code 1**), ``pane read <id>
+  --source S --format F [--lines N]``
   (screen snapshot: ``visible`` returns the whole viewport, ``recent``/
   ``recent-unwrapped`` tail ``--lines``; a small ``--lines`` models the historic
   empty-read quirk; ``--format ansi`` prepends an SGR marker; emitted with CRLF
@@ -207,6 +218,17 @@ def _command_argv(tokens: list[str]) -> list[str]:
     return rest
 
 
+def _argv_after_double_dash(tokens: list[str]) -> list[str]:
+    """Return the inner argv after a standalone ``--`` marker (``agent start``).
+
+    Real herdr's ``agent start <name> ... -- <argv...>`` separates the inner argv
+    with a bare ``--`` (not ``--command``); everything after it is the program.
+    """
+    if "--" not in tokens:
+        return []
+    return tokens[tokens.index("--") + 1 :]
+
+
 def _log(argv: list[str]) -> None:
     """Append this invocation's argv to the log file, if one is configured."""
     log_path = os.environ.get(LOG_ENV_VAR)
@@ -220,6 +242,20 @@ def _log(argv: list[str]) -> None:
 # ---------------------------------------------------------------------------
 # Subcommand handlers.
 # ---------------------------------------------------------------------------
+
+
+def _write_result(envelope_id: str, payload: dict[str, object]) -> None:
+    """Emit a real-herdr success envelope ``{"id": .., "result": <payload>}``."""
+    sys.stdout.write(json.dumps({"id": envelope_id, "result": payload}))
+
+
+def _write_error(envelope_id: str, code: str, message: str = "") -> None:
+    """Emit a real-herdr error envelope ``{"error": {"code": ..}, "id": ..}``.
+
+    Written to stderr (where real herdr surfaces command errors) so the backend
+    exercises its stdout-then-stderr envelope parsing.
+    """
+    sys.stderr.write(json.dumps({"error": {"code": code, "message": message}, "id": envelope_id}))
 
 
 def _handle_api_schema() -> int:
@@ -242,16 +278,50 @@ def _handle_api_schema() -> int:
     return 0
 
 
+def _new_pane_record(
+    state: dict[str, object],
+    *,
+    workspace: str,
+    cwd: str | None,
+    command: list[str],
+    alive: bool,
+) -> str:
+    """Create a pane record under *workspace* and return its id.
+
+    Shared by ``workspace create`` (the auto-spawned root shell pane) and
+    ``agent start`` (the inner-command pane), mirroring how real herdr spawns a
+    pane in both flows.
+    """
+    pid = _next_id(state, "pane")
+    panes = state["panes"]
+    assert isinstance(panes, dict)
+    panes[pid] = {
+        "id": pid,
+        "workspace": workspace,
+        # herdr has no remain-on-exit: a process that exits at once leaves a
+        # destroyed pane (alive=False → pane_not_found), final screen lost.
+        "alive": alive,
+        "agent_status": "idle",
+        "screen": "",
+        "cwd": cwd,
+        "command": command,
+    }
+    return pid
+
+
 def _handle_workspace(state_dir: str, session: str, rest: list[str]) -> int:
-    """Dispatch ``workspace list|create|close``."""
+    """Dispatch ``workspace list|create|close`` (real ``{"result": ..}`` envelope)."""
     action = rest[1] if len(rest) > 1 else ""
     if action == "list":
         state = _load(state_dir, session)
         workspaces = list((state or {}).get("workspaces", {}).values()) if state else []
-        sys.stdout.write(json.dumps({"workspaces": workspaces}))
+        # Real herdr wraps every socket-API success as
+        # {"id": "cli:<group>:<verb>", "result": {<payload>, "type": <const>}}.
+        _write_result("cli:workspace:list", {"type": "workspace_list", "workspaces": workspaces})
         return 0
     if action == "create":
         label = _flag(rest, "--label") or ""
+        cwd = _flag(rest, "--cwd")
         state = _load(state_dir, session) or _blank_state(session)
         wsid = _next_id(state, "ws")
         workspaces = state["workspaces"]
@@ -259,8 +329,13 @@ def _handle_workspace(state_dir: str, session: str, rest: list[str]) -> int:
         # Labels are intentionally NOT unique: a create never dedupes, so a
         # same-label husk survives here for the backend to adopt/replace.
         workspaces[wsid] = {"id": wsid, "label": label}
+        # herdr auto-spawns a root shell pane in the new workspace.
+        _new_pane_record(state, workspace=wsid, cwd=cwd, command=[], alive=True)
         _save(state_dir, session, state)
-        sys.stdout.write(json.dumps({"workspace": {"id": wsid, "label": label}}))
+        _write_result(
+            "cli:workspace:create",
+            {"type": "workspace_created", "workspace": {"id": wsid, "label": label}},
+        )
         return 0
     if action == "close":
         wsid = _flag(rest, "--workspace") or ""
@@ -346,19 +421,34 @@ def _handle_pane(state_dir: str, session: str, rest: list[str]) -> int:
     action = rest[1] if len(rest) > 1 else ""
     pid = rest[2] if len(rest) > 2 else ""
 
+    if action == "list":
+        state = _load(state_dir, session)
+        panes = list((state or {}).get("panes", {}).values()) if state else []
+        ws_filter = _flag(rest, "--workspace")
+        if ws_filter is not None:
+            panes = [p for p in panes if isinstance(p, dict) and p.get("workspace") == ws_filter]
+        _write_result("cli:pane:list", {"type": "pane_list", "panes": panes})
+        return 0
+
     if action == "get":
+        # Real herdr: a live pane is a success envelope with the pane nested at
+        # .result.pane; a dead pane / gone workspace is an ERROR envelope with
+        # process exit code 1 (NOT a clean {"result": ...} string).
         state = _load(state_dir, session)
         if state is None:
-            sys.stdout.write(json.dumps({"result": "workspace_not_found"}))
-            return 0
+            _write_error("cli:pane:get", "workspace_not_found")
+            return 1
         pane = _live_pane(state_dir, session, pid)
         if pane is None:
-            sys.stdout.write(json.dumps({"result": "pane_not_found"}))
-            return 0
+            _write_error("cli:pane:get", "pane_not_found")
+            return 1
         # An env override lets a test flip the native busy/idle signal (incl. the
         # lying-idle case) without mutating the sidecar per pane.
         status = os.environ.get(AGENT_STATUS_ENV_VAR) or pane.get("agent_status")
-        sys.stdout.write(json.dumps({"result": "alive", "agent_status": status}))
+        _write_result(
+            "cli:pane:get",
+            {"type": "pane_info", "pane": {"id": pid, "agent_status": status}},
+        )
         return 0
 
     if action == "read":
@@ -403,6 +493,38 @@ def _handle_pane(state_dir: str, session: str, rest: list[str]) -> int:
 
     sys.stderr.write(f"unknown pane action: {action}\n")
     return 2
+
+
+def _handle_agent(state_dir: str, session: str, rest: list[str]) -> int:
+    """Dispatch ``agent start`` — the real spawn verb for the inner command.
+
+    ``agent start <name> --workspace <id> --cwd <P> --no-focus -- <argv...>``
+    creates a new pane in the workspace running the inner argv (real herdr also
+    arms native agent detection here). The backend isolates this pane by diffing
+    ``pane list`` across the call, so the success output is minimal; a failure is
+    an error envelope + exit 1.
+    """
+    action = rest[1] if len(rest) > 1 else ""
+    if action != "start":
+        sys.stderr.write(f"unknown agent action: {action}\n")
+        return 2
+    state = _load(state_dir, session)
+    wsid = _flag(rest, "--workspace") or ""
+    if state is None or wsid not in state.get("workspaces", {}):  # type: ignore[union-attr]
+        _write_error("cli:agent:start", "workspace_not_found")
+        return 1
+    command = _argv_after_double_dash(rest)
+    inner_exits = bool(command) and command[0] == EXIT_SENTINEL
+    pid = _new_pane_record(
+        state,
+        workspace=wsid,
+        cwd=_flag(rest, "--cwd"),
+        command=command,
+        alive=not inner_exits,
+    )
+    _save(state_dir, session, state)
+    _write_result("cli:agent:start", {"type": "agent_started", "pane": {"id": pid}})
+    return 0
 
 
 def _rendered_read(pane: dict[str, object], rest: list[str]) -> str:
@@ -477,6 +599,8 @@ def main(argv: list[str]) -> int:
         return _handle_workspace(state_dir, session, rest)
     if command == "tab":
         return _handle_tab_create(state_dir, session, rest)
+    if command == "agent":
+        return _handle_agent(state_dir, session, rest)
     if command == "pane":
         return _handle_pane(state_dir, session, rest)
 

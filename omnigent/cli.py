@@ -4546,6 +4546,40 @@ def _reject_native_on_windows(harness: str) -> None:
         )
 
 
+def _ensure_native_terminal_backend_available(harness: str) -> None:
+    """Gate a hosting-only native harness on a usable terminal backend (Windows).
+
+    Replaces the hard Windows rejection (:func:`_reject_native_on_windows`) for a
+    *side-channel* harness whose prompt/interrupt path is its own app-server, not
+    the terminal — the terminal only needs to *host* the CLI. Such a harness can
+    run wherever a platform-native terminal multiplexer backend is available, so
+    on Windows this resolves the seam's backend for this platform and probes its
+    binary via :meth:`~omnigent.inner.terminal.TerminalBackend.ensure_available`
+    (herdr: installed + protocol supported). A missing/too-old/unsupported
+    backend raises the seam's own actionable error (herdr install hint / protocol
+    gate / "no backend for this platform") as a :class:`click.ClickException`.
+
+    POSIX is left **byte-identical** to the old no-op: tmux hosting there is
+    unchanged and its availability keeps failing at terminal-creation time as
+    before, so this never adds an early gate on the POSIX path.
+
+    :param harness: The native command name, e.g. ``"codex"`` (for messages).
+    :raises click.ClickException: On Windows when no terminal backend can host
+        the harness.
+    """
+    if not IS_WINDOWS:
+        return
+    from omnigent.inner.terminal import select_terminal_backend_class
+
+    try:
+        backend_cls = select_terminal_backend_class()
+        backend_cls.ensure_available()
+    except RuntimeError as exc:
+        raise click.ClickException(
+            f"`omnigent {harness}` cannot start on Windows: {exc}"
+        ) from exc
+
+
 @cli.command(
     context_settings={
         "ignore_unknown_options": True,
@@ -4781,7 +4815,13 @@ def codex(
       omnigent codex --resume                  # interactive picker
       omnigent codex --server https://<app>.databricksapps.com
     """
-    _reject_native_on_windows("codex")
+    # Codex is a side-channel harness (its prompt/interrupt path is the codex
+    # app-server, not the terminal), so the terminal only needs to HOST the CLI.
+    # Replace the hard Windows rejection with a backend-availability check: on
+    # Windows the runner can host codex in a herdr pane, so proceed when a
+    # terminal backend is available and fail with a clear, actionable error when
+    # it is not. POSIX is byte-identical to the prior no-op.
+    _ensure_native_terminal_backend_available("codex")
     choice = _split_resume_value(resume)
     if session_id is not None and (choice.picker or choice.conversation_id is not None):
         raise click.UsageError(

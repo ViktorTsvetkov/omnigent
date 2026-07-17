@@ -24,6 +24,7 @@ import httpx
 import yaml
 
 from omnigent._native_resume_hint import echo_native_resume_hint
+from omnigent._platform import IS_WINDOWS
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._wrapper_labels import (
     CODEX_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE,
@@ -1366,6 +1367,16 @@ async def _attach_terminal_resource(
             raise click.ClickException("Codex tmux attach metadata was incomplete.")
         await _attach_direct_tmux(prepared.tmux_socket, prepared.tmux_target)
         return
+    # On native Windows the terminal is hosted in a herdr pane, and the local
+    # PTY relay used below (attach_local_terminal) is POSIX-only (termios / tty /
+    # SIGWINCH). herdr is a GUI app whose equivalent of `tmux attach` is opening
+    # the herdr app and finding this session's workspace by its label, so point
+    # the user there instead of crashing on a POSIX attach. The session keeps
+    # running on the runner (web UI + app-server data plane), so a turn still
+    # completes without a local attach.
+    if IS_WINDOWS:
+        _print_herdr_local_attach_guidance(prepared)
+        return
     if prepared.app_server_url is None:
         raise click.ClickException(
             f"Runner-owned Codex terminal requires direct tmux attach, but {direct_tmux_error}"
@@ -1379,6 +1390,50 @@ async def _attach_terminal_resource(
         session_id=prepared.session_id,
         terminal_id=prepared.terminal_id,
         active_session_id_reader=lambda: _active_codex_session_id(prepared.bridge_dir),
+    )
+
+
+def _print_herdr_local_attach_guidance(prepared: PreparedCodexTerminal) -> None:
+    """Point a Windows user at the herdr GUI to watch the hosted Codex pane.
+
+    The POSIX local-terminal attach (a raw-mode PTY relay) cannot run on native
+    Windows, and herdr — the Windows terminal backend — is a GUI app rather than
+    a socket a ``tmux attach`` could consume. Its equivalent of ``tmux attach`` is
+    opening the herdr app and selecting this session's workspace by its durable
+    label. The label is derived from the terminal's endpoint path, so it is
+    recomputed here from the resource metadata the runner reported.
+
+    The Codex session keeps running on the runner (the Web UI and app-server data
+    plane are unaffected), so a turn still completes without a local attach; this
+    guidance is only about *watching* the native TUI locally.
+
+    :param prepared: Prepared terminal details for the hosted Codex terminal.
+    :returns: None. Side-effect only (writes guidance to stderr).
+    """
+    label: str | None = None
+    if prepared.tmux_socket is not None:
+        from omnigent.inner.terminal import HerdrBackend
+
+        label = HerdrBackend.workspace_label_for(
+            prepared.tmux_socket, prepared.tmux_target or "main"
+        )
+    click.echo(
+        "\nCodex is running in a herdr terminal on this Windows host.", err=True
+    )
+    click.echo(
+        "Local terminal attach is POSIX-only; to watch the native TUI, open the "
+        "herdr app",
+        err=True,
+    )
+    if label is not None:
+        click.echo(f"and select the workspace labeled '{label}'.", err=True)
+    else:
+        click.echo("and select this session's omnigent workspace (label prefix "
+                   "'omnigent-ws-').", err=True)
+    click.echo(
+        "The session keeps running on the runner — you can also drive it from the "
+        "Web UI above.",
+        err=True,
     )
 
 

@@ -12620,6 +12620,13 @@ def create_runner_app(
         if instance is None or not instance.running:
             # No live codex terminal to render on; web card is the surface.
             return Response(status_code=204)
+        if not instance.backend_capabilities.native_popup:
+            # The terminal backend cannot host a native pane popup (herdr on
+            # Windows declares native_popup=False; a tmux display-popup has no
+            # herdr equivalent). Degrade to the web approval card, which the
+            # server already published for this elicitation. Capability-flag
+            # driven, never platform- or backend-identity driven.
+            return Response(status_code=204)
         # Mint a fresh AP-routing snapshot rather than reading this bridge's
         # policy_hook.json, whose launch token goes stale at ~1h and would 401
         # the verdict POST (silently losing the approval).

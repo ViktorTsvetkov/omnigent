@@ -62,6 +62,37 @@ def _instance_on_fake(
 
 
 # ---------------------------------------------------------------------------
+# backend_capabilities — the seam the native cost popup degrades on
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("backend_name", "expected_native_popup"),
+    [("tmux", True), ("herdr", False)],
+)
+def test_backend_capabilities_expose_native_popup_flag(
+    tmp_path: Path, backend_name: str, expected_native_popup: bool
+) -> None:
+    """A TerminalInstance exposes its backend's ``native_popup`` capability.
+
+    The native cost-popup dispatch reads
+    ``instance.backend_capabilities.native_popup`` to decide whether to render a
+    pane overlay or degrade to the web approval card: tmux hosts the popup
+    (``True``); herdr on Windows cannot (``False``), so the ASK verdict flows to
+    the web card. Construction goes through the production hook and probes no
+    binary, so this runs on any platform for both backends.
+    """
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        backend_name=backend_name,
+    )
+    assert instance.backend_capabilities.native_popup is expected_native_popup
+
+
+# ---------------------------------------------------------------------------
 # is_alive — mirrors test_is_alive_true_when_pane_live / _false_when_pane_dead
 # ---------------------------------------------------------------------------
 

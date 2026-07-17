@@ -1863,7 +1863,12 @@ class HerdrBackend(TerminalBackend):
 
     @classmethod
     def _workspaces_of(cls, data: dict[str, Any]) -> list[dict[str, Any]]:  # type: ignore[explicit-any]
-        """Return the ``workspaces`` list from a ``workspace list`` envelope."""
+        """Return the ``workspaces`` list from a ``workspace list`` envelope.
+
+        Each entry's id field is ``workspace_id`` (verified against real herdr
+        0.7.4 — NOT a bare ``id``; the entry also carries ``label``, ``number``,
+        ``pane_count``, ``active_tab_id``, etc., which callers ignore).
+        """
         workspaces = cls._result_payload(data).get("workspaces")
         if not isinstance(workspaces, list):
             return []
@@ -1871,11 +1876,20 @@ class HerdrBackend(TerminalBackend):
 
     @classmethod
     def _pane_ids_of(cls, data: dict[str, Any]) -> list[str]:  # type: ignore[explicit-any]
-        """Return the pane ids from a ``pane list`` envelope, in listed order."""
+        """Return the pane ids from a ``pane list`` envelope, in listed order.
+
+        The id field is ``pane_id`` (verified against real herdr 0.7.4 — a
+        namespaced ``wN:pN``, NOT a bare ``id``; entries also carry ``tab_id``,
+        ``workspace_id``, ``terminal_id``, ``cwd``, etc., which callers ignore).
+        """
         panes = cls._result_payload(data).get("panes")
         if not isinstance(panes, list):
             return []
-        return [p["id"] for p in panes if isinstance(p, dict) and isinstance(p.get("id"), str)]
+        return [
+            p["pane_id"]
+            for p in panes
+            if isinstance(p, dict) and isinstance(p.get("pane_id"), str)
+        ]
 
     @staticmethod
     def _to_windows_path(cwd: str) -> str:
@@ -2164,9 +2178,9 @@ class HerdrBackend(TerminalBackend):
         await self._ensure_server_running()
         listing = await self._run_json("workspace", "list")
         husks = [
-            ws["id"]
+            ws["workspace_id"]
             for ws in self._workspaces_of(listing)
-            if ws.get("label") == self._label and ws.get("id") is not None
+            if ws.get("label") == self._label and ws.get("workspace_id") is not None
         ]
 
         win_cwd = self._to_windows_path(request.cwd)
@@ -2178,9 +2192,11 @@ class HerdrBackend(TerminalBackend):
         )
         after_create = self._workspaces_of(await self._run_json("workspace", "list"))
         mine = [
-            ws["id"]
+            ws["workspace_id"]
             for ws in after_create
-            if ws.get("label") == self._label and ws.get("id") not in husks and ws.get("id")
+            if ws.get("label") == self._label
+            and ws.get("workspace_id") not in husks
+            and ws.get("workspace_id")
         ]
         if not mine:
             raise RuntimeError(
@@ -2233,7 +2249,7 @@ class HerdrBackend(TerminalBackend):
         # Create-before-close: only now retire the husks.
         for husk_id in husks:
             with contextlib.suppress(RuntimeError):
-                await self._run("workspace", "close", "--workspace", husk_id)
+                await self._run("workspace", "close", husk_id)
 
     def _pane_argv(self, action: str, *args: str) -> list[str]:
         """Build a ``pane <action> <pane-id> [args...]`` suffix (no session prefix).
@@ -2360,7 +2376,7 @@ class HerdrBackend(TerminalBackend):
         """
         if self._workspace_id is not None:
             with contextlib.suppress(RuntimeError):
-                await self._run("workspace", "close", "--workspace", self._workspace_id)
+                await self._run("workspace", "close", self._workspace_id)
         await self._reap_labeled_workspaces()
 
     async def _reap_labeled_workspaces(self, *, exclude: str | None = None) -> None:
@@ -2373,10 +2389,10 @@ class HerdrBackend(TerminalBackend):
         except RuntimeError:
             return
         for ws in self._workspaces_of(listing):
-            wsid = ws.get("id")
+            wsid = ws.get("workspace_id")
             if ws.get("label") == self._label and wsid is not None and wsid != exclude:
                 with contextlib.suppress(RuntimeError):
-                    await self._run("workspace", "close", "--workspace", wsid)
+                    await self._run("workspace", "close", wsid)
 
     async def send_text(self, text: str) -> None:
         """Type literal *text* into the pane WITHOUT submitting it.

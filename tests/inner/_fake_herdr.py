@@ -32,11 +32,14 @@ Modeled vocabulary (nothing else)
   (``Os { code: 2, kind: NotFound }`` + exit 1). The :data:`SERVER_REFUSE_ENV_VAR`
   knob makes it refuse, exercising the backend's readiness-timeout path.
 - ``workspace list`` / ``workspace create --label --cwd --no-focus`` / ``workspace
-  close --workspace`` — labels are NOT unique (a create never dedupes), so the
+  close <workspace_id>`` — labels are NOT unique (a create never dedupes), so the
   backend can leave and later adopt same-label husks. ``create`` auto-spawns a
   root shell pane in the new workspace (as real herdr does). All emit the real
   ``{"id": "cli:<group>:<verb>", "result": {<payload>, "type": <const>}}``
-  success envelope.
+  success envelope, with real 0.7.4 field names (``workspace_id``/``pane_id``,
+  NOT ``id``; namespaced ``wN``/``wN:pN`` ids). ``workspace close`` takes the id
+  POSITIONALLY — the ``--workspace`` flag form is rejected with the real usage
+  error (rc 2), pinning the verb shape.
 - ``agent start <name> --workspace <id> --cwd <P> --no-focus [--env K=V ...] --
   <argv...>`` — the real spawn verb for the inner command: creates a new pane in
   the workspace running the argv. The repeatable ``--env`` pairs (before the
@@ -176,10 +179,37 @@ def _blank_state(session: str) -> dict[str, object]:
     return {
         "session": session,
         "counter": 0,
+        "pane_counter": 0,
         "server_running": False,
         "workspaces": {},
         "tabs": {},
         "panes": {},
+    }
+
+
+def _new_pane_id(state: dict[str, object], workspace: str) -> str:
+    """Allocate a namespaced ``<workspace>:pN`` pane id (real herdr's form)."""
+    n = int(state.get("pane_counter", 0)) + 1  # type: ignore[arg-type]
+    state["pane_counter"] = n
+    return f"{workspace}:p{n}"
+
+
+def _workspace_record(wsid: str, label: str) -> dict[str, object]:
+    """Build a ``workspace list`` entry with real herdr 0.7.4 field names.
+
+    The id field is ``workspace_id`` (NOT ``id``); the extra fields mirror the
+    real envelope so tests exercise the backend's tolerance of them.
+    """
+    number = int(wsid[1:]) if wsid[1:].isdigit() else 1
+    return {
+        "workspace_id": wsid,
+        "label": label,
+        "number": number,
+        "pane_count": 1,
+        "tab_count": 1,
+        "active_tab_id": f"{wsid}:t1",
+        "agent_status": "unknown",
+        "focused": True,
     }
 
 
@@ -192,10 +222,10 @@ def seed_workspace(state_dir: str | Path, session: str, label: str) -> str:
     :returns: The new workspace id.
     """
     state = _load(str(state_dir), session) or _blank_state(session)
-    wsid = _next_id(state, "ws")
+    wsid = _next_id(state, "w")
     workspaces = state["workspaces"]
     assert isinstance(workspaces, dict)
-    workspaces[wsid] = {"id": wsid, "label": label}
+    workspaces[wsid] = _workspace_record(wsid, label)
     _save(str(state_dir), session, state)
     return wsid
 
@@ -380,16 +410,20 @@ def _new_pane_record(
     pane in both flows. ``env`` records the ``--env KEY=VALUE`` pairs threaded
     onto the pane so a test can assert the backend delivered them.
     """
-    pid = _next_id(state, "pane")
+    pid = _new_pane_id(state, workspace)
     panes = state["panes"]
     assert isinstance(panes, dict)
     panes[pid] = {
-        "id": pid,
-        "workspace": workspace,
+        # Real herdr 0.7.4 field names: the id is ``pane_id`` (a namespaced
+        # ``wN:pN``), NOT ``id``; ``workspace_id``/``tab_id`` are namespaced too.
+        "pane_id": pid,
+        "workspace_id": workspace,
+        "tab_id": f"{workspace}:t1",
         # herdr has no remain-on-exit: a process that exits at once leaves a
         # destroyed pane (alive=False → pane_not_found), final screen lost.
         "alive": alive,
         "agent_status": "idle",
+        "revision": 1,
         "screen": "",
         "cwd": cwd,
         "command": command,
@@ -412,22 +446,27 @@ def _handle_workspace(state_dir: str, session: str, rest: list[str]) -> int:
         label = _flag(rest, "--label") or ""
         cwd = _flag(rest, "--cwd")
         state = _load(state_dir, session) or _blank_state(session)
-        wsid = _next_id(state, "ws")
+        wsid = _next_id(state, "w")
         workspaces = state["workspaces"]
         assert isinstance(workspaces, dict)
         # Labels are intentionally NOT unique: a create never dedupes, so a
         # same-label husk survives here for the backend to adopt/replace.
-        workspaces[wsid] = {"id": wsid, "label": label}
+        workspaces[wsid] = _workspace_record(wsid, label)
         # herdr auto-spawns a root shell pane in the new workspace.
         _new_pane_record(state, workspace=wsid, cwd=cwd, command=[], alive=True)
         _save(state_dir, session, state)
         _write_result(
             "cli:workspace:create",
-            {"type": "workspace_created", "workspace": {"id": wsid, "label": label}},
+            {"type": "workspace_created", "workspace": {"workspace_id": wsid, "label": label}},
         )
         return 0
     if action == "close":
-        wsid = _flag(rest, "--workspace") or ""
+        # Real herdr: the workspace id is POSITIONAL (``workspace close <id>``);
+        # the ``--workspace`` flag form is a usage error (rc 2). Pins the verb.
+        if "--workspace" in rest:
+            sys.stderr.write("usage: herdr workspace close <workspace_id>\n")
+            return 2
+        wsid = rest[2] if len(rest) > 2 else ""
         state = _load(state_dir, session)
         if state is not None:
             workspaces = state["workspaces"]
@@ -437,9 +476,9 @@ def _handle_workspace(state_dir: str, session: str, rest: list[str]) -> int:
                 isinstance(workspaces, dict) and isinstance(tabs, dict) and isinstance(panes, dict)
             )
             workspaces.pop(wsid, None)
-            for tid in [t for t, tab in tabs.items() if tab.get("workspace") == wsid]:
+            for tid in [t for t, tab in tabs.items() if tab.get("workspace_id") == wsid]:
                 tabs.pop(tid, None)
-            for pid in [p for p, pane in panes.items() if pane.get("workspace") == wsid]:
+            for pid in [p for p, pane in panes.items() if pane.get("workspace_id") == wsid]:
                 panes.pop(pid, None)
             _save(state_dir, session, state)
         # Idempotent: closing an already-gone workspace succeeds quietly.
@@ -515,7 +554,9 @@ def _handle_pane(state_dir: str, session: str, rest: list[str]) -> int:
         panes = list((state or {}).get("panes", {}).values()) if state else []
         ws_filter = _flag(rest, "--workspace")
         if ws_filter is not None:
-            panes = [p for p in panes if isinstance(p, dict) and p.get("workspace") == ws_filter]
+            panes = [
+                p for p in panes if isinstance(p, dict) and p.get("workspace_id") == ws_filter
+            ]
         _write_result("cli:pane:list", {"type": "pane_list", "panes": panes})
         return 0
 
@@ -536,7 +577,7 @@ def _handle_pane(state_dir: str, session: str, rest: list[str]) -> int:
         status = os.environ.get(AGENT_STATUS_ENV_VAR) or pane.get("agent_status")
         _write_result(
             "cli:pane:get",
-            {"type": "pane_info", "pane": {"id": pid, "agent_status": status}},
+            {"type": "pane_info", "pane": {"pane_id": pid, "agent_status": status}},
         )
         return 0
 

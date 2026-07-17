@@ -268,6 +268,25 @@ async def test_launch_adopts_and_replaces_same_label_husk(herdr_env: _HerdrEnv) 
         await backend.close()
 
 
+async def test_workspace_close_uses_positional_id(herdr_env: _HerdrEnv) -> None:
+    """``workspace close`` passes the id positionally (real herdr rejects the flag).
+
+    Real herdr 0.7.4's ``workspace close <id>`` takes the id positionally; the
+    ``--workspace`` form is a usage error. The fake rejects the flag form (rc 2),
+    so a regressed adapter would silently fail to close — this pins the shape.
+    """
+    backend = herdr_env.make_backend()
+    await backend.launch(_request(["sleep", "1000000"]))
+    wsid = backend._workspace_id
+    await backend.close()
+    closes = [a for a in herdr_env.log() if a[2:4] == ["workspace", "close"]]
+    assert closes, "expected a workspace close invocation"
+    for argv in closes:
+        assert "--workspace" not in argv, argv
+    # This terminal's own workspace was closed by its positional id.
+    assert any(argv[argv.index("close") + 1] == wsid for argv in closes)
+
+
 async def test_close_reaps_leftover_same_label_workspaces(herdr_env: _HerdrEnv) -> None:
     """close() reaps stray same-label husks of the session, not just its own."""
     backend = herdr_env.make_backend()

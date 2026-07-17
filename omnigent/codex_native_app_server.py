@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import socket
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -873,9 +874,16 @@ def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) 
         --bridge-dir /home/u/.omnigent/codex-native/abc"``.
     """
     python = python_executable or sys.executable
-    return shlex.join(
-        [python, "-m", _POLICY_HOOK_MODULE, "evaluate-policy", "--bridge-dir", str(bridge_dir)]
-    )
+    argv = [python, "-m", _POLICY_HOOK_MODULE, "evaluate-policy", "--bridge-dir", str(bridge_dir)]
+    if IS_WINDOWS:
+        # codex runs the hook ``command`` string through the Windows shell
+        # (cmd.exe), which does NOT understand POSIX single-quote quoting:
+        # ``shlex.join`` emits ``'C:\\path\\python.exe' -m ...`` and cmd.exe then
+        # fails with "The filename, directory name, or volume label syntax is
+        # incorrect" (the hook exits 1 → policy enforcement degrades open). Use
+        # Windows command-line quoting (double quotes) instead. POSIX unchanged.
+        return subprocess.list2cmdline(argv)
+    return shlex.join(argv)
 
 
 def _codex_policy_hooks_settings(

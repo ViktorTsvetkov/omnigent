@@ -1044,3 +1044,29 @@ async def test_start_posix_env_has_no_passthrough_merge(
     env = captured["env"]
     assert env == {"CODEX_HOME": str(server.codex_home)}
     assert "SYSTEMROOT" not in env
+
+
+def test_policy_hook_command_uses_windows_quoting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On Windows the hook command uses cmd.exe-compatible (double-quote) quoting.
+
+    codex runs the hook ``command`` string through the Windows shell; POSIX
+    single-quote quoting (``shlex.join``) makes cmd.exe fail with a filename-syntax
+    error and the hook exits 1 (policy enforcement degrades open). The Windows
+    branch must never emit POSIX single quotes.
+    """
+    import omnigent.codex_native_app_server as mod
+
+    monkeypatch.setattr(mod, "IS_WINDOWS", True)
+    cmd = mod._codex_policy_hook_command(Path("bridge dir"), "py dir/python.exe")
+    assert "'" not in cmd  # never POSIX single-quotes on Windows
+    assert '"' in cmd  # space-containing tokens are double-quoted instead
+
+
+def test_policy_hook_command_posix_quoting_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POSIX keeps byte-identical ``shlex.join`` (single-quote) quoting."""
+    import omnigent.codex_native_app_server as mod
+
+    monkeypatch.setattr(mod, "IS_WINDOWS", False)
+    cmd = mod._codex_policy_hook_command(Path("bridge dir"), "py dir/python")
+    assert "'" in cmd  # POSIX shlex single-quotes the space-containing tokens
+    assert '"' not in cmd

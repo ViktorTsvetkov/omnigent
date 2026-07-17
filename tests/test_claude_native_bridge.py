@@ -5405,6 +5405,28 @@ def test_format_terminal_failure_tail_caps_length(monkeypatch: pytest.MonkeyPatc
     assert len(body) <= 51
 
 
+class _SnapshotDelivery:
+    """Minimal :class:`TerminalDelivery` stand-in exposing only ``snapshot()``.
+
+    The readiness gate calls nothing but ``snapshot()`` on its delivery surface,
+    so these tests drive it with a scripted snapshot function instead of a real
+    tmux-backed surface — the pane-text logic (glyph scan, failure tail, poll
+    counts) is what they pin, independent of any multiplexer.
+    """
+
+    def __init__(self, snapshot_fn: Any) -> None:
+        self._snapshot_fn = snapshot_fn
+
+    def snapshot(self) -> str:
+        """Return the next scripted pane text."""
+        return self._snapshot_fn()
+
+
+def _snapshot_delivery(snapshot_fn: Any) -> Any:
+    """Build a delivery stub whose ``snapshot()`` calls *snapshot_fn*."""
+    return _SnapshotDelivery(snapshot_fn)
+
+
 def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5425,14 +5447,9 @@ def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
         "  at <parse> (:0)\n"
         "  at parse (unknown)\n"
     )
-    monkeypatch.setattr(
-        "omnigent.claude_native_bridge._capture_pane",
-        lambda socket_path, tmux_target: crash_pane,
-    )
     with pytest.raises(RuntimeError) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
-            "/tmp/example/tmux.sock",
-            "claude:0.0",
+            _snapshot_delivery(lambda: crash_pane),
             timeout_s=0.0,
         )
     message = str(excinfo.value)
@@ -5456,14 +5473,9 @@ def test_wait_for_claude_prompt_ready_reports_empty_capture_count(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    monkeypatch.setattr(
-        "omnigent.claude_native_bridge._capture_pane",
-        lambda socket_path, tmux_target: "",
-    )
     with pytest.raises(RuntimeError) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
-            "/tmp/example/tmux.sock",
-            "claude:0.0",
+            _snapshot_delivery(lambda: ""),
             timeout_s=0.0,
         )
     message = str(excinfo.value)
@@ -5497,18 +5509,16 @@ def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
     late_ready = "────────────────\n❯ \n────────────────\n  Opus 4.8\n"
     calls = {"n": 0}
 
-    def fake_capture(socket_path: str, tmux_target: str) -> str:
+    def fake_snapshot() -> str:
         calls["n"] += 1
-        # First (and only, at timeout_s=0) in-loop capture: no box.
-        # Any later capture would be the box-present frame — which the
+        # First (and only, at timeout_s=0) in-loop snapshot: no box.
+        # Any later snapshot would be the box-present frame — which the
         # rewritten gate must never fetch, since it does not re-capture.
         return observed if calls["n"] == 1 else late_ready
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._capture_pane", fake_capture)
     with pytest.raises(RuntimeError) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
-            "/tmp/example/tmux.sock",
-            "claude:0.0",
+            _snapshot_delivery(fake_snapshot),
             timeout_s=0.0,
         )
     message = str(excinfo.value)

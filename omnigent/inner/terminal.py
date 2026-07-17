@@ -2060,10 +2060,13 @@ class HerdrBackend(TerminalBackend):
         spawn is not expressible; headless panes come up ~52 columns and the
         capture path relies on ``--source recent-unwrapped`` for logical lines
         (see :meth:`_read_argv`). :attr:`~TerminalLaunchRequest.keep_alive_after_exit`
-        is ignored (herdr has no remain-on-exit). Threading the inner process
-        environment (``request.env``) through the per-session server is a #15
-        integration concern (real herdr's per-pane ``--env KEY=VALUE`` is a
-        few-vars vehicle, not the full merged env).
+        is ignored (herdr has no remain-on-exit). The inner process environment
+        (:attr:`TerminalLaunchRequest.env`, already harness-filtered — codex needs
+        only ~3 vars: CODEX_HOME + the optional Databricks pair) is threaded onto
+        the pane as repeated ``agent start ... --env KEY=VALUE`` flags (before the
+        ``--`` marker); the OS argv cap for a pathologically large env is a
+        documented limitation, and threading a full merged env through a
+        per-session server stays a #15 integration concern.
 
         :param request: The backend-neutral launch request.
         :raises RuntimeError: If herdr rejects the workspace/agent creation.
@@ -2101,8 +2104,18 @@ class HerdrBackend(TerminalBackend):
                 await self._run_json("pane", "list", "--workspace", self._workspace_id)
             )
         )
-        # ``-- <argv>`` must be LAST: everything after ``--`` is the inner argv,
-        # so no herdr flag may follow it.
+        # Thread the (harness-filtered) environment onto the pane as repeated
+        # ``--env KEY=VALUE`` flags — the spike-verified per-pane env vehicle.
+        # These MUST precede the ``--`` marker (everything after ``--`` is the
+        # inner argv, so no herdr flag may follow it). ``request.env`` is already
+        # the small env the harness needs (codex threads ~3 vars — CODEX_HOME +
+        # the optional Databricks pair), so per-pane ``--env`` fits; a
+        # pathologically large ``request.env`` is bounded by the OS argv cap
+        # (documented limitation), and the full-merged-env / per-session-server
+        # vehicle stays a #15 integration concern.
+        env_flags: list[str] = []
+        for key, value in request.env.items():
+            env_flags += ["--env", f"{key}={value}"]
         await self._run(
             "agent",
             "start",
@@ -2112,6 +2125,7 @@ class HerdrBackend(TerminalBackend):
             "--cwd",
             win_cwd,
             "--no-focus",
+            *env_flags,
             "--",
             *request.command,
         )

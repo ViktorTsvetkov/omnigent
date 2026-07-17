@@ -19,6 +19,7 @@ from omnigent.codex_native_app_server import (
     CodexNativeAppServer,
     _codex_policy_hooks_settings,
     build_codex_native_server,
+    codex_terminal_env,
     trust_native_policy_hooks,
 )
 from omnigent.codex_native_hook import _EVALUATE_POLICY_TIMEOUT_S
@@ -979,3 +980,21 @@ def test_free_loopback_ws_url_is_valid() -> None:
     url = _free_loopback_ws_url()
     assert url.startswith("ws://127.0.0.1:")
     assert 0 < int(url.rsplit(":", 1)[1]) < 65536
+
+
+def test_codex_terminal_env_always_carries_codex_home(tmp_path: Path) -> None:
+    """``codex_terminal_env`` always includes CODEX_HOME (the herdr-pane contract).
+
+    On Windows the herdr pane finds its private per-session codex config only via
+    the ``CODEX_HOME`` env var threaded onto ``agent start --env``. If a future
+    change dropped CODEX_HOME from this filtered env, the pane would fall back to
+    the user's real ``~/.codex`` and the ``--remote`` TUI would render the
+    sign-in onboarding instead of creating a thread. Pin the contract.
+    """
+    codex_home = tmp_path / "codex-home"
+    bridge_dir = tmp_path / "bridge"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(tmp_path, codex_home, bridge_dir, workspace)
+    env = codex_terminal_env(server)
+    assert env["CODEX_HOME"] == str(codex_home)

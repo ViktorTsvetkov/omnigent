@@ -364,6 +364,59 @@ async def test_launch_runs_inner_command_via_agent_start(herdr_env: _HerdrEnv) -
         await backend.close()
 
 
+async def test_launch_threads_env_as_agent_start_flags(herdr_env: _HerdrEnv) -> None:
+    """Every ``request.env`` pair reaches the pane as ``--env`` before the ``--``.
+
+    This is the codex-on-Windows dependency: the pane needs ``CODEX_HOME`` (and
+    the optional Databricks pair) to find its private per-session config.
+    """
+    backend = herdr_env.make_backend()
+    env = {"CODEX_HOME": "C:\\codex-home", "DATABRICKS_HOST": "https://x"}
+    request = TerminalLaunchRequest(
+        command=["codex", "--remote", "ws://127.0.0.1:9"], cwd=".", env=env
+    )
+    await backend.launch(request)
+    try:
+        # The fake recorded exactly the threaded env on the pane.
+        pane = herdr_env.load_state(backend)["panes"][backend._pane_id]
+        assert pane["env"] == env
+        # Every ``--env`` flag precedes the ``--`` inner-argv marker.
+        start = next(a for a in herdr_env.log() if a[2:4] == ["agent", "start"])
+        dash = start.index("--")
+        env_positions = [i for i, tok in enumerate(start) if tok == "--env"]
+        assert env_positions, "expected --env flags"
+        assert all(pos < dash for pos in env_positions)
+    finally:
+        await backend.close()
+
+
+async def test_launch_with_empty_env_emits_no_env_flags(herdr_env: _HerdrEnv) -> None:
+    """An empty ``request.env`` threads zero ``--env`` flags (POSIX-neutral)."""
+    backend = herdr_env.make_backend()
+    await backend.launch(_request(["sleep", "1000000"]))
+    try:
+        start = next(a for a in herdr_env.log() if a[2:4] == ["agent", "start"])
+        assert "--env" not in start
+        assert herdr_env.load_state(backend)["panes"][backend._pane_id]["env"] == {}
+    finally:
+        await backend.close()
+
+
+async def test_launch_env_value_with_equals_survives(herdr_env: _HerdrEnv) -> None:
+    """An env value containing ``=`` is delivered intact (split on first ``=``)."""
+    backend = herdr_env.make_backend()
+    token = "header.payload=extra=padding"
+    request = TerminalLaunchRequest(
+        command=["codex"], cwd=".", env={"DATABRICKS_CODEX_TOKEN": token}
+    )
+    await backend.launch(request)
+    try:
+        pane = herdr_env.load_state(backend)["panes"][backend._pane_id]
+        assert pane["env"]["DATABRICKS_CODEX_TOKEN"] == token
+    finally:
+        await backend.close()
+
+
 async def test_launch_translates_cwd_to_windows_path(herdr_env: _HerdrEnv) -> None:
     """A forward-slash cwd is translated to a Windows-native path for herdr."""
     backend = herdr_env.make_backend()

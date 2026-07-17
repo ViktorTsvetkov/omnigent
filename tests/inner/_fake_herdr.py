@@ -33,11 +33,13 @@ Modeled vocabulary (nothing else)
   root shell pane in the new workspace (as real herdr does). All emit the real
   ``{"id": "cli:<group>:<verb>", "result": {<payload>, "type": <const>}}``
   success envelope.
-- ``agent start <name> --workspace <id> --cwd <P> --no-focus -- <argv...>`` — the
-  real spawn verb for the inner command: creates a new pane in the workspace
-  running the argv. (``tab create ... --command`` was a #11 design that does not
-  exist in real herdr; :func:`_handle_tab_create` is retained but unused by the
-  reconciled adapter.)
+- ``agent start <name> --workspace <id> --cwd <P> --no-focus [--env K=V ...] --
+  <argv...>`` — the real spawn verb for the inner command: creates a new pane in
+  the workspace running the argv. The repeatable ``--env`` pairs (before the
+  ``--`` marker) are recorded on the pane so a test can assert env threading.
+  (``tab create ... --command`` was a #11 design that does not exist in real
+  herdr; :func:`_handle_tab_create` is retained but unused by the reconciled
+  adapter.)
 - ``pane list [--workspace <id>]`` — the pane roster the backend diffs across
   ``agent start`` to isolate the inner-command pane.
 - ``pane get <id>`` (liveness: a live pane is a success envelope with the pane
@@ -208,6 +210,33 @@ def _flag(tokens: list[str], name: str) -> str | None:
     return None
 
 
+def _multi_flag(tokens: list[str], name: str) -> list[str]:
+    """Return every value following an occurrence of ``name`` (repeatable flag).
+
+    ``agent start ... --env K1=V1 --env K2=V2`` passes ``--env`` repeatedly, so
+    the fake collects all of them rather than just the first (:func:`_flag`).
+    """
+    return [
+        tokens[i + 1]
+        for i, token in enumerate(tokens)
+        if token == name and i + 1 < len(tokens)
+    ]
+
+
+def _parse_env_pairs(pairs: list[str]) -> dict[str, str]:
+    """Parse ``KEY=VALUE`` env markers, splitting on the FIRST ``=`` only.
+
+    A value that itself contains ``=`` (e.g. a token or base64 padding) must
+    survive intact, so only the first ``=`` separates key from value.
+    """
+    env: dict[str, str] = {}
+    for pair in pairs:
+        key, sep, value = pair.partition("=")
+        if sep and key:
+            env[key] = value
+    return env
+
+
 def _command_argv(tokens: list[str]) -> list[str]:
     """Return the inner argv after a trailing ``--command --`` marker."""
     if "--command" not in tokens:
@@ -285,12 +314,14 @@ def _new_pane_record(
     cwd: str | None,
     command: list[str],
     alive: bool,
+    env: dict[str, str] | None = None,
 ) -> str:
     """Create a pane record under *workspace* and return its id.
 
     Shared by ``workspace create`` (the auto-spawned root shell pane) and
     ``agent start`` (the inner-command pane), mirroring how real herdr spawns a
-    pane in both flows.
+    pane in both flows. ``env`` records the ``--env KEY=VALUE`` pairs threaded
+    onto the pane so a test can assert the backend delivered them.
     """
     pid = _next_id(state, "pane")
     panes = state["panes"]
@@ -305,6 +336,7 @@ def _new_pane_record(
         "screen": "",
         "cwd": cwd,
         "command": command,
+        "env": env or {},
     }
     return pid
 
@@ -515,12 +547,16 @@ def _handle_agent(state_dir: str, session: str, rest: list[str]) -> int:
         return 1
     command = _argv_after_double_dash(rest)
     inner_exits = bool(command) and command[0] == EXIT_SENTINEL
+    # ``--env`` is repeatable and only meaningful BEFORE the ``--`` marker (a
+    # ``--env`` appearing inside the inner argv is the program's, not herdr's).
+    pre_marker = rest[: rest.index("--")] if "--" in rest else rest
     pid = _new_pane_record(
         state,
         workspace=wsid,
         cwd=_flag(rest, "--cwd"),
         command=command,
         alive=not inner_exits,
+        env=_parse_env_pairs(_multi_flag(pre_marker, "--env")),
     )
     _save(state_dir, session, state)
     _write_result("cli:agent:start", {"type": "agent_started", "pane": {"id": pid}})

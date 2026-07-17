@@ -1312,6 +1312,46 @@ class TerminalBackend(ABC):
         except RuntimeError:
             return ""
 
+    def delivery_liveness_sync(self) -> bool:
+        """Report whether this session's host endpoint currently exists.
+
+        The delivery dance's fast-fail probe (:meth:`TerminalDelivery.is_alive`):
+        a bridge checks this before injecting a web message so a prompt into an
+        already-exited TUI raises a clear "restart the session" error instead of
+        being silently typed into a dead pane. Distinct from :meth:`liveness_sync`
+        (which grades ALIVE / INNER_EXITED / ENDPOINT_GONE / UNKNOWN): the
+        delivery caller only needs a boolean "endpoint present", so this collapses
+        the verdict. NEVER raises — a probe that cannot run reads as not-alive.
+
+        The default derives the boolean from :meth:`liveness_sync` (so the herdr
+        backend routes through its existing pane-liveness machinery, and the
+        in-process fake through its scriptable verdict). A backend whose delivery
+        liveness must match a pre-existing byte-exact command stream — tmux's
+        ``has-session`` — overrides this.
+
+        :returns: ``True`` when the endpoint exists (ALIVE or INNER_EXITED),
+            ``False`` otherwise (ENDPOINT_GONE / UNKNOWN).
+        """
+        return self.liveness_sync() in (Liveness.ALIVE, Liveness.INNER_EXITED)
+
+    def send_keys_repeated_sync(self, key: str, count: int) -> None:
+        """Press *key* *count* times (the composer-clear burst primitive).
+
+        Backs :meth:`TerminalDelivery.send_keys_repeated`, the primitive cursor's
+        backspace-flood composer clear is built on. The default expresses the
+        repeat as *count* presses through the existing send path — the semantics a
+        backend without a native repeat has (herdr sends N single keys). tmux
+        overrides this with its native ``send-keys -N`` repeat so the migrated
+        cursor command stream stays byte-identical. A non-positive *count* is a
+        no-op.
+
+        :param key: A single named key in the neutral vocabulary, e.g. ``"BSpace"``.
+        :param count: How many times to press it; ``<= 0`` sends nothing.
+        """
+        if count <= 0:
+            return
+        self.send_keys_sync([key] * count)
+
     def native_popup_launch(
         self,
         *,
@@ -1347,6 +1387,42 @@ class TerminalBackend(ABC):
             policy_name,
             python_executable,
         )
+
+
+@dataclass(frozen=True)
+class TmuxDeliveryStyle:
+    """Per-bridge tmux delivery argv dialect for :class:`TmuxBackend`.
+
+    The native bridges migrated in #9 (cursor, goose, kimi) each drove tmux with
+    their OWN paste-buffer name, ``capture-pane`` flag order, and per-command
+    timeout, and their per-harness argv tests pin those exact bytes. Consolidating
+    them onto the shared :class:`TerminalDelivery` must therefore PRESERVE each
+    bridge's stream, not normalize it onto claude's. This carries the three knobs
+    that differ between bridges; every default reproduces claude's audited #8
+    command stream byte-for-byte, so a :class:`TmuxBackend` built WITHOUT a style
+    — every #8 caller, and every :class:`TerminalInstance` — is byte-unchanged.
+
+    :param paste_buffer: Named tmux buffer the bracketed paste loads into
+        (``load-buffer -b`` / ``paste-buffer -b``). Claude/default:
+        ``"omnigent-paste"``; cursor/goose/kimi pass their own.
+    :param capture_flag_before_target: ``capture-pane`` flag order for the
+        delivery snapshot. ``False`` (default) → ``capture-pane -t <target> -p``
+        (claude's order, the #8 surface); ``True`` → ``capture-pane -p -t
+        <target>`` (cursor/goose/kimi's order).
+    :param command_timeout_s: Per-command subprocess timeout for every delivery
+        client command (send/paste/kill/snapshot/liveness). Default matches
+        claude's :data:`_DELIVERY_SEND_TIMEOUT_S`; cursor/goose pass ``10.0``,
+        kimi passes the default.
+    """
+
+    paste_buffer: str = _TMUX_PASTE_BUFFER
+    capture_flag_before_target: bool = False
+    command_timeout_s: float = _DELIVERY_SEND_TIMEOUT_S
+
+
+# The claude-shaped default: byte-identical to the #8 surface, used by every
+# construction that does not pass its own style.
+_DEFAULT_TMUX_DELIVERY_STYLE = TmuxDeliveryStyle()
 
 
 class TmuxBackend(TerminalBackend):
@@ -1401,6 +1477,7 @@ class TmuxBackend(TerminalBackend):
         socket_path: str | Path,
         target: str = "main",
         config_path: str = _TMUX_CONFIG_PATH,
+        delivery_style: TmuxDeliveryStyle | None = None,
     ) -> None:
         """
         :param socket_path: Private tmux socket path for this instance's
@@ -1412,10 +1489,17 @@ class TmuxBackend(TerminalBackend):
         :param target: Session/pane target name, e.g. ``"main"``.
         :param config_path: tmux config file to load, ``os.devnull`` so a
             managed session never inherits the user's ``~/.tmux.conf``.
+        :param delivery_style: Per-bridge tmux delivery argv dialect
+            (:class:`TmuxDeliveryStyle` — paste-buffer name, capture flag order,
+            per-command timeout). ``None`` selects the claude-shaped default, so a
+            backend built without one drives the byte-identical #8 command stream;
+            a migrated native bridge passes its own via
+            :func:`build_prompt_delivery`.
         """
         self._socket_path = socket_path
         self._target = target
         self._config_path = config_path
+        self._delivery_style = delivery_style or _DEFAULT_TMUX_DELIVERY_STYLE
 
     def _base_cmd(self) -> list[str]:
         """Build the tmux argv prefix for this instance's private server."""
@@ -1692,18 +1776,17 @@ class TmuxBackend(TerminalBackend):
         "no server running" once the pane is gone), so the delivery caller can
         surface a transport failure rather than a silent success.
         """
+        timeout_s = self._delivery_style.command_timeout_s
         try:
             proc = subprocess.run(
                 self._delivery_cmd(*args),
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=_DELIVERY_SEND_TIMEOUT_S,
+                timeout=timeout_s,
             )
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                f"tmux command timed out after {_DELIVERY_SEND_TIMEOUT_S}s"
-            ) from exc
+            raise RuntimeError(f"tmux command timed out after {timeout_s}s") from exc
         if proc.returncode != 0:
             detail = proc.stderr.strip() or proc.stdout.strip() or "<no output>"
             raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
@@ -1740,19 +1823,20 @@ class TmuxBackend(TerminalBackend):
         (anthropics/claude-code#52126); ``-d`` drops the buffer after pasting so
         no stale copies accumulate server-side.
         """
+        paste_buffer = self._delivery_style.paste_buffer
         with tempfile.NamedTemporaryFile(
             prefix="omnigent_paste_", suffix=".bin", delete=False
         ) as paste_file:
             paste_file.write(_tmux_paste_payload_bytes(text))
             paste_path = paste_file.name
         try:
-            self._delivery_run_sync("load-buffer", "-b", _TMUX_PASTE_BUFFER, paste_path)
+            self._delivery_run_sync("load-buffer", "-b", paste_buffer, paste_path)
             self._delivery_run_sync(
                 "paste-buffer",
                 "-p",  # bracketed-paste markers — the TUI keeps newlines as data
                 "-d",  # drop the buffer after pasting (no stale copies server-side)
                 "-b",
-                _TMUX_PASTE_BUFFER,
+                paste_buffer,
                 "-t",
                 self._target,
             )
@@ -1771,21 +1855,62 @@ class TmuxBackend(TerminalBackend):
         """
         self._delivery_run_sync("kill-session", "-t", self._target)
 
+    def delivery_liveness_sync(self) -> bool:
+        """Report endpoint existence via ``has-session -t <target>`` (rc==0).
+
+        Byte-identical to the migrated bridges' private ``_session_alive``: one
+        ``tmux -S <sock> has-session -t <target>`` client command (no ``-f``, same
+        as the other delivery ops), ``True`` on exit 0, and NEVER raises — a
+        timeout or spawn error reads as not-alive (``False``), the fast-fail the
+        bridge keyed off before injecting into a possibly-dead pane.
+        """
+        try:
+            proc = subprocess.run(
+                self._delivery_cmd("has-session", "-t", self._target),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self._delivery_style.command_timeout_s,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return False
+        return proc.returncode == 0
+
+    def send_keys_repeated_sync(self, key: str, count: int) -> None:
+        """Press *key* *count* times via one ``send-keys -N <count>`` call.
+
+        Byte-identical to cursor's composer-clear burst
+        (``send-keys -t <target> -N <count> <key>``): tmux's native repeat sends
+        the key *count* times in a single client command, which the default
+        (N separate presses) would not reproduce. A non-positive *count* is a
+        no-op, so an empty burst emits no command.
+        """
+        if count <= 0:
+            return
+        self._delivery_run_sync("send-keys", "-t", self._target, "-N", str(count), key)
+
     def delivery_snapshot_sync(self) -> str:
         """Snapshot the pane via ``capture-pane -p`` for the delivery dance.
 
         Byte-identical to the bridges' private ``_capture_pane``: never raises —
         a transient capture failure returns ``""`` (the "not ready yet" signal
         the readiness/verify polls key off) rather than the "host went away"
-        exception :meth:`capture_sync` raises.
+        exception :meth:`capture_sync` raises. The ``-p`` / ``-t`` flag order
+        follows the bound bridge's dialect (:attr:`TmuxDeliveryStyle.
+        capture_flag_before_target`) so each migrated bridge's pinned capture argv
+        is preserved; the default keeps claude's ``-t <target> -p`` order.
         """
+        if self._delivery_style.capture_flag_before_target:
+            capture_args = ("capture-pane", "-p", "-t", self._target)
+        else:
+            capture_args = ("capture-pane", "-t", self._target, "-p")
         try:
             proc = subprocess.run(
-                self._delivery_cmd("capture-pane", "-t", self._target, "-p"),
+                self._delivery_cmd(*capture_args),
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=_DELIVERY_SEND_TIMEOUT_S,
+                timeout=self._delivery_style.command_timeout_s,
             )
         except (subprocess.SubprocessError, OSError):
             return ""
@@ -3147,7 +3272,11 @@ def select_terminal_backend_class(*, spec_backend: str | None = None) -> type[Te
 
 
 def _construct_terminal_backend(
-    name: str, *, socket_path: str | Path, target: str
+    name: str,
+    *,
+    socket_path: str | Path,
+    target: str,
+    tmux_delivery_style: TmuxDeliveryStyle | None = None,
 ) -> TerminalBackend:
     """Construct the registered backend *name* for a terminal instance.
 
@@ -3164,6 +3293,10 @@ def _construct_terminal_backend(
     :param name: A registered backend name, e.g. ``"tmux"``.
     :param socket_path: Private multiplexer socket path for this instance.
     :param target: Session/pane target name, e.g. ``"main"``.
+    :param tmux_delivery_style: Per-bridge tmux delivery argv dialect, forwarded
+        to :class:`TmuxBackend` only (inert for other backends, whose delivery
+        stream is not tmux argv). ``None`` selects the claude-shaped default, so a
+        :class:`TerminalInstance` — which never passes one — is byte-unchanged.
     :returns: A fresh backend instance bound to this terminal.
     :raises RuntimeError: When *name* is not registered.
     :raises NotImplementedError: When *name* is registered but provides no
@@ -3174,7 +3307,9 @@ def _construct_terminal_backend(
         known = ", ".join(sorted(_TERMINAL_BACKENDS)) or "(none registered)"
         raise RuntimeError(f"Unknown terminal backend {name!r}. Known backends: {known}.")
     if backend_cls is TmuxBackend:
-        return TmuxBackend(socket_path=socket_path, target=target)
+        return TmuxBackend(
+            socket_path=socket_path, target=target, delivery_style=tmux_delivery_style
+        )
     # Non-tmux hooks take a ``Path``; normalize here (tmux keeps the value raw
     # so a bridge-advertised socket string reaches an identical ``-S`` argv).
     backend = backend_cls.construct_for_instance(socket_path=Path(socket_path), target=target)
@@ -3224,10 +3359,31 @@ class TerminalDelivery:
         """
         return self._backend.delivery_snapshot_sync()
 
+    def is_alive(self) -> bool:
+        """Return whether this session's host endpoint still exists.
+
+        The delivery fast-fail: a bridge probes this before injecting so a web
+        message into an exited TUI raises a clear "restart" error rather than
+        being typed into a dead pane (or polling a dead pane for the full
+        readiness timeout). Never raises — an unrunnable probe reads as not-alive.
+        """
+        return self._backend.delivery_liveness_sync()
+
     def send_keys(self, keys: Sequence[str]) -> None:
         """Press *keys* in order (Enter/Escape/Ctrl-C/… — the interrupt and
         submit primitive)."""
         self._backend.send_keys_sync(list(keys))
+
+    def send_keys_repeated(self, key: str, count: int) -> None:
+        """Press *key* *count* times (the composer-clear backspace burst).
+
+        The primitive cursor's ``_clear_composer`` flood is built on: where a
+        composer ignores readline kill keys and only ``Backspace`` deletes, a
+        burst of *count* presses clears a line in one shot. The tmux backend emits
+        a single native ``send-keys -N`` repeat; other backends fall back to
+        *count* single presses.
+        """
+        self._backend.send_keys_repeated_sync(key, count)
 
     def type_literal(self, text: str) -> None:
         """Type *text* literally into the composer without submitting (e.g. a
@@ -3336,12 +3492,55 @@ class TerminalDelivery:
                 last_enter = time.monotonic()
         raise RuntimeError(error_message)
 
+    def submit_once(
+        self,
+        *,
+        draft_present: Callable[[str], bool] | None,
+        poll_interval_s: float,
+        commit_timeout_s: float,
+        settle_s: float,
+    ) -> None:
+        """Submit a pasted draft with a single Enter and NO verify/retry.
+
+        The submit half of the cursor/goose/kimi delivery dance, reproduced from
+        their private helpers so the behavior is byte-for-byte unchanged — and
+        deliberately distinct from :meth:`submit_and_verify`, which re-sends Enter
+        until the draft leaves the box. These TUIs submit on ONE Enter (goose
+        inserts a newline on Ctrl+J and submits on Enter, so a second Enter would
+        submit twice), so this never re-sends and never raises:
+
+        1. **Commit wait** — when *draft_present* is given, poll :meth:`snapshot`
+           up to *commit_timeout_s* until it sees the paste land in the composer,
+           so a submit key arriving mid-paste isn't folded into the draft as a
+           newline. When *draft_present* is ``None`` (no usable needle — e.g.
+           whitespace-only content), skip the wait and submit blind, matching the
+           bridges' ``if needle:`` guard.
+        2. **Settle** — a brief *settle_s* pause (always, even on the blind path).
+        3. **Submit** — exactly one ``Enter``. No verification, no retry.
+
+        :param draft_present: Predicate over a snapshot: has the paste landed in
+            the composer? ``None`` skips the commit wait (blind submit).
+        :param poll_interval_s: Seconds between commit-wait polls.
+        :param commit_timeout_s: Max seconds to wait for the draft to land before
+            falling through to the submit anyway.
+        :param settle_s: Pause after the commit wait, before the submit Enter.
+        """
+        if draft_present is not None:
+            deadline = time.monotonic() + commit_timeout_s
+            while time.monotonic() < deadline:
+                if draft_present(self.snapshot()):
+                    break
+                time.sleep(poll_interval_s)
+        time.sleep(settle_s)
+        self.send_keys(["Enter"])
+
 
 def build_prompt_delivery(
     *,
     socket_path: str | Path,
     target: str,
     backend_name: str | None = None,
+    tmux_delivery_style: TmuxDeliveryStyle | None = None,
 ) -> TerminalDelivery:
     """Build a :class:`TerminalDelivery` bound to an advertised terminal endpoint.
 
@@ -3359,12 +3558,18 @@ def build_prompt_delivery(
     :param backend_name: Backend to construct. ``None`` selects tmux — the POSIX
         default that hosts every native harness today; a backend-aware
         advertisement can pass a name once non-tmux delivery is enabled.
+    :param tmux_delivery_style: Per-bridge tmux delivery argv dialect
+        (:class:`TmuxDeliveryStyle`). ``None`` selects the claude-shaped default,
+        so the #8 command stream is byte-unchanged; a migrated native bridge
+        whose stream differs (cursor/goose/kimi — own paste buffer, capture flag
+        order, per-command timeout) passes its own. Inert for non-tmux backends.
     :returns: A fresh delivery surface bound to this endpoint.
     """
     backend = _construct_terminal_backend(
         backend_name or TmuxBackend.name,
         socket_path=socket_path,
         target=target,
+        tmux_delivery_style=tmux_delivery_style,
     )
     return TerminalDelivery(backend)
 

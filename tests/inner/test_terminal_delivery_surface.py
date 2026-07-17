@@ -24,9 +24,11 @@ from typing import Any
 import pytest
 
 from omnigent.inner.terminal import (
+    Liveness,
     TerminalDelivery,
     TerminalLaunchRequest,
     TmuxBackend,
+    TmuxDeliveryStyle,
     _tmux_paste_payload_bytes,
     build_prompt_delivery,
 )
@@ -217,6 +219,109 @@ async def test_kill_marks_endpoint_gone() -> None:
     assert delivery.snapshot() == ""
 
 
+async def test_is_alive_reflects_endpoint_liveness() -> None:
+    """``is_alive`` is True while the endpoint exists and False once it is gone.
+
+    The delivery fast-fail gate: a bridge probes this before injecting so a web
+    message into an exited TUI raises a clear "restart" error instead of being
+    typed into a dead pane.
+    """
+    backend = await _launched_fake()
+    delivery = TerminalDelivery(backend)
+
+    assert delivery.is_alive() is True
+
+    backend.push_liveness([Liveness.ENDPOINT_GONE])
+    assert delivery.is_alive() is False
+
+
+async def test_is_alive_true_when_inner_exited_but_endpoint_kept() -> None:
+    """A kept-but-dead pane (INNER_EXITED) still counts as a present endpoint."""
+    backend = await _launched_fake()
+    delivery = TerminalDelivery(backend)
+
+    backend.push_liveness([Liveness.INNER_EXITED])
+    assert delivery.is_alive() is True
+
+
+async def test_send_keys_repeated_presses_key_n_times() -> None:
+    """``send_keys_repeated`` delivers one key the requested number of times."""
+    backend = await _launched_fake()
+    delivery = TerminalDelivery(backend)
+
+    delivery.send_keys_repeated("BSpace", 3)
+
+    # The fake's default repeat expresses the burst as three presses in one call.
+    assert delivery.snapshot().count(key_marker("BSpace")) == 3
+
+
+async def test_send_keys_repeated_zero_count_is_noop() -> None:
+    """A non-positive count sends nothing (an empty burst emits no key)."""
+    backend = await _launched_fake()
+    delivery = TerminalDelivery(backend)
+
+    delivery.send_keys_repeated("BSpace", 0)
+
+    assert backend.sent_keys == []
+    assert key_marker("BSpace") not in delivery.snapshot()
+
+
+async def test_submit_once_submits_exactly_one_enter_no_retry() -> None:
+    """``submit_once`` sends a single Enter and never retries, even if the draft stays.
+
+    Unlike :meth:`submit_and_verify`, this does not verify the draft left the box:
+    the cursor/goose/kimi TUIs submit on one Enter and a second would submit
+    twice, so a still-present draft must NOT trigger another Enter or an error.
+    """
+    backend = await _launched_fake()
+    delivery = TerminalDelivery(backend)
+
+    delivery.submit_once(
+        draft_present=lambda _pane: True,  # never clears — would make verify retry/raise
+        poll_interval_s=0.0,
+        commit_timeout_s=0.05,
+        settle_s=0.0,
+    )
+
+    assert backend.sent_keys.count(["Enter"]) == 1
+
+
+async def test_submit_once_waits_for_commit_then_submits() -> None:
+    """``submit_once`` waits for the draft to land, then submits one Enter.
+
+    A submit key that arrives mid-paste is folded into the draft as a newline, so
+    the commit wait polls until the paste is visible before the single Enter.
+    """
+    backend = await _launched_fake()
+    delivery = TerminalDelivery(backend)
+    # The draft is invisible for the first two snapshots, then commits.
+    backend.push_snapshots(["❯ ", "❯ ", "❯ do the thing"])
+
+    delivery.submit_once(
+        draft_present=lambda pane: "do the thing" in pane,
+        poll_interval_s=0.0,
+        commit_timeout_s=0.5,
+        settle_s=0.0,
+    )
+
+    assert backend.sent_keys.count(["Enter"]) == 1
+
+
+async def test_submit_once_submits_blind_when_no_predicate() -> None:
+    """With no predicate (unidentifiable draft), submit once without polling."""
+    backend = await _launched_fake()
+    delivery = TerminalDelivery(backend)
+
+    delivery.submit_once(
+        draft_present=None,
+        poll_interval_s=0.0,
+        commit_timeout_s=0.5,
+        settle_s=0.0,
+    )
+
+    assert backend.sent_keys == [["Enter"]]
+
+
 async def test_launch_native_popup_is_noop_without_capability() -> None:
     """The popup no-ops on a backend without the native-popup capability.
 
@@ -319,6 +424,146 @@ def test_tmux_kill_pins_kill_session(
     delivery, recorder = tmux_delivery
     delivery.kill()
     assert recorder.calls == [["tmux", "-S", _SOCKET, "kill-session", "-t", _TARGET]]
+
+
+def test_tmux_is_alive_pins_has_session_argv(
+    tmux_delivery: tuple[TerminalDelivery, _TmuxRecorder],
+) -> None:
+    """``is_alive`` emits ``has-session -t <target>`` and reads True on exit 0."""
+    delivery, recorder = tmux_delivery
+    assert delivery.is_alive() is True
+    assert recorder.calls == [["tmux", "-S", _SOCKET, "has-session", "-t", _TARGET]]
+
+
+def test_tmux_is_alive_false_on_nonzero_never_raises(
+    tmux_delivery: tuple[TerminalDelivery, _TmuxRecorder],
+) -> None:
+    """A non-zero ``has-session`` (endpoint gone) reads as False, never raises."""
+    delivery, recorder = tmux_delivery
+    recorder.fail_with("no server running")
+    assert delivery.is_alive() is False
+
+
+def test_tmux_send_keys_repeated_pins_n_argv(
+    tmux_delivery: tuple[TerminalDelivery, _TmuxRecorder],
+) -> None:
+    """``send_keys_repeated`` emits one ``send-keys -t <target> -N <count> <key>``.
+
+    Byte-identical to cursor's composer-clear burst: a single native repeat, not
+    N separate presses.
+    """
+    delivery, recorder = tmux_delivery
+    delivery.send_keys_repeated("BSpace", 200)
+    assert recorder.calls == [
+        ["tmux", "-S", _SOCKET, "send-keys", "-t", _TARGET, "-N", "200", "BSpace"],
+    ]
+
+
+def test_tmux_send_keys_repeated_zero_emits_no_command(
+    tmux_delivery: tuple[TerminalDelivery, _TmuxRecorder],
+) -> None:
+    """A non-positive repeat count emits no tmux command at all."""
+    delivery, recorder = tmux_delivery
+    delivery.send_keys_repeated("BSpace", 0)
+    assert recorder.calls == []
+
+
+def test_tmux_delivery_style_paste_buffer_is_used(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A custom ``TmuxDeliveryStyle`` paste buffer name reaches the paste argv.
+
+    Proves a migrated bridge keeps its own per-harness buffer name
+    (``omnigent-cursor-paste`` etc.) rather than being normalized onto claude's.
+    """
+    recorder = _TmuxRecorder()
+    monkeypatch.setattr("subprocess.run", recorder)
+    style = TmuxDeliveryStyle(paste_buffer="omnigent-cursor-paste")
+    delivery = TerminalDelivery(
+        TmuxBackend(socket_path=_SOCKET, target=_TARGET, delivery_style=style)
+    )
+
+    delivery.paste_without_submit("hi")
+
+    assert recorder.calls[0][:6] == [
+        "tmux",
+        "-S",
+        _SOCKET,
+        "load-buffer",
+        "-b",
+        "omnigent-cursor-paste",
+    ]
+    assert recorder.calls[1] == [
+        "tmux",
+        "-S",
+        _SOCKET,
+        "paste-buffer",
+        "-p",
+        "-d",
+        "-b",
+        "omnigent-cursor-paste",
+        "-t",
+        _TARGET,
+    ]
+
+
+def test_tmux_delivery_style_capture_flag_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``capture_flag_before_target`` swaps the snapshot argv to ``-p -t <target>``.
+
+    Preserves cursor/goose/kimi's ``capture-pane -p -t <target>`` order (claude's
+    default is ``-t <target> -p``).
+    """
+    seen: list[list[str]] = []
+
+    def recording_run(cmd: list[str], **kwargs: Any) -> SimpleNamespace:
+        del kwargs
+        seen.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="pane", stderr="")
+
+    monkeypatch.setattr("subprocess.run", recording_run)
+    style = TmuxDeliveryStyle(capture_flag_before_target=True)
+    delivery = TerminalDelivery(
+        TmuxBackend(socket_path=_SOCKET, target=_TARGET, delivery_style=style)
+    )
+
+    assert delivery.snapshot() == "pane"
+    assert seen == [["tmux", "-S", _SOCKET, "capture-pane", "-p", "-t", _TARGET]]
+
+
+def test_tmux_delivery_style_command_timeout_threads_to_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The style's ``command_timeout_s`` is the per-command subprocess timeout.
+
+    cursor/goose deliver with a 10.0s timeout vs claude's 5.0s; the value must
+    reach ``subprocess.run(timeout=...)`` on every delivery command.
+    """
+    timeouts: list[float] = []
+
+    def recording_run(cmd: list[str], **kwargs: Any) -> SimpleNamespace:
+        timeouts.append(kwargs.get("timeout"))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", recording_run)
+    style = TmuxDeliveryStyle(command_timeout_s=10.0)
+    delivery = TerminalDelivery(
+        TmuxBackend(socket_path=_SOCKET, target=_TARGET, delivery_style=style)
+    )
+
+    delivery.send_keys(["Enter"])
+    assert timeouts == [10.0]
+
+
+def test_build_prompt_delivery_threads_tmux_style() -> None:
+    """The factory forwards ``tmux_delivery_style`` to the tmux backend."""
+    style = TmuxDeliveryStyle(
+        paste_buffer="omnigent-goose-paste",
+        capture_flag_before_target=True,
+        command_timeout_s=10.0,
+    )
+    delivery = build_prompt_delivery(
+        socket_path=_SOCKET, target=_TARGET, tmux_delivery_style=style
+    )
+    assert isinstance(delivery.backend, TmuxBackend)
+    assert delivery.backend._delivery_style is style
 
 
 @pytest.mark.parametrize(

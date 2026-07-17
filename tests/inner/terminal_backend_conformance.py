@@ -306,6 +306,42 @@ class BackendConformanceSuite:
         backend.kill_session_sync()
         assert await backend.liveness() != Liveness.ALIVE
 
+    async def test_delivery_liveness_sync_reports_endpoint_presence(
+        self, adapter: ConformanceAdapter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``delivery_liveness_sync`` is ``True`` while alive, ``False`` once gone.
+
+        The delivery fast-fail probe: a bridge checks it before injecting so a web
+        message into an exited TUI raises a clear "restart" error rather than
+        being typed into a dead pane. Boolean regardless of how a backend grades
+        its full :class:`Liveness` verdict.
+        """
+        backend = adapter.make_backend(tmp_path, monkeypatch)
+        await backend.launch(adapter.launch_request(adapter.alive_command()))
+        assert backend.delivery_liveness_sync() is True
+        await backend.close()
+        assert backend.delivery_liveness_sync() is False
+
+    async def test_send_keys_repeated_sync_presses_key_n_times(
+        self, adapter: ConformanceAdapter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``send_keys_repeated_sync`` presses one key the requested number of times.
+
+        The composer-clear burst primitive (cursor's Backspace flood): tmux emits
+        a single native ``send-keys -N`` repeat, other backends fall back to N
+        single presses, but the observable outcome is identical — the key's marker
+        appears *count* times.
+        """
+        backend = adapter.make_backend(tmp_path, monkeypatch)
+        await backend.launch(adapter.launch_request(adapter.alive_command()))
+        try:
+            key = adapter.sample_keys[0]
+            backend.send_keys_repeated_sync(key, 3)
+            snapshot = backend.delivery_snapshot_sync()
+            assert snapshot.count(adapter.key_marker(key)) == 3
+        finally:
+            await backend.close()
+
     async def test_inner_exit_without_keep_alive_is_endpoint_gone(
         self, adapter: ConformanceAdapter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

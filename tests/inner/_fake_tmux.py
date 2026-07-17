@@ -113,8 +113,9 @@ def _split_semicolons(tokens: list[str]) -> list[list[str]]:
 def _positionals(cmd: list[str]) -> list[str]:
     """Return the positional args of a ``send-keys`` command.
 
-    Drops the command word, the ``-l`` literal flag, and the ``-t <target>``
-    pair, leaving the literal text (for ``-l``) or the key names.
+    Drops the command word, the ``-l`` literal flag, the ``-t <target>`` pair,
+    and the ``-N <count>`` repeat pair, leaving the literal text (for ``-l``) or
+    the key names.
     """
     positionals: list[str] = []
     i = 1  # skip the command word itself
@@ -122,12 +123,29 @@ def _positionals(cmd: list[str]) -> list[str]:
         token = cmd[i]
         if token == "-l":
             i += 1
-        elif token == "-t":
-            i += 2  # skip the target value too
+        elif token in ("-t", "-N"):
+            i += 2  # skip the target / repeat-count value too
         else:
             positionals.append(token)
             i += 1
     return positionals
+
+
+def _repeat_count(cmd: list[str]) -> int:
+    """Return the ``send-keys -N <count>`` repeat count, or ``1`` when absent.
+
+    tmux's ``-N`` repeats the whole key sequence *count* times (cursor's
+    composer-clear flood sends ``send-keys -N 200 BSpace``). A malformed or
+    missing count reads as a single press.
+    """
+    if "-N" in cmd:
+        idx = cmd.index("-N")
+        if idx + 1 < len(cmd):
+            try:
+                return int(cmd[idx + 1])
+            except ValueError:
+                return 1
+    return 1
 
 
 def _handle_new_session(cmd: list[str], socket_path: str, *, remain_on_exit: bool) -> int:
@@ -190,13 +208,24 @@ def _handle_send_keys(cmd: list[str], socket_path: str) -> int:
     if "-l" in cmd:
         screen += "".join(positionals)
     else:
-        for key in positionals:
-            screen += key_marker(key)
-            if key == "Enter":
-                screen += SUBMIT_SENTINEL
+        # ``-N <count>`` repeats the key sequence (cursor's Backspace flood).
+        for _ in range(_repeat_count(cmd)):
+            for key in positionals:
+                screen += key_marker(key)
+                if key == "Enter":
+                    screen += SUBMIT_SENTINEL
     state["screen"] = screen
     _save(socket_path, state)
     return 0
+
+
+def _handle_has_session(socket_path: str) -> int:
+    """Exit ``0`` when this server/session exists, ``1`` when it is gone.
+
+    Mirrors real ``tmux has-session``: the delivery liveness probe
+    (:meth:`TmuxBackend.delivery_liveness_sync`) keys off the exit code.
+    """
+    return 0 if _load(socket_path) is not None else 1
 
 
 def _handle_kill_server(socket_path: str) -> int:
@@ -309,6 +338,8 @@ def main(argv: list[str]) -> int:
             rc = _handle_kill_server(socket_path)
         elif name == "kill-session":
             rc = _handle_kill_session(socket_path)
+        elif name == "has-session":
+            rc = _handle_has_session(socket_path)
         # set-window-option / set-hook / unbind-key / detach-client and any
         # other option command are inert no-ops for the fake.
         if rc != 0:

@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+from pathlib import PureWindowsPath
 from typing import Any
 
 from omnigent.host.frames import HostStatFrame, encode_host_frame
@@ -178,6 +179,131 @@ def _is_subpath_of(canonical_workspace: str, canonical_boundary: str) -> bool:
     return canonical_workspace.startswith(boundary_with_sep)
 
 
+def _is_subpath_of_windows(canonical_workspace: str, canonical_boundary: str) -> bool:
+    """Windows-path sibling of :func:`_is_subpath_of` (drive-letter, backslash).
+
+    Uses :class:`~pathlib.PureWindowsPath` so the boundary/workspace comparison
+    is done with Windows semantics — case-insensitive, ``\\`` (or ``/``)
+    separators, drive letters — instead of the POSIX ``/`` prefix arithmetic in
+    :func:`_is_subpath_of`. Both inputs are realpaths returned by ``host.stat``
+    on the (Windows) host, so symlinks/``..`` are already resolved.
+
+    :param canonical_workspace: Host realpath for the workspace, e.g.
+        ``"D:\\\\Repos\\\\omnigent\\\\src"``.
+    :param canonical_boundary: Host realpath for the agent's boundary.
+    :returns: ``True`` when the workspace equals or nests under the boundary.
+    """
+    try:
+        PureWindowsPath(canonical_workspace).relative_to(PureWindowsPath(canonical_boundary))
+    except ValueError:
+        return False
+    return True
+
+
+async def _validate_windows_host_workspace(
+    *,
+    host_registry: HostRegistry,
+    host_id: str,
+    workspace: str,
+    spec_cwd: str | None,
+    host_name_for_errors: str | None = None,
+) -> str:
+    """Windows-host equivalent of :func:`validate_workspace`.
+
+    Delegated to by :func:`validate_workspace` when the workspace is not
+    POSIX-absolute but IS a Windows-absolute path (``D:\\...``), so a native
+    Windows host (herdr-hosted codex, #13) can bind its real workspace instead of
+    being rejected by the POSIX ``startswith("/")`` gate. Mirrors the same steps
+    faithfully — host online, host.stat the workspace (existence + directory +
+    canonical realpath), boundary computation for a non-relative agent
+    ``os_env.cwd``, and the ``./subdir`` existence check — differing only where
+    path semantics do: :func:`_is_subpath_of_windows` and a Windows-separator
+    subdir join. The host is still the source of truth for ``~`` expansion and
+    canonicalization (its ``os.path.realpath`` returns Windows-native paths).
+
+    :param host_registry: Server-side host registry.
+    :param host_id: Target host's stable id.
+    :param workspace: Windows-absolute path on the host, e.g.
+        ``"D:\\Repos\\omnigent"``.
+    :param spec_cwd: The bound agent's ``os_env.cwd`` (drives boundary).
+    :param host_name_for_errors: Optional human-readable host name for errors.
+    :returns: The canonical workspace path (host realpath) to store.
+    :raises WorkspaceValidationError: On any validation failure.
+    """
+    display_host = host_name_for_errors or host_id
+
+    # Step 0: host must be online.
+    host_conn = host_registry.get(host_id)
+    if host_conn is None:
+        raise WorkspaceValidationError(
+            f"host '{display_host}' is offline; reconnect the host and try again"
+        )
+
+    # Step 4: stat the workspace (host canonicalizes to a Windows realpath).
+    workspace_stat = await _ask_host_stat(
+        host_registry=host_registry,
+        host_conn=host_conn,
+        path=workspace,
+    )
+    if not workspace_stat.get("exists"):
+        raise WorkspaceValidationError(
+            f"workspace path does not exist on host '{display_host}': {workspace}"
+        )
+    if workspace_stat.get("type") != "directory":
+        raise WorkspaceValidationError(
+            f"workspace path is not a directory on host '{display_host}': {workspace}"
+        )
+    canonical_workspace = workspace_stat.get("canonical_path")
+    if not isinstance(canonical_workspace, str):
+        raise WorkspaceValidationError("host returned an empty canonical_path for the workspace")
+
+    # Steps 2, 3, 5: boundary computation (skipped for a relative agent cwd).
+    if not _is_relative_cwd(spec_cwd):
+        boundary_stat = await _ask_host_stat(
+            host_registry=host_registry,
+            host_conn=host_conn,
+            path=spec_cwd or "",
+        )
+        if not boundary_stat.get("exists"):
+            raise WorkspaceValidationError(
+                f"agent requires path '{spec_cwd}' which does not exist on host '{display_host}'"
+            )
+        if boundary_stat.get("type") != "directory":
+            raise WorkspaceValidationError(
+                f"agent's required path '{spec_cwd}' is not a directory on host '{display_host}'"
+            )
+        canonical_boundary = boundary_stat.get("canonical_path")
+        if not isinstance(canonical_boundary, str):
+            raise WorkspaceValidationError(
+                "host returned an empty canonical_path for the agent's boundary"
+            )
+        if not _is_subpath_of_windows(canonical_workspace, canonical_boundary):
+            raise WorkspaceValidationError(
+                f"workspace '{workspace}' is outside the agent's required path '{spec_cwd}'"
+            )
+
+    # Step 6: ``cwd: ./subdir`` requires the named subdir under the workspace,
+    # joined with Windows separators against the canonical (host) path.
+    if (
+        spec_cwd is not None
+        and spec_cwd.startswith("./")
+        and spec_cwd not in _RELATIVE_CWD_PLACEHOLDERS
+    ):
+        subdir = spec_cwd[2:]
+        subdir_path = str(PureWindowsPath(canonical_workspace) / subdir)
+        subdir_stat = await _ask_host_stat(
+            host_registry=host_registry,
+            host_conn=host_conn,
+            path=subdir_path,
+        )
+        if not subdir_stat.get("exists"):
+            raise WorkspaceValidationError(
+                f"agent expects subdirectory '{subdir}' which is not present at {workspace}"
+            )
+
+    return canonical_workspace
+
+
 async def validate_workspace(
     *,
     host_registry: HostRegistry,
@@ -214,6 +340,20 @@ async def validate_workspace(
         The exception message is suitable for surfacing to the
         API caller verbatim.
     """
+    # Windows-host workspaces (native codex hosting, #13) are not POSIX-absolute
+    # but ARE Windows-absolute (``D:\...``); delegate them to the Windows-aware
+    # validator BEFORE the POSIX gate below so a native Windows host is not
+    # rejected. Everything below stays byte-identical: a POSIX-absolute path
+    # falls through to the existing logic, and a truly relative path still hits
+    # the ``startswith("/")`` raise.
+    if not workspace.startswith("/") and PureWindowsPath(workspace).is_absolute():
+        return await _validate_windows_host_workspace(
+            host_registry=host_registry,
+            host_id=host_id,
+            workspace=workspace,
+            spec_cwd=spec_cwd,
+            host_name_for_errors=host_name_for_errors,
+        )
     if not workspace.startswith("/"):
         # Belt-and-suspenders. The Pydantic schema layer also
         # rejects this; pin it here so direct callers (tests,

@@ -606,3 +606,138 @@ async def test_tilde_boundary_passed_through_to_host(
         spec_cwd="~/universe",
     )
     assert canonical == "/Users/corey/universe/src/foo"
+
+
+# ── Windows-host workspaces (native codex hosting, #13) ──────────
+
+
+async def test_windows_absolute_workspace_is_accepted(
+    host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
+) -> None:
+    """A Windows-absolute workspace (``D:\...``) validates via the host stat.
+
+    The POSIX ``startswith("/")`` gate would reject ``D:\Repos\omnigent``; the
+    Windows-aware delegate stats it on the (Windows) host and returns the
+    canonical realpath. Relative agent cwd (``.``) imposes no boundary.
+    """
+    registry, _, _ = host_setup
+    _set_stat(registry, r"D:\Repos\omnigent", canonical=r"D:\Repos\omnigent")
+    result = await validate_workspace(
+        host_registry=registry,
+        host_id=_HOST_ID,
+        workspace=r"D:\Repos\omnigent",
+        spec_cwd=".",
+    )
+    assert result == r"D:\Repos\omnigent"
+
+
+async def test_windows_workspace_missing_is_rejected(
+    host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
+) -> None:
+    """A non-existent Windows workspace is rejected with the same clear error."""
+    registry, _, _ = host_setup
+    with pytest.raises(WorkspaceValidationError) as exc_info:
+        await validate_workspace(
+            host_registry=registry,
+            host_id=_HOST_ID,
+            workspace=r"D:\Repos\missing",
+            spec_cwd=".",
+        )
+    assert "does not exist" in exc_info.value.message
+
+
+async def test_windows_workspace_inside_boundary_is_accepted(
+    host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
+) -> None:
+    """A Windows workspace nested under an absolute agent boundary is accepted."""
+    registry, _, _ = host_setup
+    _set_stat(registry, r"C:\Users\dev", canonical=r"C:\Users\dev")
+    _set_stat(registry, r"C:\Users\dev\proj", canonical=r"C:\Users\dev\proj")
+    result = await validate_workspace(
+        host_registry=registry,
+        host_id=_HOST_ID,
+        workspace=r"C:\Users\dev\proj",
+        spec_cwd=r"C:\Users\dev",
+    )
+    assert result == r"C:\Users\dev\proj"
+
+
+async def test_windows_workspace_outside_boundary_is_rejected(
+    host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
+) -> None:
+    """A Windows workspace outside the agent's boundary is rejected."""
+    registry, _, _ = host_setup
+    _set_stat(registry, r"D:\other", canonical=r"D:\other")
+    _set_stat(registry, r"C:\Users\dev", canonical=r"C:\Users\dev")
+    with pytest.raises(WorkspaceValidationError) as exc_info:
+        await validate_workspace(
+            host_registry=registry,
+            host_id=_HOST_ID,
+            workspace=r"D:\other",
+            spec_cwd=r"C:\Users\dev",
+        )
+    assert "outside the agent's required path" in exc_info.value.message
+
+
+async def test_windows_subdir_cwd_requires_present_subdir(
+    host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
+) -> None:
+    """``cwd: ./sub`` requires ``<workspace>\sub`` (Windows-separator join)."""
+    registry, _, _ = host_setup
+    _set_stat(registry, r"D:\Repos\omnigent", canonical=r"D:\Repos\omnigent")
+    # The subdir is joined with Windows separators against the canonical path.
+    _set_stat(registry, r"D:\Repos\omnigent\sub", canonical=r"D:\Repos\omnigent\sub")
+    result = await validate_workspace(
+        host_registry=registry,
+        host_id=_HOST_ID,
+        workspace=r"D:\Repos\omnigent",
+        spec_cwd="./sub",
+    )
+    assert result == r"D:\Repos\omnigent"
+
+
+async def test_windows_subdir_cwd_missing_subdir_is_rejected(
+    host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
+) -> None:
+    """A missing ``./sub`` under a Windows workspace is rejected."""
+    registry, _, _ = host_setup
+    _set_stat(registry, r"D:\Repos\omnigent", canonical=r"D:\Repos\omnigent")
+    # No reply for the subdir → fixture default exists:false.
+    with pytest.raises(WorkspaceValidationError) as exc_info:
+        await validate_workspace(
+            host_registry=registry,
+            host_id=_HOST_ID,
+            workspace=r"D:\Repos\omnigent",
+            spec_cwd="./sub",
+        )
+    assert "subdirectory 'sub'" in exc_info.value.message
+
+
+async def test_non_absolute_path_still_rejected_posix_behavior(
+    host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
+) -> None:
+    """A truly relative path (neither POSIX- nor Windows-absolute) still raises.
+
+    Pins that the POSIX gate is unchanged: only a Windows-*absolute* path takes
+    the new delegate; a bare relative token hits the original ``startswith("/")``
+    rejection byte-for-byte.
+    """
+    registry, _, _ = host_setup
+    with pytest.raises(WorkspaceValidationError) as exc_info:
+        await validate_workspace(
+            host_registry=registry,
+            host_id=_HOST_ID,
+            workspace="relative/path",
+            spec_cwd=".",
+        )
+    assert "absolute path starting with /" in exc_info.value.message
+
+
+def test_is_subpath_of_windows_unit() -> None:
+    """Windows subpath check: equal + nested True, sibling/other-drive False."""
+    from omnigent.server.routes._workspace_validation import _is_subpath_of_windows
+
+    assert _is_subpath_of_windows(r"C:\a\b", r"C:\a\b") is True
+    assert _is_subpath_of_windows(r"C:\a\b\c", r"C:\a\b") is True
+    assert _is_subpath_of_windows(r"C:\a\bb", r"C:\a\b") is False  # prefix collision
+    assert _is_subpath_of_windows(r"D:\a\b", r"C:\a") is False  # different drive

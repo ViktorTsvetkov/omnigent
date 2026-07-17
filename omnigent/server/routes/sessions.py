@@ -6267,7 +6267,13 @@ async def _validate_session_workspace(
             "workspace required when host_id is set",
             code=ErrorCode.INVALID_INPUT,
         )
-    if not workspace.startswith("/"):
+    # A Windows-host workspace (native codex hosting, #13) is not POSIX-absolute
+    # but IS Windows-absolute (``D:\...``); accept it too. validate_workspace
+    # below routes it through the Windows-aware validator. (Sanctioned
+    # single-condition edit: insertion cannot express an inline raise's guard.)
+    from pathlib import PureWindowsPath
+
+    if not workspace.startswith("/") and not PureWindowsPath(workspace).is_absolute():
         raise OmnigentError(
             "workspace must be an absolute path starting with /",
             code=ErrorCode.INVALID_INPUT,

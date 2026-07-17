@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from omnigent._platform import stable_user_id
+from omnigent.inner.terminal import TerminalDelivery, TmuxDeliveryStyle, build_prompt_delivery
 
 _logger = logging.getLogger(__name__)
 
@@ -55,6 +56,11 @@ _TMUX_SEND_TIMEOUT_S = 10.0
 _POLL_INTERVAL_S = 0.2
 _PASTE_SETTLE_S = 0.3
 _PASTE_BUFFER = "omnigent-hermes-paste"
+_HERMES_DELIVERY_STYLE = TmuxDeliveryStyle(
+    paste_buffer=_PASTE_BUFFER,
+    capture_flag_before_target=True,
+    command_timeout_s=_TMUX_SEND_TIMEOUT_S,
+)
 # How long to wait for the pasted text to become visible in the pane before
 # sending Enter — submitting before the TUI commits the paste folds the Enter
 # into the paste as a newline and the message sits unsent.
@@ -442,14 +448,17 @@ def inject_compress_command(bridge_dir: Path, *, timeout_s: float = 5.0) -> None
     :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    socket_path = info["socket_path"]
-    target = info["tmux_target"]
+    delivery = build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_HERMES_DELIVERY_STYLE,
+    )
     # Clear any draft the user is mid-typing.
-    _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
+    delivery.send_keys(["C-u"])
     # Paste ``/compress`` literally.
-    _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/compress")
+    delivery.type_literal("/compress")
     # Submit.
-    _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
+    delivery.send_keys(["Enter"])
 
 
 def read_hermes_home(bridge_dir: Path) -> Path | None:
@@ -518,23 +527,6 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
     raise RuntimeError(f"hermes-native tmux target was not advertised within {timeout_s:.0f}s")
 
 
-def _run_tmux(socket_path: str, *args: str) -> None:
-    """Invoke ``tmux -S <socket> <args...>`` and raise on failure."""
-    try:
-        proc = subprocess.run(
-            ["tmux", "-S", socket_path, *args],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"tmux command timed out after {_TMUX_SEND_TIMEOUT_S}s") from exc
-    if proc.returncode != 0:
-        detail = proc.stderr.strip() or proc.stdout.strip() or "<no output>"
-        raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
-
-
 def _capture_pane(socket_path: str, tmux_target: str) -> str:
     """Capture the visible pane contents; ``""`` on any failure (treat as not-ready)."""
     try:
@@ -599,7 +591,7 @@ def _submit_needle(content: str) -> str:
     return stripped[:24] if len(stripped) >= 4 else ""
 
 
-def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
+def _settle_pane(delivery: TerminalDelivery, *, timeout_s: float) -> None:
     """Best-effort wait until the Hermes input box is ready to receive a paste.
 
     Hermes emits no fixed idle marker, so readiness is detected by the pane
@@ -608,11 +600,11 @@ def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> Non
     the timeout (mid-turn steering may never fully settle) rather than raising.
     """
     deadline = time.monotonic() + timeout_s
-    previous = _capture_pane(socket_path, tmux_target)
+    previous = delivery.snapshot()
     stable = 0
     while time.monotonic() < deadline:
         time.sleep(_POLL_INTERVAL_S)
-        current = _capture_pane(socket_path, tmux_target)
+        current = delivery.snapshot()
         if current and current == previous:
             stable += 1
             if stable >= _SETTLE_STABLE_POLLS:
@@ -686,58 +678,26 @@ def _await_new_message(db_path: Path, baseline_id: int, timeout_s: float) -> boo
         time.sleep(_DELIVERY_POLL_INTERVAL_S)
 
 
-def _deliver_once(
-    socket_path: str,
-    tmux_target: str,
+def _deliver_once_via_delivery(
+    delivery: TerminalDelivery,
     content: str,
-    bridge_dir: Path,
     needle: str,
     *,
     settle_timeout_s: float,
 ) -> None:
-    """Settle, clear any draft, paste *content*, then submit with a single Enter.
-
-    Waits for the pane to settle, clears the input (C-a + C-k), delivers
-    *content* via ``load-buffer`` / ``paste-buffer -p`` (bracketed-paste markers
-    keep interior newlines as data), waits until *needle* is visibly committed
-    (so the trailing Enter isn't folded into the paste), then sends one Enter.
-    """
-    _settle_pane(socket_path, tmux_target, timeout_s=settle_timeout_s)
-    # Clear any leftover draft: Home (C-a) + kill-to-end (C-k).
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
-    with tempfile.NamedTemporaryFile(
-        dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
-    ) as paste_file:
-        # Trailing newline absorbs any trailing backslash so it can't escape Enter.
-        paste_file.write(_paste_payload_bytes(content + "\n"))
-        paste_path = paste_file.name
-    try:
-        _run_tmux(socket_path, "load-buffer", "-b", _PASTE_BUFFER, paste_path)
-        _run_tmux(
-            socket_path,
-            "paste-buffer",
-            "-p",  # bracketed-paste markers — the TUI keeps newlines as data
-            "-d",  # drop the buffer after pasting
-            "-b",
-            _PASTE_BUFFER,
-            "-t",
-            tmux_target,
-        )
-    finally:
-        with contextlib.suppress(OSError):
-            os.unlink(paste_path)
-    # Wait until the paste is visibly committed before Enter. Submitting mid-paste
-    # folds the Enter in as a newline (rapid stdin bursts coalesce), leaving the
-    # message unsent. Poll for the text, then submit; blind-submit if no needle.
+    """Settle, clear, paste, and submit through the shared terminal surface."""
+    _settle_pane(delivery, timeout_s=settle_timeout_s)
+    delivery.send_keys(["C-a"])
+    delivery.send_keys(["C-k"])
+    delivery.paste_without_submit(content + "\n")
     if needle:
         deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
         while time.monotonic() < deadline:
-            if needle in _capture_pane(socket_path, tmux_target):
+            if needle in delivery.snapshot():
                 break
             time.sleep(_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    delivery.send_keys(["Enter"])
 
 
 def inject_user_message(
@@ -771,9 +731,12 @@ def inject_user_message(
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
+    delivery = build_prompt_delivery(
+        socket_path=socket_path, target=tmux_target, tmux_delivery_style=_HERMES_DELIVERY_STYLE
+    )
     # Fast-fail if the TUI already exited: otherwise _settle_pane polls a dead
     # pane for the full timeout and the web message is silently lost.
-    if not _session_alive(socket_path, tmux_target):
+    if not delivery.is_alive():
         raise RuntimeError(
             "hermes terminal is no longer running (the TUI exited); restart the session"
         )
@@ -783,9 +746,7 @@ def inject_user_message(
     db_path = _state_db_path(bridge_dir)
     baseline_id = _max_message_id(db_path) if db_path is not None else None
 
-    _deliver_once(
-        socket_path, tmux_target, content, bridge_dir, needle, settle_timeout_s=timeout_s
-    )
+    _deliver_once_via_delivery(delivery, content, needle, settle_timeout_s=timeout_s)
 
     if db_path is None:
         # No readable store to confirm against — best-effort single delivery,
@@ -796,9 +757,7 @@ def inject_user_message(
     # The first delivery did not land (the TUI was still initializing). Re-deliver
     # once — the store confirmed no row was written, so there is no double-submit
     # risk — giving the pane a longer settle to let MCP startup finish.
-    _deliver_once(
-        socket_path, tmux_target, content, bridge_dir, needle, settle_timeout_s=_RETRY_SETTLE_S
-    )
+    _deliver_once_via_delivery(delivery, content, needle, settle_timeout_s=_RETRY_SETTLE_S)
     if _await_new_message(db_path, baseline_id or 0, _DELIVERY_CONFIRM_TIMEOUT_S):
         return
     raise RuntimeError(
@@ -818,7 +777,11 @@ def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT
     :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-c")
+    build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_HERMES_DELIVERY_STYLE,
+    ).send_keys(["C-c"])
 
 
 def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
@@ -830,7 +793,11 @@ def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) 
     :raises RuntimeError: If the tmux target is not advertised or kill-session fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])
+    build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_HERMES_DELIVERY_STYLE,
+    ).kill()
 
 
 def capture_hermes_pane(bridge_dir: Path) -> str | None:
@@ -847,10 +814,14 @@ def capture_hermes_pane(bridge_dir: Path) -> str | None:
     info = read_tmux_info(bridge_dir)
     if info is None:
         return None
-    socket_path, tmux_target = info["socket_path"], info["tmux_target"]
-    if not _session_alive(socket_path, tmux_target):
+    delivery = build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_HERMES_DELIVERY_STYLE,
+    )
+    if not delivery.is_alive():
         return None
-    return _capture_pane(socket_path, tmux_target)
+    return delivery.snapshot()
 
 
 def send_hermes_pane_keys(bridge_dir: Path, *keys: str) -> None:
@@ -868,4 +839,8 @@ def send_hermes_pane_keys(bridge_dir: Path, *keys: str) -> None:
     info = read_tmux_info(bridge_dir)
     if info is None:
         raise RuntimeError("hermes-native tmux target not advertised")
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], *keys)
+    build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_HERMES_DELIVERY_STYLE,
+    ).send_keys_atomic(keys)

@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from omnigent.inner.terminal import TerminalDelivery, TmuxDeliveryStyle, build_prompt_delivery
+
 _logger = logging.getLogger(__name__)
 
 ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.antigravity_native.bridge_id"
@@ -849,6 +851,11 @@ _SUBMIT_VERIFY_TIMEOUT_S = 5.0
 _MAX_SUBMIT_ATTEMPTS = 3
 # Named tmux buffer used to stream the paste (avoids the ~16KB send-keys argv cap).
 _PASTE_BUFFER = "omnigent-agy-paste"
+_ANTIGRAVITY_DELIVERY_STYLE = TmuxDeliveryStyle(
+    paste_buffer=_PASTE_BUFFER,
+    capture_flag_before_target=True,
+    command_timeout_s=_TMUX_SEND_TIMEOUT_S,
+)
 # agy TUI footer when idle (input box mounted, ready for a turn).
 _AGY_IDLE_MARKER = "? for shortcuts"
 # agy TUI footer while a turn is running. Used as a readiness hint and to detect
@@ -972,33 +979,6 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
                 "(is the agy terminal running on this host?)"
             )
         time.sleep(_TMUX_POLL_INTERVAL_S)
-
-
-def _run_tmux(socket_path: str, *args: str) -> None:
-    """
-    Invoke ``tmux -S <socket> <args...>`` and raise on failure.
-
-    :param socket_path: tmux server socket path.
-    :param args: tmux subcommand and arguments, e.g.
-        ``("send-keys", "-t", "main", "Enter")``.
-    :returns: None.
-    :raises RuntimeError: On a non-zero exit or a timeout.
-    """
-    try:
-        proc = subprocess.run(
-            ["tmux", "-S", socket_path, *args],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"tmux command timed out after {_TMUX_SEND_TIMEOUT_S:.0f}s") from exc
-    except OSError as exc:
-        raise RuntimeError(f"tmux could not be executed: {exc}") from exc
-    if proc.returncode != 0:
-        detail = proc.stderr.strip() or proc.stdout.strip() or "<no output>"
-        raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
 
 
 def _capture_pane(socket_path: str, tmux_target: str) -> str:
@@ -1203,7 +1183,7 @@ def _agy_draft_candidate_lines(region: str) -> list[str]:
     return candidates
 
 
-def _wait_for_agy_prompt_ready(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
+def _wait_for_agy_prompt_ready(delivery: TerminalDelivery, *, timeout_s: float) -> None:
     """
     Best-effort wait until agy's input box is mounted (its footer is rendered).
 
@@ -1223,15 +1203,14 @@ def _wait_for_agy_prompt_ready(socket_path: str, tmux_target: str, *, timeout_s:
     """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        pane = _capture_pane(socket_path, tmux_target)
+        pane = delivery.snapshot()
         if _AGY_IDLE_MARKER in pane or _AGY_ACTIVE_MARKER in pane:
             return
         time.sleep(_TMUX_POLL_INTERVAL_S)
 
 
 def _submit_and_verify(
-    socket_path: str,
-    tmux_target: str,
+    delivery: TerminalDelivery,
     *,
     needle: str = "",
     baseline_region: str = "",
@@ -1263,39 +1242,39 @@ def _submit_and_verify(
     :raises RuntimeError: When the agy TUI exits mid-submit, or the visible
         draft remains in the composer after :data:`_MAX_SUBMIT_ATTEMPTS` attempts.
     """
-    if not _session_alive(socket_path, tmux_target):
+    if not delivery.is_alive():
         raise RuntimeError(
             "the agy terminal exited before the message could be submitted; restart the session"
         )
     # Mid-turn steer: a turn is already running, so verifying via draft
     # disappearance is unreliable and a re-sent Enter could queue an empty turn.
     # Deliver one best-effort Enter and return (see the docstring).
-    if _AGY_ACTIVE_MARKER in _capture_pane(socket_path, tmux_target):
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    if _AGY_ACTIVE_MARKER in delivery.snapshot():
+        delivery.send_keys(["Enter"])
         return
     if not draft_seen:
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        delivery.send_keys(["Enter"])
         return
-    last_pane = _capture_pane(socket_path, tmux_target)
+    last_pane = delivery.snapshot()
     for _ in range(_MAX_SUBMIT_ATTEMPTS):
         # Re-check liveness each attempt: if the TUI exited between the paste and
         # now, every capture returns "" and the draft never clears — so fail
         # fast with the real cause instead of spinning the full budget and then
         # blaming paste-coalescing.
-        if not _session_alive(socket_path, tmux_target):
+        if not delivery.is_alive():
             raise RuntimeError(
                 "the agy terminal exited before the message could be submitted; "
                 "restart the session"
             )
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        delivery.send_keys(["Enter"])
         deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
         while time.monotonic() < deadline:
-            if not _session_alive(socket_path, tmux_target):
+            if not delivery.is_alive():
                 raise RuntimeError(
                     "the agy terminal exited before the message could be submitted; "
                     "restart the session"
                 )
-            pane = _capture_pane(socket_path, tmux_target)
+            pane = delivery.snapshot()
             last_pane = pane or last_pane
             if pane and not _draft_in_input_region(pane, needle, baseline_region):
                 return
@@ -1351,45 +1330,25 @@ def inject_user_message_via_tui(
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
+    delivery = build_prompt_delivery(
+        socket_path=socket_path,
+        target=tmux_target,
+        tmux_delivery_style=_ANTIGRAVITY_DELIVERY_STYLE,
+    )
     # Fast-fail if the TUI already exited: otherwise the readiness gate polls a
     # dead pane for the full timeout and the web message is silently lost. A clear
     # error lets the executor surface an ExecutorError so the UI can say "restart".
-    if not _session_alive(socket_path, tmux_target):
+    if not delivery.is_alive():
         raise RuntimeError(
             "the agy terminal is no longer running (the TUI exited); restart the session"
         )
-    _wait_for_agy_prompt_ready(
-        socket_path, tmux_target, timeout_s=max(0.0, deadline - time.monotonic())
-    )
+    _wait_for_agy_prompt_ready(delivery, timeout_s=max(0.0, deadline - time.monotonic()))
     # Clear any leftover draft before typing: Home (C-a) + kill-to-end (C-k).
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
-    baseline_region = _agy_input_region(_capture_pane(socket_path, tmux_target))
-    # ``delete=False`` + name captured BEFORE the write, so a write failure still
-    # leaves a path the finally can unlink (no leaked temp file in the bridge dir).
-    paste_path: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
-        ) as paste_file:
-            paste_path = paste_file.name
-            # Trailing newline absorbs any trailing backslash so it can't escape Enter.
-            paste_file.write(_paste_payload_bytes(content + "\n"))
-        _run_tmux(socket_path, "load-buffer", "-b", _PASTE_BUFFER, paste_path)
-        _run_tmux(
-            socket_path,
-            "paste-buffer",
-            "-p",  # bracketed-paste markers — the TUI keeps newlines as data
-            "-d",  # drop the buffer after pasting (no stale copies server-side)
-            "-b",
-            _PASTE_BUFFER,
-            "-t",
-            tmux_target,
-        )
-    finally:
-        if paste_path is not None:
-            with contextlib.suppress(OSError):
-                os.unlink(paste_path)
+    delivery.send_keys(["C-a"])
+    delivery.send_keys(["C-k"])
+    baseline_region = _agy_input_region(delivery.snapshot())
+    # Trailing newline absorbs any trailing backslash so it can't escape Enter.
+    delivery.paste_without_submit(content + "\n")
     # Wait until the paste is visibly committed to the input box before Enter, so
     # the submit is not folded into the paste burst (see _submit_and_verify). This
     # runs for EVERY message — including short ones with no stable needle — so a
@@ -1402,12 +1361,12 @@ def inject_user_message_via_tui(
     # The render hard-fail below is for the idle/sequential case, where a paste
     # that never lands in the composer (e.g. eaten by an unhooked modal such as
     # the first-run trust gate) must fail loudly instead of vanishing.
-    mid_turn = _AGY_ACTIVE_MARKER in _capture_pane(socket_path, tmux_target)
+    mid_turn = _AGY_ACTIVE_MARKER in delivery.snapshot()
     draft_seen = False
     last_commit_pane = ""
     commit_deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < commit_deadline:
-        pane = _capture_pane(socket_path, tmux_target)
+        pane = delivery.snapshot()
         last_commit_pane = pane or last_commit_pane
         if _draft_in_input_region(pane, needle, baseline_region):
             draft_seen = True
@@ -1420,8 +1379,7 @@ def inject_user_message_via_tui(
         )
     time.sleep(_PASTE_SETTLE_S)
     _submit_and_verify(
-        socket_path,
-        tmux_target,
+        delivery,
         needle=needle,
         baseline_region=baseline_region,
         draft_seen=draft_seen,
@@ -1471,8 +1429,13 @@ def send_interaction_keys_via_tui(
         )
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
-    if not _session_alive(socket_path, tmux_target):
+    delivery = build_prompt_delivery(
+        socket_path=socket_path,
+        target=tmux_target,
+        tmux_delivery_style=_ANTIGRAVITY_DELIVERY_STYLE,
+    )
+    if not delivery.is_alive():
         raise RuntimeError(
             "the agy terminal is no longer running (the TUI exited); restart the session"
         )
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, *keys)
+    delivery.send_keys_atomic(keys)

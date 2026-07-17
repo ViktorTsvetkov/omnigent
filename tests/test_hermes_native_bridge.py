@@ -7,10 +7,27 @@ import sqlite3
 import sys
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from omnigent import hermes_native_bridge as b
+
+
+def _patch_delivery_tmux(monkeypatch, calls=None, *, alive=True, pane="") -> None:
+    """Patch the shared tmux backend while recording bridge-shaped argv tails."""
+    calls = calls if calls is not None else []
+
+    def _fake_run(cmd, **_kwargs):
+        args = tuple(cmd[3:])
+        calls.append(args)
+        if args and args[0] == "has-session":
+            return SimpleNamespace(returncode=0 if alive else 1, stdout="", stderr="")
+        if args and args[0] == "capture-pane":
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
 
 
 def test_bridge_dir_is_per_session_and_under_root() -> None:
@@ -61,12 +78,17 @@ def _patch_inject_tmux(monkeypatch, calls: list[tuple[str, ...]]) -> None:
     monkeypatch.setattr(
         b, "_wait_for_tmux_info", lambda *_a, **_k: {"socket_path": "/s", "tmux_target": "t"}
     )
-    monkeypatch.setattr(b, "_session_alive", lambda *_a, **_k: True)
     monkeypatch.setattr(b, "_settle_pane", lambda *_a, **_k: None)
-    # Pane already shows the needle so the commit-wait returns immediately.
-    monkeypatch.setattr(b, "_capture_pane", lambda *_a, **_k: "do something now")
     monkeypatch.setattr(b.time, "sleep", lambda *_a, **_k: None)
-    monkeypatch.setattr(b, "_run_tmux", lambda _sock, *args: calls.append(args))
+
+    def _fake_run(cmd, **_kwargs):
+        args = tuple(cmd[3:])
+        stdout = "do something now" if args and args[0] == "capture-pane" else ""
+        if not args or args[0] not in {"has-session", "capture-pane"}:
+            calls.append(args)
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
 
 
 def test_inject_user_message_clears_pastes_and_submits(tmp_path, monkeypatch) -> None:
@@ -187,7 +209,7 @@ def test_inject_user_message_dead_pane_raises(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         b, "_wait_for_tmux_info", lambda *_a, **_k: {"socket_path": "/s", "tmux_target": "t"}
     )
-    monkeypatch.setattr(b, "_session_alive", lambda *_a, **_k: False)
+    _patch_delivery_tmux(monkeypatch, alive=False)
     with pytest.raises(RuntimeError, match="no longer running"):
         b.inject_user_message(tmp_path, content="hi")
 
@@ -197,7 +219,7 @@ def test_inject_interrupt_sends_ctrl_c(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         b, "_wait_for_tmux_info", lambda *_a, **_k: {"socket_path": "/s", "tmux_target": "t"}
     )
-    monkeypatch.setattr(b, "_run_tmux", lambda _sock, *args: calls.append(args))
+    _patch_delivery_tmux(monkeypatch, calls)
     b.inject_interrupt(tmp_path)
     assert calls == [("send-keys", "-t", "t", "C-c")]
 
@@ -207,7 +229,7 @@ def test_kill_session_kills_target(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         b, "_wait_for_tmux_info", lambda *_a, **_k: {"socket_path": "/s", "tmux_target": "t"}
     )
-    monkeypatch.setattr(b, "_run_tmux", lambda _sock, *args: calls.append(args))
+    _patch_delivery_tmux(monkeypatch, calls)
     b.kill_session(tmp_path)
     assert calls == [("kill-session", "-t", "t")]
 
@@ -216,21 +238,20 @@ def test_capture_pane_none_when_no_target_or_dead(tmp_path, monkeypatch) -> None
     monkeypatch.setattr(b, "read_tmux_info", lambda _d: None)
     assert b.capture_hermes_pane(tmp_path) is None
     monkeypatch.setattr(b, "read_tmux_info", lambda _d: {"socket_path": "/s", "tmux_target": "t"})
-    monkeypatch.setattr(b, "_session_alive", lambda *_a, **_k: False)
+    _patch_delivery_tmux(monkeypatch, alive=False)
     assert b.capture_hermes_pane(tmp_path) is None
 
 
 def test_capture_pane_returns_text_when_alive(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(b, "read_tmux_info", lambda _d: {"socket_path": "/s", "tmux_target": "t"})
-    monkeypatch.setattr(b, "_session_alive", lambda *_a, **_k: True)
-    monkeypatch.setattr(b, "_capture_pane", lambda *_a, **_k: "pane text")
+    _patch_delivery_tmux(monkeypatch, pane="pane text")
     assert b.capture_hermes_pane(tmp_path) == "pane text"
 
 
 def test_send_pane_keys_forwards_to_tmux(tmp_path, monkeypatch) -> None:
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(b, "read_tmux_info", lambda _d: {"socket_path": "/s", "tmux_target": "t"})
-    monkeypatch.setattr(b, "_run_tmux", lambda _sock, *args: calls.append(args))
+    _patch_delivery_tmux(monkeypatch, calls)
     b.send_hermes_pane_keys(tmp_path, "4")
     assert calls == [("send-keys", "-t", "t", "4")]
 
@@ -247,10 +268,7 @@ def test_send_pane_keys_raises_without_target(tmp_path, monkeypatch) -> None:
 def test_inject_compress_command_sends_keys(tmp_path, monkeypatch) -> None:
     calls: list[tuple[str, ...]] = []
 
-    def _fake_tmux(_socket_path, *args):
-        calls.append(args)
-
-    monkeypatch.setattr(b, "_run_tmux", _fake_tmux)
+    _patch_delivery_tmux(monkeypatch, calls)
     monkeypatch.setattr(b, "read_tmux_info", lambda _d: {"socket_path": "/s", "tmux_target": "t"})
     # _wait_for_tmux_info calls read_tmux_info internally, so patch it.
     monkeypatch.setattr(

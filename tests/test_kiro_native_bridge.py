@@ -465,7 +465,13 @@ def test_inject_interrupt_sends_escape(
     monkeypatch.setattr(
         bridge, "_wait_for_tmux_info", lambda *_a, **_k: {"socket_path": "/s", "tmux_target": "t"}
     )
-    monkeypatch.setattr(bridge, "_run_tmux", lambda _sock, *args: calls.append(args))
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda cmd, **_kwargs: (
+            calls.append(tuple(cmd[3:])),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )[1],
+    )
 
     bridge.inject_interrupt(tmp_path)
 
@@ -481,7 +487,13 @@ def test_kill_session_kills_target(
     monkeypatch.setattr(
         bridge, "_wait_for_tmux_info", lambda *_a, **_k: {"socket_path": "/s", "tmux_target": "t"}
     )
-    monkeypatch.setattr(bridge, "_run_tmux", lambda _sock, *args: calls.append(args))
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda cmd, **_kwargs: (
+            calls.append(tuple(cmd[3:])),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )[1],
+    )
 
     bridge.kill_session(tmp_path)
 

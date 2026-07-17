@@ -9,12 +9,16 @@ import os
 import secrets
 import subprocess
 import sys
-import tempfile
+
+# ``tempfile`` is retained per the strictly-additive rule: the private tmux paste
+# path used it before delivery moved to the shared terminal surface.
+import tempfile  # noqa: F401
 import time
 from pathlib import Path
 from typing import Any
 
 from omnigent._platform import stable_user_id
+from omnigent.inner.terminal import TerminalDelivery, TmuxDeliveryStyle, build_prompt_delivery
 
 KIRO_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_KIRO_NATIVE_BRIDGE_DIR"
 KIRO_ACP_RECORD_PATH_ENV_VAR = "KIRO_ACP_RECORD_PATH"
@@ -46,6 +50,12 @@ _KIRO_INPUT_READY_MARKERS = (
     "Type to steer",
 )
 _PASTE_BUFFER = "omnigent-kiro-paste"
+_KIRO_DELIVERY_STYLE = TmuxDeliveryStyle(
+    paste_buffer=_PASTE_BUFFER,
+    capture_flag_before_target=True,
+    literal_flag_before_target=True,
+    command_timeout_s=_TMUX_SEND_TIMEOUT_S,
+)
 _KIRO_PERMISSION_MARKERS = (
     "requires approval",
     "Yes, single permission",
@@ -321,22 +331,6 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
     raise RuntimeError(f"kiro-native tmux target was not advertised within {timeout_s:.0f}s")
 
 
-def _run_tmux(socket_path: str, *args: str) -> None:
-    try:
-        proc = subprocess.run(
-            ["tmux", "-S", socket_path, *args],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"tmux command timed out after {_TMUX_SEND_TIMEOUT_S}s") from exc
-    if proc.returncode != 0:
-        detail = proc.stderr.strip() or proc.stdout.strip() or "<no output>"
-        raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
-
-
 def _session_alive(socket_path: str, tmux_target: str) -> bool:
     try:
         proc = subprocess.run(
@@ -479,8 +473,7 @@ def _kiro_permission_prompt_matches_title(pane: str, expected_title: str | None)
 
 
 def _wait_for_kiro_permission_prompt(
-    socket_path: str,
-    tmux_target: str,
+    delivery: TerminalDelivery,
     *,
     expected_title: str | None,
     timeout_s: float,
@@ -488,7 +481,7 @@ def _wait_for_kiro_permission_prompt(
     """Wait until Kiro has rendered an approval prompt before typing a verdict."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        pane = _capture_pane(socket_path, tmux_target)
+        pane = delivery.snapshot()
         if (
             _kiro_permission_prompt_active(pane)
             and _kiro_permission_focus_on_one_time_allow(pane)
@@ -502,15 +495,14 @@ def _wait_for_kiro_permission_prompt(
 
 
 def _wait_for_kiro_input_ready(
-    socket_path: str,
-    tmux_target: str,
+    delivery: TerminalDelivery,
     *,
     timeout_s: float,
 ) -> None:
     """Wait until Kiro has rendered an input prompt before typing."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        if _kiro_input_ready(_capture_pane(socket_path, tmux_target)):
+        if _kiro_input_ready(delivery.snapshot()):
             return
         time.sleep(_POLL_INTERVAL_S)
     raise RuntimeError("kiro-native TUI input prompt was not ready before injection")
@@ -534,36 +526,9 @@ def _paste_payload_bytes(text: str) -> bytes:
     return bytes(body)
 
 
-def _paste_literal_text(socket_path: str, tmux_target: str, bridge_dir: Path, text: str) -> None:
-    """Deliver text into Kiro via a tmux bracketed paste (multi-line safe).
-
-    ``send-keys -l`` sends interior newlines as raw Enter keys, so a multi-line
-    web message submits line-by-line on the first break. ``load-buffer`` +
-    ``paste-buffer -p`` wraps the text in bracketed-paste markers so Kiro's
-    composer keeps the line breaks (encoded as CR by :func:`_paste_payload_bytes`)
-    as draft data, not submits. Mirrors cursor-native / goose-native; the trailing
-    newline absorbs any trailing backslash so it can't escape the follow-up Enter.
-    """
-    with tempfile.NamedTemporaryFile(
-        dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
-    ) as paste_file:
-        paste_file.write(_paste_payload_bytes(text + "\n"))
-        paste_path = paste_file.name
-    try:
-        _run_tmux(socket_path, "load-buffer", "-b", _PASTE_BUFFER, paste_path)
-        _run_tmux(
-            socket_path,
-            "paste-buffer",
-            "-p",  # bracketed-paste markers — the TUI keeps newlines as data
-            "-d",  # drop the buffer after pasting
-            "-b",
-            _PASTE_BUFFER,
-            "-t",
-            tmux_target,
-        )
-    finally:
-        with contextlib.suppress(OSError):
-            os.unlink(paste_path)
+def _paste_literal_text_via_delivery(delivery: TerminalDelivery, text: str) -> None:
+    """Deliver text through the shared terminal surface without submitting."""
+    delivery.paste_without_submit(text + "\n")
 
 
 def inject_user_message(
@@ -584,40 +549,39 @@ def inject_user_message(
     )
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
-    if not _session_alive(socket_path, tmux_target):
+    delivery = build_prompt_delivery(
+        socket_path=socket_path, target=tmux_target, tmux_delivery_style=_KIRO_DELIVERY_STYLE
+    )
+    if not delivery.is_alive():
         raise RuntimeError(
             "kiro terminal is no longer running (the TUI exited); restart the session"
         )
-    _wait_for_kiro_input_ready(socket_path, tmux_target, timeout_s=timeout_s)
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
-    baseline_region = _kiro_input_region(_capture_pane(socket_path, tmux_target))
-    _paste_literal_text(socket_path, tmux_target, bridge_dir, content)
+    _wait_for_kiro_input_ready(delivery, timeout_s=timeout_s)
+    delivery.send_keys(["C-a"])
+    delivery.send_keys(["C-k"])
+    baseline_region = _kiro_input_region(delivery.snapshot())
+    _paste_literal_text_via_delivery(delivery, content)
     needle = _submit_needle(content)
     draft_seen = False
     if needle:
         deadline = time.monotonic() + _TYPE_COMMIT_TIMEOUT_S
         while time.monotonic() < deadline:
-            if _draft_in_input_region(
-                _capture_pane(socket_path, tmux_target), needle, baseline_region
-            ):
+            if _draft_in_input_region(delivery.snapshot(), needle, baseline_region):
                 draft_seen = True
                 break
             time.sleep(_POLL_INTERVAL_S)
     time.sleep(_TYPE_SETTLE_S)
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    delivery.send_keys(["Enter"])
     if not draft_seen:
         return
     deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
     last_enter = time.monotonic()
     while time.monotonic() < deadline:
         time.sleep(_POLL_INTERVAL_S)
-        if not _draft_in_input_region(
-            _capture_pane(socket_path, tmux_target), needle, baseline_region
-        ):
+        if not _draft_in_input_region(delivery.snapshot(), needle, baseline_region):
             return
         if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
-            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            delivery.send_keys(["Enter"])
             last_enter = time.monotonic()
     raise RuntimeError("Kiro did not accept the submitted message; the draft is still visible")
 
@@ -637,7 +601,11 @@ def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     # No ``-l``: tmux must interpret ``Escape`` as a key name.
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
+    build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_KIRO_DELIVERY_STYLE,
+    ).send_keys(["Escape"])
 
 
 def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
@@ -650,7 +618,11 @@ def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) 
     :raises RuntimeError: If the tmux target is not advertised or kill-session fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])
+    build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_KIRO_DELIVERY_STYLE,
+    ).kill()
 
 
 def send_kiro_permission_verdict(
@@ -666,29 +638,30 @@ def send_kiro_permission_verdict(
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
-    if not _session_alive(socket_path, tmux_target):
+    delivery = build_prompt_delivery(
+        socket_path=socket_path, target=tmux_target, tmux_delivery_style=_KIRO_DELIVERY_STYLE
+    )
+    if not delivery.is_alive():
         raise RuntimeError(
             "kiro terminal is no longer running (the TUI exited); restart the session"
         )
-    _wait_for_kiro_permission_prompt(
-        socket_path, tmux_target, expected_title=expected_title, timeout_s=timeout_s
-    )
+    _wait_for_kiro_permission_prompt(delivery, expected_title=expected_title, timeout_s=timeout_s)
     if action == "accept":
         time.sleep(_PERMISSION_ENTER_SETTLE_S)
-        pane = _capture_pane(socket_path, tmux_target)
+        pane = delivery.snapshot()
         if not (
             _kiro_permission_prompt_active(pane)
             and _kiro_permission_focus_on_one_time_allow(pane)
             and _kiro_permission_prompt_matches_title(pane, expected_title)
         ):
             raise RuntimeError("kiro-native allow option was not safely focused before delivery")
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        delivery.send_keys(["Enter"])
         time.sleep(_PERMISSION_KEY_INTERVAL_S)
         return
     for key in ("Down", "Down"):
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, key)
+        delivery.send_keys([key])
         time.sleep(_PERMISSION_KEY_INTERVAL_S)
-    pane = _capture_pane(socket_path, tmux_target)
+    pane = delivery.snapshot()
     if not (
         _kiro_permission_prompt_active(pane)
         and _kiro_permission_focus_on_reject(pane)
@@ -696,7 +669,7 @@ def send_kiro_permission_verdict(
     ):
         raise RuntimeError("kiro-native reject option was not safely focused before delivery")
     time.sleep(_PERMISSION_ENTER_SETTLE_S)
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    delivery.send_keys(["Enter"])
     time.sleep(_PERMISSION_KEY_INTERVAL_S)
 
 
@@ -740,23 +713,26 @@ def inject_model_command(
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
-    if not _session_alive(socket_path, tmux_target):
+    delivery = build_prompt_delivery(
+        socket_path=socket_path, target=tmux_target, tmux_delivery_style=_KIRO_DELIVERY_STYLE
+    )
+    if not delivery.is_alive():
         raise RuntimeError(
             "kiro terminal is no longer running (the TUI exited); restart the session"
         )
-    _wait_for_kiro_input_ready(socket_path, tmux_target, timeout_s=timeout_s)
+    _wait_for_kiro_input_ready(delivery, timeout_s=timeout_s)
     # Clear any leftover draft so the slash command isn't appended to it.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+    delivery.send_keys(["C-a"])
+    delivery.send_keys(["C-k"])
     # ``-l`` sends literal characters so ``/`` opens the slash command and the id
     # is not parsed as tmux key names.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "-l", f"/model {model}")
+    delivery.type_literal(f"/model {model}")
     time.sleep(_TYPE_SETTLE_S)
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    delivery.send_keys(["Enter"])
     # Confirm via kiro's "Model changed to <id>" line so a bad id fails loudly.
     deadline = time.monotonic() + _MODEL_CONFIRM_TIMEOUT_S
     while time.monotonic() < deadline:
-        if f"{_MODEL_CHANGED_MARKER} {model}" in _capture_pane(socket_path, tmux_target):
+        if f"{_MODEL_CHANGED_MARKER} {model}" in delivery.snapshot():
             return
         time.sleep(_POLL_INTERVAL_S)
     raise RuntimeError(f"kiro-native did not confirm the model switch to {model!r}")

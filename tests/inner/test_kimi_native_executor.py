@@ -12,6 +12,8 @@ per-spawn MCP config), so the MCP-config tests have no analogue here.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -124,20 +126,35 @@ class TestApprovalKeystroke:
 
     def _stub_tmux(
         self, monkeypatch: pytest.MonkeyPatch, *, pane: str, alive: bool = True
-    ) -> list[tuple[str, ...]]:
-        sent: list[tuple[str, ...]] = []
+    ) -> list[list[str]]:
+        """Route the surface through a fake ``subprocess.run`` and record send-keys.
+
+        Post-#9 the bridge delivers through the shared ``TerminalDelivery`` rather
+        than the private ``_run_tmux`` / ``_capture_pane`` / ``_session_alive``, so
+        we patch ``subprocess.run`` (as #8 did in test_claude_native_bridge.py) and
+        stub the three tmux verbs the delivery emits: ``has-session`` (liveness),
+        ``capture-pane`` (the menu-marker snapshot), and ``send-keys`` (recorded).
+        The advertised socket is a raw string, so the pinned argv is byte-exact on
+        every platform (no Path round-trip).
+        """
+        sent: list[list[str]] = []
         monkeypatch.setattr(
             kimi_native_bridge,
             "_wait_for_tmux_info",
             lambda bridge_dir, *, timeout_s: {"socket_path": "/s", "tmux_target": "main"},
         )
-        monkeypatch.setattr(kimi_native_bridge, "_session_alive", lambda s, t: alive)
-        monkeypatch.setattr(kimi_native_bridge, "_capture_pane", lambda s, t: pane)
-        monkeypatch.setattr(
-            kimi_native_bridge,
-            "_run_tmux",
-            lambda socket_path, *args: sent.append(args),
-        )
+
+        def _fake_run(cmd: list[str], **kwargs: Any) -> SimpleNamespace:
+            del kwargs
+            if "has-session" in cmd:
+                return SimpleNamespace(returncode=0 if alive else 1, stdout="", stderr="")
+            if "capture-pane" in cmd:
+                return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+            if "send-keys" in cmd:
+                sent.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("subprocess.run", _fake_run)
         return sent
 
     def test_injects_digit_and_enter_when_menu_present(
@@ -146,8 +163,8 @@ class TestApprovalKeystroke:
         sent = self._stub_tmux(monkeypatch, pane="▶ 1. Approve once\n  3. Reject")
         assert inject_approval_keystroke(tmp_path, key=APPROVE_KEY) is True
         assert sent == [
-            ("send-keys", "-t", "main", APPROVE_KEY),
-            ("send-keys", "-t", "main", "Enter"),
+            ["tmux", "-S", "/s", "send-keys", "-t", "main", APPROVE_KEY],
+            ["tmux", "-S", "/s", "send-keys", "-t", "main", "Enter"],
         ]
 
     def test_deny_key_selects_reject(
@@ -155,7 +172,7 @@ class TestApprovalKeystroke:
     ) -> None:
         sent = self._stub_tmux(monkeypatch, pane="▶ 1. Approve once\n  3. Reject")
         assert inject_approval_keystroke(tmp_path, key=DENY_KEY) is True
-        assert sent[0] == ("send-keys", "-t", "main", DENY_KEY)
+        assert sent[0] == ["tmux", "-S", "/s", "send-keys", "-t", "main", DENY_KEY]
 
     def test_skips_when_menu_absent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # Prompt already answered in the terminal → marker gone → no keystroke.
@@ -191,17 +208,27 @@ class TestSettlePaneReadiness:
     ) -> None:
         captures = {"n": 0}
 
-        def _capture(_s: str, _t: str) -> str:
-            captures["n"] += 1
-            return "context: 6.5% (17.0k/262.1k)"
+        def _fake_run(cmd: list[str], **kwargs: Any) -> SimpleNamespace:
+            del kwargs
+            if "capture-pane" in cmd:
+                captures["n"] += 1
+                return SimpleNamespace(
+                    returncode=0, stdout="context: 6.5% (17.0k/262.1k)", stderr=""
+                )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        monkeypatch.setattr(kimi_native_bridge, "_capture_pane", _capture)
+        monkeypatch.setattr("subprocess.run", _fake_run)
         # If the marker fails to match, this would loop until the deadline; a
         # tiny timeout keeps the test fast either way, but it must return after
         # exactly one capture with no sleep.
         slept: list[float] = []
         monkeypatch.setattr(kimi_native_bridge.time, "sleep", lambda s: slept.append(s))
-        kimi_native_bridge._settle_pane("/s", "main", timeout_s=30.0)
+        delivery = kimi_native_bridge.build_prompt_delivery(
+            socket_path="/s",
+            target="main",
+            tmux_delivery_style=kimi_native_bridge._KIMI_DELIVERY_STYLE,
+        )
+        kimi_native_bridge._settle_pane(delivery, timeout_s=30.0)
         assert captures["n"] == 1
         assert slept == []
 

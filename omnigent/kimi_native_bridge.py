@@ -16,12 +16,17 @@ import hashlib
 import json
 import os
 import subprocess
-import tempfile
+
+# ``tempfile`` is retained per the strictly-additive rule: the private tmux paste
+# path in ``inject_user_message`` used it before delivery moved to the shared
+# surface, and the unused private helpers below are kept byte-identical.
+import tempfile  # noqa: F401
 import time
 from pathlib import Path
 from typing import Any
 
 from omnigent._platform import stable_user_id
+from omnigent.inner.terminal import TerminalDelivery, TmuxDeliveryStyle, build_prompt_delivery
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_KIMI_NATIVE_BRIDGE_DIR"
@@ -56,6 +61,17 @@ _PASTE_COMMIT_TIMEOUT_S = 5.0
 # whole 30s timeout — the web→TUI latency the markers were meant to avoid.)
 _INPUT_READY_MARKERS = ("context:",)
 _TRUST_MARKER = "Trust this workspace"
+
+# Delivery dialect that preserves kimi's exact tmux command stream on the shared
+# :class:`~omnigent.inner.terminal.TerminalDelivery`: kimi's own paste buffer, the
+# ``capture-pane -p -t <target>`` flag order its private ``_capture_pane`` used,
+# and its 5s per-command timeout. Every value equals kimi's private helpers, so
+# migrating each call site onto the surface keeps the POSIX bytes byte-identical.
+_KIMI_DELIVERY_STYLE = TmuxDeliveryStyle(
+    paste_buffer=_PASTE_BUFFER,
+    capture_flag_before_target=True,
+    command_timeout_s=_TMUX_SEND_TIMEOUT_S,
+)
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
@@ -275,18 +291,23 @@ def _submit_needle(content: str) -> str:
     return stripped[:24] if len(stripped) >= 4 else ""
 
 
-def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
+def _settle_pane(delivery: TerminalDelivery, *, timeout_s: float) -> None:
     """Best-effort wait until the Kimi input box is ready to receive a paste.
 
     Accepts the first-run "Trust this workspace" modal (sends ``a`` at most once)
     so the input box can mount, then returns as soon as the TUI chrome is present
     (see :data:`_INPUT_READY_MARKERS`). Falls through after the timeout (e.g. a
     boot that never renders) rather than raising — the paste still lands.
+
+    Drives the shared delivery surface: :meth:`~TerminalDelivery.snapshot` for the
+    readiness capture and :meth:`~TerminalDelivery.send_keys` for the one-shot
+    ``a``, so no tmux is invoked directly here (the byte stream is identical —
+    ``capture-pane -p -t`` and ``send-keys -t <target> a``).
     """
     deadline = time.monotonic() + timeout_s
     trust_accepted = False
     while time.monotonic() < deadline:
-        pane = _capture_pane(socket_path, tmux_target)
+        pane = delivery.snapshot()
         if any(marker in pane for marker in _INPUT_READY_MARKERS):
             return
         # One-shot, only when no input marker is up (so a later transcript that
@@ -294,7 +315,7 @@ def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> Non
         if not trust_accepted and _TRUST_MARKER in pane:
             trust_accepted = True
             with contextlib.suppress(RuntimeError):
-                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "a")
+                delivery.send_keys(["a"])
         time.sleep(_POLL_INTERVAL_S)
 
 
@@ -319,53 +340,41 @@ def inject_user_message(
     if not content:
         raise RuntimeError("kimi-native injection requires non-empty content")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    socket_path = info["socket_path"]
-    tmux_target = info["tmux_target"]
+    delivery = build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_KIMI_DELIVERY_STYLE,
+    )
     # Fast-fail if the TUI already exited: otherwise _settle_pane polls a dead
     # pane for the full timeout and the web message is silently lost. A clear
     # error lets run_turn surface ExecutorError so the UI can say "restart".
-    if not _session_alive(socket_path, tmux_target):
+    if not delivery.is_alive():
         raise RuntimeError(
             "kimi terminal is no longer running (the TUI exited); restart the session"
         )
-    _settle_pane(socket_path, tmux_target, timeout_s=timeout_s)
-    # Clear any leftover draft: Home (C-a) + kill-to-end (C-k).
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
-    with tempfile.NamedTemporaryFile(
-        dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
-    ) as paste_file:
-        # Trailing newline absorbs any trailing backslash so it can't escape Enter.
-        paste_file.write(_paste_payload_bytes(content + "\n"))
-        paste_path = paste_file.name
-    try:
-        _run_tmux(socket_path, "load-buffer", "-b", _PASTE_BUFFER, paste_path)
-        _run_tmux(
-            socket_path,
-            "paste-buffer",
-            "-p",  # bracketed-paste markers — the TUI keeps newlines as data
-            "-d",  # drop the buffer after pasting
-            "-b",
-            _PASTE_BUFFER,
-            "-t",
-            tmux_target,
-        )
-    finally:
-        with contextlib.suppress(OSError):
-            os.unlink(paste_path)
-    # Wait until the paste is visibly committed to the input box before Enter.
-    # Submitting mid-paste folds the Enter in as a newline (the kimi TUI
-    # coalesces rapid stdin bursts), leaving the message unsent. Poll for the
-    # text, then submit; fall through to a blind submit if no needle is usable.
+    _settle_pane(delivery, timeout_s=timeout_s)
+    # Clear any leftover draft: Home (C-a) + kill-to-end (C-k), two separate
+    # send-keys the same as the private helper issued.
+    delivery.send_keys(["C-a"])
+    delivery.send_keys(["C-k"])
+    # Bracketed paste via a loaded tmux buffer (kimi's own ``omnigent-kimi-paste``
+    # buffer, from the delivery style) so interior newlines stay data; the trailing
+    # newline absorbs any trailing backslash so it can't escape the submit Enter.
+    delivery.paste_without_submit(content + "\n")
+    # Wait until the paste is visibly committed to the input box before Enter, then
+    # submit with a SINGLE Enter (no verify/retry): kimi submits on one Enter, so a
+    # second would submit twice. Submitting mid-paste folds the Enter in as a
+    # newline (the kimi TUI coalesces rapid stdin bursts), leaving the message
+    # unsent — so ``submit_once`` polls for the draft first. A whitespace-only
+    # message has no identifiable needle, so it submits blind (``draft_present``
+    # None), matching the old ``if needle:`` guard.
     needle = _submit_needle(content)
-    if needle:
-        deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
-        while time.monotonic() < deadline:
-            if needle in _capture_pane(socket_path, tmux_target):
-                break
-            time.sleep(_POLL_INTERVAL_S)
-    time.sleep(_PASTE_SETTLE_S)
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    delivery.submit_once(
+        draft_present=(lambda pane: needle in pane) if needle else None,
+        poll_interval_s=_POLL_INTERVAL_S,
+        commit_timeout_s=_PASTE_COMMIT_TIMEOUT_S,
+        settle_s=_PASTE_SETTLE_S,
+    )
 
 
 def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
@@ -379,8 +388,15 @@ def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT
     :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    # No ``-l``: tmux must interpret ``Escape`` as a key name.
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
+    delivery = build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_KIMI_DELIVERY_STYLE,
+    )
+    # A named ``Escape`` key (not literal): kimi cancels an in-flight turn on one
+    # Escape. ``send_keys`` sends it as the key name — ``send-keys -t <target>
+    # Escape`` — not the bytes of the word.
+    delivery.send_keys(["Escape"])
 
 
 #: Tool-independent label proving kimi's permission menu is on screen — guards
@@ -416,16 +432,20 @@ def inject_approval_keystroke(
     :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    socket_path = info["socket_path"]
-    tmux_target = info["tmux_target"]
-    if not _session_alive(socket_path, tmux_target):
+    delivery = build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_KIMI_DELIVERY_STYLE,
+    )
+    if not delivery.is_alive():
         return False
-    if _PERMISSION_PROMPT_MARKER not in _capture_pane(socket_path, tmux_target):
+    if _PERMISSION_PROMPT_MARKER not in delivery.snapshot():
         return False
     # ``key`` is a single documented option digit; Enter confirms (the footer
     # lists "choose" and "confirm" separately, so a digit selects and ↵ commits).
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, key)
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    # Two separate send-keys, the same as the private helper issued.
+    delivery.send_keys([key])
+    delivery.send_keys(["Enter"])
     return True
 
 
@@ -439,4 +459,9 @@ def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) 
     :raises RuntimeError: If the tmux target is not advertised or kill-session fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])
+    delivery = build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_KIMI_DELIVERY_STYLE,
+    )
+    delivery.kill()

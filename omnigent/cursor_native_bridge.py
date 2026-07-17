@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from omnigent._platform import stable_user_id
+from omnigent.inner.terminal import TerminalDelivery, TmuxDeliveryStyle, build_prompt_delivery
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_CURSOR_NATIVE_BRIDGE_DIR"
@@ -98,6 +99,19 @@ _COMPOSER_CLEAR_MAX_ROUNDS = 50
 # slightly after the turn stops. Wait for the pane to stop changing (generation
 # ended and the draft settled) before clearing it, bounded by this timeout.
 _INTERRUPT_SETTLE_TIMEOUT_S = 2.0
+
+# Delivery dialect that preserves cursor's exact tmux command stream on the shared
+# :class:`~omnigent.inner.terminal.TerminalDelivery`: cursor's own paste buffer,
+# the ``capture-pane -p -t <target>`` flag order its private ``_capture_pane``
+# used, the ``send-keys -t <target> -l`` literal order its ``/model`` picker used,
+# and its 10s per-command timeout. Every value equals cursor's private helpers, so
+# migrating each call site onto the surface keeps the POSIX bytes byte-identical.
+_CURSOR_DELIVERY_STYLE = TmuxDeliveryStyle(
+    paste_buffer=_PASTE_BUFFER,
+    capture_flag_before_target=True,
+    literal_flag_before_target=True,
+    command_timeout_s=_TMUX_SEND_TIMEOUT_S,
+)
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
@@ -574,10 +588,17 @@ def capture_cursor_pane(bridge_dir: Path) -> str | None:
     info = read_tmux_info(bridge_dir)
     if info is None:
         return None
-    socket_path, tmux_target = info["socket_path"], info["tmux_target"]
-    if not _session_alive(socket_path, tmux_target):
+    delivery = build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_CURSOR_DELIVERY_STYLE,
+    )
+    # ``is_alive`` (has-session) distinguishes a dead pane (``None``) from a live
+    # but empty capture (``""``); ``snapshot`` returns ``""`` on a transient miss,
+    # matching the private ``_capture_pane``.
+    if not delivery.is_alive():
         return None
-    return _capture_pane(socket_path, tmux_target)
+    return delivery.snapshot()
 
 
 def send_cursor_pane_keys(bridge_dir: Path, *keys: str) -> None:
@@ -589,6 +610,11 @@ def send_cursor_pane_keys(bridge_dir: Path, *keys: str) -> None:
     a tmux key name/argument (not bracketed-paste data), so multi-byte keys like
     ``"Escape"`` are interpreted, not typed literally.
 
+    Delivered as ONE ``send-keys -t <target> k1 k2 …`` via
+    :meth:`~TerminalDelivery.send_keys_atomic` — the same single client command
+    the private helper issued, so any packed sequence stays atomic against a
+    concurrent client.
+
     :param bridge_dir: The cursor-native bridge dir holding ``tmux.json``.
     :param keys: tmux key arguments, e.g. ``"y"`` or ``"Escape"``.
     :raises RuntimeError: If the tmux target is not advertised or the
@@ -597,7 +623,12 @@ def send_cursor_pane_keys(bridge_dir: Path, *keys: str) -> None:
     info = read_tmux_info(bridge_dir)
     if info is None:
         raise RuntimeError("cursor-native tmux target not advertised")
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], *keys)
+    delivery = build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_CURSOR_DELIVERY_STYLE,
+    )
+    delivery.send_keys_atomic(keys)
 
 
 def _submit_needle(content: str) -> str:
@@ -610,18 +641,23 @@ def _submit_needle(content: str) -> str:
     return stripped[:24] if len(stripped) >= 4 else ""
 
 
-def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
+def _settle_pane(delivery: TerminalDelivery, *, timeout_s: float) -> None:
     """Best-effort wait until the Cursor input box is ready to receive a paste.
 
     Accepts the first-run "Trust this workspace" modal (sends ``a`` at most once)
     so the input box can mount, then waits for an idle/running input marker. Falls
     through after the timeout (mid-turn steering has no idle placeholder) rather
     than raising.
+
+    Drives the shared delivery surface: :meth:`~TerminalDelivery.snapshot`
+    (``capture-pane -p -t``) for the readiness capture and
+    :meth:`~TerminalDelivery.send_keys` for the one-shot ``a`` — no tmux is
+    invoked directly, and the byte stream is identical.
     """
     deadline = time.monotonic() + timeout_s
     trust_accepted = False
     while time.monotonic() < deadline:
-        pane = _capture_pane(socket_path, tmux_target)
+        pane = delivery.snapshot()
         if any(marker in pane for marker in _IDLE_MARKERS):
             return
         # One-shot, only when no input marker is up (so a later transcript that
@@ -629,11 +665,11 @@ def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> Non
         if not trust_accepted and _TRUST_MARKER in pane:
             trust_accepted = True
             with contextlib.suppress(RuntimeError):
-                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "a")
+                delivery.send_keys(["a"])
         time.sleep(_POLL_INTERVAL_S)
 
 
-def _clear_composer(socket_path: str, tmux_target: str) -> None:
+def _clear_composer(delivery: TerminalDelivery) -> None:
     """Empty the cursor-agent composer of any leftover draft before a paste.
 
     cursor-agent restores the interrupted prompt back into the composer when a
@@ -644,20 +680,17 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     changing (the draft is gone) or a generous round cap is hit. A burst against
     an already-empty composer is a harmless no-op (unlike ``C-c``, which would
     arm cursor-agent's exit), so this is safe to run before every injection.
+
+    Drives the shared surface: :meth:`~TerminalDelivery.send_keys` for ``End``,
+    :meth:`~TerminalDelivery.send_keys_repeated` for each ``send-keys -N`` burst,
+    and :meth:`~TerminalDelivery.snapshot` for the settle diff — the tmux stream
+    (``send-keys -t <target> -N <chunk> BSpace``) is byte-identical.
     """
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "End")
-    previous = _capture_pane(socket_path, tmux_target)
+    delivery.send_keys(["End"])
+    previous = delivery.snapshot()
     for _ in range(_COMPOSER_CLEAR_MAX_ROUNDS):
-        _run_tmux(
-            socket_path,
-            "send-keys",
-            "-t",
-            tmux_target,
-            "-N",
-            str(_COMPOSER_CLEAR_CHUNK),
-            "BSpace",
-        )
-        current = _capture_pane(socket_path, tmux_target)
+        delivery.send_keys_repeated("BSpace", _COMPOSER_CLEAR_CHUNK)
+        current = delivery.snapshot()
         # Once a burst no longer changes the pane, the composer is empty —
         # further Backspaces are no-ops, so stop.
         if current == previous:
@@ -686,53 +719,39 @@ def inject_user_message(
     if not content:
         raise RuntimeError("cursor-native injection requires non-empty content")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    socket_path = info["socket_path"]
-    tmux_target = info["tmux_target"]
+    delivery = build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_CURSOR_DELIVERY_STYLE,
+    )
     # Fast-fail if the TUI already exited: otherwise _settle_pane polls a dead
     # pane for the full timeout and the web message is silently lost. A clear
     # error lets run_turn surface ExecutorError so the UI can say "restart".
-    if not _session_alive(socket_path, tmux_target):
+    if not delivery.is_alive():
         raise RuntimeError(
             "cursor terminal is no longer running (the TUI exited); restart the session"
         )
-    _settle_pane(socket_path, tmux_target, timeout_s=timeout_s)
+    _settle_pane(delivery, timeout_s=timeout_s)
     # Clear any leftover draft (e.g. the prompt cursor-agent restores into the
     # composer after a cancelled turn) so it can't prepend the new message.
-    _clear_composer(socket_path, tmux_target)
-    with tempfile.NamedTemporaryFile(
-        dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
-    ) as paste_file:
-        # Trailing newline absorbs any trailing backslash so it can't escape Enter.
-        paste_file.write(_paste_payload_bytes(content + "\n"))
-        paste_path = paste_file.name
-    try:
-        _run_tmux(socket_path, "load-buffer", "-b", _PASTE_BUFFER, paste_path)
-        _run_tmux(
-            socket_path,
-            "paste-buffer",
-            "-p",  # bracketed-paste markers — the TUI keeps newlines as data
-            "-d",  # drop the buffer after pasting
-            "-b",
-            _PASTE_BUFFER,
-            "-t",
-            tmux_target,
-        )
-    finally:
-        with contextlib.suppress(OSError):
-            os.unlink(paste_path)
-    # Wait until the paste is visibly committed to the input box before Enter.
-    # Submitting mid-paste folds the Enter in as a newline (the cursor TUI
-    # coalesces rapid stdin bursts), leaving the message unsent. Poll for the
-    # text, then submit; fall through to a blind submit if no needle is usable.
+    _clear_composer(delivery)
+    # Bracketed paste via a loaded tmux buffer (cursor's own ``omnigent-cursor-paste``
+    # buffer, from the delivery style) so interior newlines stay data; the trailing
+    # newline absorbs any trailing backslash so it can't escape the submit Enter.
+    delivery.paste_without_submit(content + "\n")
+    # Wait until the paste is visibly committed to the input box before Enter, then
+    # submit with a SINGLE Enter (no verify/retry). Submitting mid-paste folds the
+    # Enter in as a newline (the cursor TUI coalesces rapid stdin bursts), leaving
+    # the message unsent, so ``submit_once`` polls for the draft first; a
+    # whitespace-only message has no identifiable needle, so it submits blind
+    # (``draft_present`` None), matching the old ``if needle:`` guard.
     needle = _submit_needle(content)
-    if needle:
-        deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
-        while time.monotonic() < deadline:
-            if needle in _capture_pane(socket_path, tmux_target):
-                break
-            time.sleep(_POLL_INTERVAL_S)
-    time.sleep(_PASTE_SETTLE_S)
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    delivery.submit_once(
+        draft_present=(lambda pane: needle in pane) if needle else None,
+        poll_interval_s=_POLL_INTERVAL_S,
+        commit_timeout_s=_PASTE_COMMIT_TIMEOUT_S,
+        settle_s=_PASTE_SETTLE_S,
+    )
 
 
 def inject_model_command(
@@ -764,21 +783,25 @@ def inject_model_command(
     if not model:
         raise RuntimeError("cursor-native model switch requires a non-empty model id")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    socket_path = info["socket_path"]
-    tmux_target = info["tmux_target"]
-    if not _session_alive(socket_path, tmux_target):
+    delivery = build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_CURSOR_DELIVERY_STYLE,
+    )
+    if not delivery.is_alive():
         raise RuntimeError(
             "cursor terminal is no longer running (the TUI exited); restart the session"
         )
-    _settle_pane(socket_path, tmux_target, timeout_s=timeout_s)
+    _settle_pane(delivery, timeout_s=timeout_s)
     # Clear any leftover draft so the slash command isn't appended to it.
     # cursor-agent's composer ignores the readline C-a/C-k keys, so this floods
     # Backspace (see _clear_composer); a bare "/model <id>" is what opens the
     # picker, whereas "<draft>/model <id>" would not.
-    _clear_composer(socket_path, tmux_target)
-    # ``-l`` sends the command as literal characters so ``/`` opens the slash
-    # menu and the id filters the picker rather than being parsed as key names.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "-l", f"/model {model}")
+    _clear_composer(delivery)
+    # Type the command as literal characters (``send-keys -t <target> -l`` via the
+    # cursor delivery style) so ``/`` opens the slash menu and the id filters the
+    # picker rather than being parsed as key names.
+    delivery.type_literal(f"/model {model}")
     # Gate on the picker's *filter result*, not the echoed command: the composer
     # line itself contains ``model``, so a naive ``model in pane`` check passes
     # instantly off the echo and never confirms a match landed. Poll for cursor's
@@ -787,38 +810,41 @@ def inject_model_command(
     # both the filter and the highlight need time to resolve.
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
-        pane = _capture_pane(socket_path, tmux_target)
+        pane = delivery.snapshot()
         if _PICKER_NO_MATCH_MARKER in pane or _PICKER_MATCH_MARKER in pane:
             break
         time.sleep(_POLL_INTERVAL_S)
     time.sleep(_MODEL_PICKER_SETTLE_S)
     # Re-read after the settle: a transient "No matches" can flash mid-filter,
     # and a real match may only resolve once the debounce fires.
-    if _PICKER_NO_MATCH_MARKER in _capture_pane(socket_path, tmux_target):
+    if _PICKER_NO_MATCH_MARKER in delivery.snapshot():
         # Dismiss the picker and clear the composer so the literal "/model <id>"
         # can't be submitted as a chat message, then fail loudly so the web
         # surfaces an honest error instead of silently selecting nothing.
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
-        _clear_composer(socket_path, tmux_target)
+        delivery.send_keys(["Escape"])
+        _clear_composer(delivery)
         raise RuntimeError(
             f"cursor model {model!r} is not available in the picker (no match); "
             "the model was not switched"
         )
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    delivery.send_keys(["Enter"])
 
 
-def _wait_for_pane_settle(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
+def _wait_for_pane_settle(delivery: TerminalDelivery, *, timeout_s: float) -> None:
     """Best-effort wait until the pane stops changing across two captures.
 
     Used after a cancel so the restored draft (and any final generation output)
     has landed before we clear the composer. Falls through after *timeout_s*
     rather than raising — the clear that follows is a no-op on an empty composer.
+
+    Drives the shared surface via :meth:`~TerminalDelivery.snapshot`
+    (``capture-pane -p -t``), so the capture byte stream is identical.
     """
     deadline = time.monotonic() + timeout_s
-    previous = _capture_pane(socket_path, tmux_target)
+    previous = delivery.snapshot()
     while time.monotonic() < deadline:
         time.sleep(_POLL_INTERVAL_S)
-        current = _capture_pane(socket_path, tmux_target)
+        current = delivery.snapshot()
         if current and current == previous:
             return
         previous = current
@@ -838,15 +864,20 @@ def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT
     :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    socket_path = info["socket_path"]
-    tmux_target = info["tmux_target"]
-    # No ``-l``: tmux must interpret ``Escape`` as a key name.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+    delivery = build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_CURSOR_DELIVERY_STYLE,
+    )
+    # A named ``Escape`` key (not literal): cursor-agent cancels a running turn on
+    # one Escape. ``send_keys`` sends the key name — ``send-keys -t <target>
+    # Escape``.
+    delivery.send_keys(["Escape"])
     # Let the cancel land and the restored draft settle, then clear it. The
     # next injection also clears (defense in depth), but clearing here means the
     # composer is empty the moment the user looks at the TUI after pressing Stop.
-    _wait_for_pane_settle(socket_path, tmux_target, timeout_s=_INTERRUPT_SETTLE_TIMEOUT_S)
-    _clear_composer(socket_path, tmux_target)
+    _wait_for_pane_settle(delivery, timeout_s=_INTERRUPT_SETTLE_TIMEOUT_S)
+    _clear_composer(delivery)
 
 
 def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
@@ -859,4 +890,9 @@ def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) 
     :raises RuntimeError: If the tmux target is not advertised or kill-session fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])
+    delivery = build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_CURSOR_DELIVERY_STYLE,
+    )
+    delivery.kill()

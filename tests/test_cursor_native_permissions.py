@@ -25,6 +25,8 @@ import contextlib
 import json as _json
 import sqlite3 as _sqlite3
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -131,13 +133,28 @@ async def test_post_external_elicitation_resolved_shape() -> None:
 def test_capture_cursor_pane_returns_pane_or_none(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Pane text when the TUI is live; ``None`` when absent or the pane is dead."""
+    """Pane text when the TUI is live; ``None`` when absent or the pane is dead.
+
+    Post-#9 ``capture_cursor_pane`` delivers through the shared surface, so this
+    patches ``subprocess.run`` (as #8 did) and stubs the tmux verbs it emits —
+    ``has-session`` (liveness) and ``capture-pane`` (the snapshot) — instead of the
+    private ``_session_alive`` / ``_capture_pane`` the surface no longer calls.
+    """
     monkeypatch.setattr(cnb, "read_tmux_info", lambda _d: {"socket_path": "s", "tmux_target": "t"})
-    monkeypatch.setattr(cnb, "_session_alive", lambda _s, _t: True)
-    monkeypatch.setattr(cnb, "_capture_pane", lambda _s, _t: "PANE-TEXT")
+    alive = {"v": True}
+
+    def _fake_run(cmd: list[str], **kwargs: Any) -> SimpleNamespace:
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0 if alive["v"] else 1, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout="PANE-TEXT", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
     assert cnb.capture_cursor_pane(tmp_path) == "PANE-TEXT"
 
-    monkeypatch.setattr(cnb, "_session_alive", lambda _s, _t: False)
+    alive["v"] = False
     assert cnb.capture_cursor_pane(tmp_path) is None  # dead pane
 
     monkeypatch.setattr(cnb, "read_tmux_info", lambda _d: None)
@@ -147,18 +164,30 @@ def test_capture_cursor_pane_returns_pane_or_none(
 def test_send_cursor_pane_keys_invokes_tmux_send_keys(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Each key is forwarded to ``tmux send-keys -t <target>`` on the pane socket."""
-    calls: list[tuple[str, tuple[str, ...]]] = []
+    """Each key is forwarded as one ``tmux send-keys -t <target>`` on the pane socket.
+
+    Post-#9 the verdict keys go through the surface's atomic multi-key send, so
+    this patches ``subprocess.run`` and pins the emitted argv (a raw-string socket
+    keeps it byte-exact on every platform).
+    """
+    sent: list[list[str]] = []
     monkeypatch.setattr(
         cnb, "read_tmux_info", lambda _d: {"socket_path": "sock", "tmux_target": "main"}
     )
-    monkeypatch.setattr(cnb, "_run_tmux", lambda sp, *a: calls.append((sp, a)))
+
+    def _fake_run(cmd: list[str], **kwargs: Any) -> SimpleNamespace:
+        del kwargs
+        if "send-keys" in cmd:
+            sent.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
 
     cnb.send_cursor_pane_keys(tmp_path, "y")
-    assert calls == [("sock", ("send-keys", "-t", "main", "y"))]
+    assert sent == [["tmux", "-S", "sock", "send-keys", "-t", "main", "y"]]
 
     cnb.send_cursor_pane_keys(tmp_path, "Escape")
-    assert calls[-1] == ("sock", ("send-keys", "-t", "main", "Escape"))
+    assert sent[-1] == ["tmux", "-S", "sock", "send-keys", "-t", "main", "Escape"]
 
 
 def test_send_cursor_pane_keys_raises_without_target(

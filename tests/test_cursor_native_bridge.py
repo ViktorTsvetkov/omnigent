@@ -16,9 +16,25 @@ import pytest
 
 from omnigent import cursor_native_bridge
 from omnigent.cursor_native_bridge import write_tmux_target
+from omnigent.inner.terminal import TerminalDelivery
 
 _SOCK = "/tmp/example/cursor.sock"
 _TARGET = "cursor:0.0"
+
+
+def _cursor_delivery() -> TerminalDelivery:
+    """Build the cursor-styled delivery surface the dance helpers now take.
+
+    Post-#9 ``_clear_composer`` / ``_settle_pane`` drive a
+    :class:`~omnigent.inner.terminal.TerminalDelivery` rather than a raw
+    socket/target; the underlying tmux still runs through the per-test
+    ``subprocess.run`` patch, so the recorded argv is unchanged.
+    """
+    return cursor_native_bridge.build_prompt_delivery(
+        socket_path=_SOCK,
+        target=_TARGET,
+        tmux_delivery_style=cursor_native_bridge._CURSOR_DELIVERY_STYLE,
+    )
 
 
 class _FakeCompleted:
@@ -79,7 +95,7 @@ def test_clear_composer_floods_backspace_until_pane_stable(
         pane_captures=["draft-content", "empty", "empty"],
     )
 
-    cursor_native_bridge._clear_composer(_SOCK, _TARGET)
+    cursor_native_bridge._clear_composer(_cursor_delivery())
 
     tails = _send_keys_calls(captured)
     # End once, then one Backspace burst per round until stable.
@@ -106,7 +122,7 @@ def test_clear_composer_terminates_on_empty_composer(
     """
     captured = _install_fake_tmux(monkeypatch, pane_captures=["idle-placeholder"])
 
-    cursor_native_bridge._clear_composer(_SOCK, _TARGET)
+    cursor_native_bridge._clear_composer(_cursor_delivery())
 
     bursts = [t for t in _send_keys_calls(captured) if "BSpace" in t]
     assert len(bursts) == 1, "empty composer should settle after a single burst"
@@ -128,7 +144,7 @@ def test_clear_composer_is_bounded_when_pane_never_settles(
 
     monkeypatch.setattr("subprocess.run", _fake_run)
 
-    cursor_native_bridge._clear_composer(_SOCK, _TARGET)
+    cursor_native_bridge._clear_composer(_cursor_delivery())
 
     # One capture seeds `previous`, then one per round up to the cap.
     assert counter["n"] == cursor_native_bridge._COMPOSER_CLEAR_MAX_ROUNDS + 1

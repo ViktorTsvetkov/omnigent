@@ -443,6 +443,69 @@ _IDLE_WATCHER_JOIN_TIMEOUT_S = 1.0
 # pane in submission order, so the program sees one contiguous stream.
 _SEND_KEYS_LITERAL_CHARS_PER_CALL = 1024
 
+# --- Shared prompt-delivery surface (the "delivery dance") ------------------
+#
+# The seven TUI-typing native bridges (claude, cursor, goose, hermes, kimi,
+# kiro, antigravity) each duplicated a private tmux helper and the full
+# delivery dance — clear the composer draft, paste a multi-line prompt WITHOUT
+# submitting it, verify via a screen snapshot that the draft landed, then submit
+# and verify it left the box. :class:`TerminalDelivery` consolidates that dance
+# onto the backend seam so it is written once and every backend (tmux, herdr,
+# the in-process fake) hosts it through the same synchronous protocol. The
+# bridges are stateless callers running in a worker thread (``asyncio.to_thread``
+# with no event loop), so the surface is synchronous throughout — the same
+# execution model the private helpers used, which keeps the migrated tmux
+# command stream byte-identical.
+
+# How long a single delivery subprocess (a ``tmux`` client command) may run
+# before it is treated as failed. Matches the value the per-bridge private
+# helpers used, so migrated delivery keeps the same timeout behavior.
+_DELIVERY_SEND_TIMEOUT_S = 5.0
+
+# Named tmux paste buffer the bracketed-paste delivery loads into. A fixed name
+# (rather than the anonymous top buffer) lets ``paste-buffer -d`` drop exactly
+# this buffer after use so no stale copies accumulate server-side.
+_TMUX_PASTE_BUFFER = "omnigent-paste"
+
+
+def _tmux_paste_payload_bytes(text: str) -> bytes:
+    r"""Encode *text* as the byte payload for a tmux bracketed paste.
+
+    Returns only the content bytes — ``paste-buffer -p`` wraps them in the
+    ``ESC [ 2 0 0 ~`` / ``ESC [ 2 0 1 ~`` markers itself when delivering the
+    buffer to the pane. Bytes are mapped so a TUI keeps the paste as editable
+    data rather than submitting on each line:
+
+    - ``\r\n`` / lone ``\r`` / ``\n`` all collapse to a single carriage return
+      ``0x0d`` — the byte a real paste carries between lines inside the markers,
+      so interior newlines stay data instead of becoming per-line submits.
+    - ``\t`` becomes ``0x09``.
+    - Any other control byte below ``0x20`` is dropped: a stray ``ESC`` (or BEL)
+      would otherwise prematurely close the bracketed-paste sequence.
+    - Everything else passes through as its UTF-8 bytes.
+
+    This is the consolidated form of the per-bridge private ``_paste_payload_bytes``
+    helpers; the tmux delivery backend uses it, and callers append their own
+    trailing newline (which absorbs a trailing backslash so it cannot escape the
+    submit ``Enter``).
+
+    :param text: Raw text to paste, possibly multi-line, e.g. ``"a\r\nb"``.
+    :returns: The normalized content bytes, e.g. ``b"a\rb"``.
+    """
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    body = bytearray()
+    for ch in normalized:
+        if ch == "\n":
+            body.append(0x0D)
+            continue
+        if ch == "\t":
+            body.append(0x09)
+            continue
+        if ord(ch) < 0x20:
+            continue
+        body.extend(ch.encode("utf-8"))
+    return bytes(body)
+
 
 class _IdleDetector:
     """
@@ -1171,6 +1234,120 @@ class TerminalBackend(ABC):
         """
         return None
 
+    # --------------------------------------------------- delivery surface (sync)
+    #
+    # The synchronous half of the protocol, driving :class:`TerminalDelivery`
+    # (the consolidated prompt-delivery dance). The native bridges deliver from a
+    # worker thread with no event loop, so these siblings exist alongside the
+    # async ``send_text`` / ``send_keys`` / ``capture`` for exactly the same
+    # reason ``capture_sync`` / ``liveness_sync`` do. ``paste_without_submit_sync``
+    # is a NEW primitive (bracketed non-submitting multi-line paste) distinct
+    # from literal ``send_text`` typing; ``kill_session_sync`` is a hard stop of
+    # this one session (which a multiplexer may distinguish from tearing down the
+    # whole host — see :meth:`close`).
+
+    @abstractmethod
+    def send_text_sync(self, text: str) -> None:
+        """Synchronous sibling of :meth:`send_text` (literal, non-submitting).
+
+        Same verbatim, non-submitting, backend-chunked semantics as
+        :meth:`send_text`; provided for the thread-based delivery callers that
+        have no event loop.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def send_keys_sync(self, keys: Sequence[str]) -> None:
+        """Synchronous sibling of :meth:`send_keys` (named keys, in order)."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def paste_without_submit_sync(self, text: str) -> None:
+        """Paste multi-line *text* into the composer WITHOUT submitting it.
+
+        The delivery-dance primitive: *text* lands as a single editable draft in
+        the pane's input box (bracketed-paste safe), so interior newlines stay
+        data rather than submitting per line, and the caller submits separately
+        via :meth:`send_keys_sync`. Distinct from :meth:`send_text_sync`, which
+        types literally: a backend may use a bulk paste channel here (tmux loads
+        a buffer and pastes it with bracketed-paste markers) that differs from
+        literal keystroke injection. Callers append their own trailing newline
+        when they need one (it absorbs a trailing backslash so it cannot escape
+        the submit key).
+
+        :param text: The draft to paste, possibly multi-line.
+        :raises RuntimeError: If the multiplexer rejects the paste (e.g. the host
+            endpoint is gone).
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def kill_session_sync(self) -> None:
+        """Hard-stop THIS hosted session, terminating its inner process.
+
+        The "Stop session" affordance behind the web UI. Distinct from
+        :meth:`close` where a backend separates one session from its host server:
+        this kills the session/pane (and the inner CLI in it) specifically.
+        Raises on failure so the caller can surface it (a wedged host must not
+        read as a successful stop).
+
+        :raises RuntimeError: If the multiplexer rejects the kill.
+        """
+        raise NotImplementedError
+
+    def delivery_snapshot_sync(self) -> str:
+        """Snapshot the pane for the delivery dance's readiness/verify polls.
+
+        Unlike :meth:`capture_sync`, this NEVER raises: a transient capture
+        failure during boot or a mid-turn repaint is "not ready yet" to the
+        polling caller, not an error, so it degrades to ``""``. The default wraps
+        :meth:`capture_sync`; a backend whose delivery capture must match a
+        pre-existing byte-exact command stream overrides it.
+
+        :returns: The plain (no-ANSI) screen text, or ``""`` when the snapshot
+            could not be taken.
+        """
+        try:
+            return self.capture_sync(ansi=False)
+        except RuntimeError:
+            return ""
+
+    def native_popup_launch(
+        self,
+        *,
+        config_file: Path,
+        session_id: str,
+        elicitation_id: str,
+        message: str,
+        policy_name: str | None = None,
+        python_executable: str | None = None,
+    ) -> None:
+        """Overlay a native approval popup on the pane, if the backend can.
+
+        Capability-gated by :attr:`TerminalBackendCapabilities.native_popup`
+        (checked by :meth:`TerminalDelivery.launch_native_popup`). The default is
+        a documented no-op — where a backend cannot host a pane popup the web
+        approval card remains the elicitation surface, exactly the degradation
+        the spec calls for. tmux overrides this.
+
+        :param config_file: AP-routing config the popup reads (base URL + auth
+            headers).
+        :param session_id: Omnigent session id that owns the elicitation.
+        :param elicitation_id: Outstanding elicitation correlation id.
+        :param message: Approval reason rendered in the popup.
+        :param policy_name: Deciding policy name (modal header), or ``None``.
+        :param python_executable: Interpreter to run the popup module, or
+            ``None`` for the caller's default.
+        """
+        del (
+            config_file,
+            session_id,
+            elicitation_id,
+            message,
+            policy_name,
+            python_executable,
+        )
+
 
 class TmuxBackend(TerminalBackend):
     """
@@ -1221,13 +1398,17 @@ class TmuxBackend(TerminalBackend):
     def __init__(
         self,
         *,
-        socket_path: Path,
+        socket_path: str | Path,
         target: str = "main",
         config_path: str = _TMUX_CONFIG_PATH,
     ) -> None:
         """
         :param socket_path: Private tmux socket path for this instance's
-            server.
+            server. Accepted as ``str`` or :class:`~pathlib.Path` — it is only
+            ever stringified onto a tmux ``-S`` argv, so a bridge advertising a
+            socket string (:func:`build_prompt_delivery`) reaches the same argv
+            as a :class:`TerminalInstance` passing a ``Path`` without a
+            platform-dependent round-trip.
         :param target: Session/pane target name, e.g. ``"main"``.
         :param config_path: tmux config file to load, ``os.devnull`` so a
             managed session never inherits the user's ``~/.tmux.conf``.
@@ -1483,6 +1664,162 @@ class TmuxBackend(TerminalBackend):
     def detach_display_clients_sync(self) -> None:
         """Synchronous :meth:`detach_display_clients` for the threaded watcher."""
         self._run_output_sync("detach-client", "-s", self._target)
+
+    # --------------------------------------------------- delivery surface (sync)
+    #
+    # These reproduce, byte-for-byte, the command stream the seven native bridges'
+    # private ``_run_tmux`` / ``_capture_pane`` helpers produced, so migrating a
+    # bridge onto the shared :class:`TerminalDelivery` leaves its POSIX behavior
+    # (and the tests that pin its exact tmux argv) unchanged. Deliberately built
+    # WITHOUT the ``-f`` config flag ``_base_cmd`` carries: these are pure client
+    # commands against the already-running server (the runner created it with
+    # ``-f``), so ``-f`` — consulted only when a server starts — is inert here,
+    # and its absence is what keeps the migrated command stream identical to the
+    # private helpers' (which never passed it).
+
+    def _delivery_cmd(self, *args: str) -> list[str]:
+        """Build a delivery client-command argv: ``tmux -S <sock> <args...>``.
+
+        No ``-f``: see the delivery-surface note above.
+        """
+        return ["tmux", "-S", str(self._socket_path), *args]
+
+    def _delivery_run_sync(self, *args: str) -> None:
+        """Run one delivery client command; raise on non-zero exit or timeout.
+
+        Byte-identical error semantics to the bridges' private ``_run_tmux``: a
+        non-zero exit raises :class:`RuntimeError` carrying the stderr (typically
+        "no server running" once the pane is gone), so the delivery caller can
+        surface a transport failure rather than a silent success.
+        """
+        try:
+            proc = subprocess.run(
+                self._delivery_cmd(*args),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=_DELIVERY_SEND_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"tmux command timed out after {_DELIVERY_SEND_TIMEOUT_S}s"
+            ) from exc
+        if proc.returncode != 0:
+            detail = proc.stderr.strip() or proc.stdout.strip() or "<no output>"
+            raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
+
+    def send_text_sync(self, text: str) -> None:
+        """Type literal *text* via ``send-keys -l``, chunked under tmux's cap.
+
+        Synchronous, byte-identical sibling of :meth:`send_text`.
+        """
+        for start in range(0, len(text), _SEND_KEYS_LITERAL_CHARS_PER_CALL):
+            self._delivery_run_sync(
+                "send-keys",
+                "-l",
+                "-t",
+                self._target,
+                text[start : start + _SEND_KEYS_LITERAL_CHARS_PER_CALL],
+            )
+
+    def send_keys_sync(self, keys: Sequence[str]) -> None:
+        """Press each named key via ``send-keys`` (sync sibling of :meth:`send_keys`)."""
+        for key in keys:
+            self._delivery_run_sync("send-keys", "-t", self._target, key)
+
+    def paste_without_submit_sync(self, text: str) -> None:
+        """Paste *text* as one bracketed paste via a loaded tmux buffer.
+
+        Delivered through a file-backed buffer (``load-buffer`` then
+        ``paste-buffer -p``), NOT ``send-keys -l`` argv: tmux caps a single
+        client->server command at ~16KB, so a large payload (a PR diff in a
+        sub-agent dispatch) failed with "command too long"; ``load-buffer``
+        streams the file without that cap. ``-p`` wraps it in bracketed-paste
+        markers so interior newlines (encoded to CR by
+        :func:`_tmux_paste_payload_bytes`) stay data instead of per-line submits
+        (anthropics/claude-code#52126); ``-d`` drops the buffer after pasting so
+        no stale copies accumulate server-side.
+        """
+        with tempfile.NamedTemporaryFile(
+            prefix="omnigent_paste_", suffix=".bin", delete=False
+        ) as paste_file:
+            paste_file.write(_tmux_paste_payload_bytes(text))
+            paste_path = paste_file.name
+        try:
+            self._delivery_run_sync("load-buffer", "-b", _TMUX_PASTE_BUFFER, paste_path)
+            self._delivery_run_sync(
+                "paste-buffer",
+                "-p",  # bracketed-paste markers — the TUI keeps newlines as data
+                "-d",  # drop the buffer after pasting (no stale copies server-side)
+                "-b",
+                _TMUX_PASTE_BUFFER,
+                "-t",
+                self._target,
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(paste_path)
+
+    def kill_session_sync(self) -> None:
+        """Hard-stop this session via ``kill-session -t <target>``.
+
+        Kills the session and its pane (terminating the inner CLI). Distinct from
+        :meth:`close` (``kill-server``): a private single-session server run with
+        ``exit-empty off`` (claude-native's keep-alive) would otherwise outlive a
+        session kill, so this targets the session specifically — the exact command
+        the bridge's private ``kill_session`` issued.
+        """
+        self._delivery_run_sync("kill-session", "-t", self._target)
+
+    def delivery_snapshot_sync(self) -> str:
+        """Snapshot the pane via ``capture-pane -p`` for the delivery dance.
+
+        Byte-identical to the bridges' private ``_capture_pane``: never raises —
+        a transient capture failure returns ``""`` (the "not ready yet" signal
+        the readiness/verify polls key off) rather than the "host went away"
+        exception :meth:`capture_sync` raises.
+        """
+        try:
+            proc = subprocess.run(
+                self._delivery_cmd("capture-pane", "-t", self._target, "-p"),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=_DELIVERY_SEND_TIMEOUT_S,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return ""
+        return proc.stdout if proc.returncode == 0 else ""
+
+    def native_popup_launch(
+        self,
+        *,
+        config_file: Path,
+        session_id: str,
+        elicitation_id: str,
+        message: str,
+        policy_name: str | None = None,
+        python_executable: str | None = None,
+    ) -> None:
+        """Overlay the cost-approval popup on this pane via ``tmux display-popup``.
+
+        Delegates to :func:`omnigent.native_cost_popup.launch_cost_popup` with
+        this backend's own socket + target, so the popup renders on the pane the
+        delivery surface is bound to. Fire-and-forget (the launcher spawns a
+        detached ``Popen`` and skips silently when no client is attached).
+        """
+        from omnigent.native_cost_popup import launch_cost_popup
+
+        launch_cost_popup(
+            str(self._socket_path),
+            self._target,
+            config_file,
+            session_id=session_id,
+            elicitation_id=elicitation_id,
+            message=message,
+            policy_name=policy_name,
+            python_executable=python_executable,
+        )
 
     @classmethod
     def reap_orphans(cls) -> int:
@@ -2427,6 +2764,39 @@ class HerdrBackend(TerminalBackend):
         if wire:
             await self._run(*self._pane_argv("send-keys", *wire))
 
+    # --------------------------------------------------- delivery surface (sync)
+    #
+    # Synchronous siblings for the thread-based :class:`TerminalDelivery` callers.
+    # These mirror the async pane commands through the sync runner (fake-tested
+    # against ``_fake_herdr``; native Windows delivery lands in a later change).
+    # herdr's ``pane send-text`` is already non-submitting, so paste and literal
+    # typing are the same command here (unlike tmux, which needs a buffer paste).
+
+    def send_text_sync(self, text: str) -> None:
+        """Type literal *text* (sync sibling of :meth:`send_text`)."""
+        self._run_output_sync(*self._pane_argv("send-text", text))
+
+    def send_keys_sync(self, keys: Sequence[str]) -> None:
+        """Press named keys, translated (sync sibling of :meth:`send_keys`)."""
+        wire = [translated for key in keys if (translated := self._translate_key(key)) is not None]
+        if wire:
+            self._run_output_sync(*self._pane_argv("send-keys", *wire))
+
+    def paste_without_submit_sync(self, text: str) -> None:
+        """Paste *text* without submitting — herdr ``send-text`` is non-submitting."""
+        self.send_text_sync(text)
+
+    def kill_session_sync(self) -> None:
+        """Hard-stop this session by closing its workspace.
+
+        Raises on a non-zero close so a wedged host surfaces (the delivery
+        contract). A workspace already gone is nothing to stop, so it returns
+        quietly.
+        """
+        if self._workspace_id is None:
+            return
+        self._run_output_sync("workspace", "close", self._workspace_id)
+
     async def capture(self, *, ansi: bool = False, scrollback: int = 0) -> str:
         """Snapshot the pane via ``pane read``, normalizing CRLF → ``\\n``.
 
@@ -2776,7 +3146,9 @@ def select_terminal_backend_class(*, spec_backend: str | None = None) -> type[Te
     return backend_cls
 
 
-def _construct_terminal_backend(name: str, *, socket_path: Path, target: str) -> TerminalBackend:
+def _construct_terminal_backend(
+    name: str, *, socket_path: str | Path, target: str
+) -> TerminalBackend:
     """Construct the registered backend *name* for a terminal instance.
 
     The construction seam for :meth:`TerminalInstance.__post_init__`. Each
@@ -2803,13 +3175,198 @@ def _construct_terminal_backend(name: str, *, socket_path: Path, target: str) ->
         raise RuntimeError(f"Unknown terminal backend {name!r}. Known backends: {known}.")
     if backend_cls is TmuxBackend:
         return TmuxBackend(socket_path=socket_path, target=target)
-    backend = backend_cls.construct_for_instance(socket_path=socket_path, target=target)
+    # Non-tmux hooks take a ``Path``; normalize here (tmux keeps the value raw
+    # so a bridge-advertised socket string reaches an identical ``-S`` argv).
+    backend = backend_cls.construct_for_instance(socket_path=Path(socket_path), target=target)
     if backend is not None:
         return backend
     raise NotImplementedError(
         f"terminal backend {name!r} is registered but its constructor is not "
         "wired into _construct_terminal_backend yet."
     )
+
+
+class TerminalDelivery:
+    """Shared, synchronous prompt-delivery surface over a :class:`TerminalBackend`.
+
+    The consolidated home of the "delivery dance" the seven TUI-typing native
+    bridges each open-coded against a private tmux helper: clear the composer
+    draft, paste a multi-line prompt WITHOUT submitting it, verify via a screen
+    snapshot that the draft landed, then submit and verify it left the box —
+    plus named-key send (Enter/Escape/Ctrl-C/…), a non-raising screen snapshot,
+    a hard session kill, and the capability-gated native popup. Delivery bugs are
+    now fixed once here instead of seven times.
+
+    The surface is **synchronous** because its callers are the bridges, which
+    deliver from a worker thread with no event loop (``asyncio.to_thread``);
+    every method drives the backend's ``*_sync`` protocol. It holds no state of
+    its own — a fresh instance binds to one terminal's advertised endpoint via
+    :func:`build_prompt_delivery`. TUI-specific knowledge (what the composer's
+    prompt glyph looks like, when a draft is "still in the box") stays with the
+    caller and enters through the ``draft_present`` predicate, so this surface
+    serves any TUI without embedding one vendor's screen grammar.
+    """
+
+    def __init__(self, backend: TerminalBackend) -> None:
+        """:param backend: The backend bound to this terminal's endpoint."""
+        self._backend = backend
+
+    @property
+    def backend(self) -> TerminalBackend:
+        """The backend this surface drives (its capabilities, name, …)."""
+        return self._backend
+
+    def snapshot(self) -> str:
+        """Return the pane's plain-text screen, or ``""`` when unavailable.
+
+        Never raises: the delivery dance polls this to watch the composer, and a
+        transient capture miss is "not ready yet", not a failure.
+        """
+        return self._backend.delivery_snapshot_sync()
+
+    def send_keys(self, keys: Sequence[str]) -> None:
+        """Press *keys* in order (Enter/Escape/Ctrl-C/… — the interrupt and
+        submit primitive)."""
+        self._backend.send_keys_sync(list(keys))
+
+    def type_literal(self, text: str) -> None:
+        """Type *text* literally into the composer without submitting (e.g. a
+        slash command's characters)."""
+        self._backend.send_text_sync(text)
+
+    def paste_without_submit(self, text: str) -> None:
+        """Paste multi-line *text* as one non-submitting draft into the composer."""
+        self._backend.paste_without_submit_sync(text)
+
+    def kill(self) -> None:
+        """Hard-stop this session (the web UI "Stop session" affordance)."""
+        self._backend.kill_session_sync()
+
+    def launch_native_popup(
+        self,
+        *,
+        config_file: Path,
+        session_id: str,
+        elicitation_id: str,
+        message: str,
+        policy_name: str | None = None,
+        python_executable: str | None = None,
+    ) -> None:
+        """Overlay a native approval popup on the pane where the backend can.
+
+        Capability-gated: on a backend without
+        :attr:`TerminalBackendCapabilities.native_popup` (herdr, the fake) this
+        is a no-op and the web approval card remains the elicitation surface —
+        the degradation the spec calls for. Arguments are forwarded to
+        :meth:`TerminalBackend.native_popup_launch`.
+        """
+        if not self._backend.capabilities.native_popup:
+            return
+        self._backend.native_popup_launch(
+            config_file=config_file,
+            session_id=session_id,
+            elicitation_id=elicitation_id,
+            message=message,
+            policy_name=policy_name,
+            python_executable=python_executable,
+        )
+
+    def submit_and_verify(
+        self,
+        *,
+        draft_present: Callable[[str], bool],
+        error_message: str,
+        poll_interval_s: float,
+        commit_timeout_s: float,
+        settle_s: float,
+        verify_timeout_s: float,
+        retry_interval_s: float,
+    ) -> None:
+        """Submit a pasted draft with commit-then-verify handshaking.
+
+        The submit half of the delivery dance, reproduced from the bridges'
+        private helper so its behavior is byte-for-byte unchanged:
+
+        1. **Commit wait** — poll :meth:`snapshot` up to *commit_timeout_s* until
+           *draft_present* sees the paste land in the composer. A TUI coalesces a
+           rapid stdin burst into a paste, so a submit key that arrives mid-paste
+           is folded into the draft as a newline instead of submitting; waiting
+           for the visible draft makes the handoff deterministic. When the draft
+           is never identifiable (e.g. whitespace-only content) the loop falls
+           through and submits blind, matching the pre-consolidation behavior.
+        2. **Settle** — a brief *settle_s* pause, then send ``Enter``.
+        3. **Verify + retry** — if the draft was observed, poll up to
+           *verify_timeout_s* that it left the box; re-send ``Enter`` no more
+           often than *retry_interval_s* while it has not, since a swallowed
+           submit must be retried but a slow-but-successful one must not be
+           double-tapped. Raise *error_message* if the draft never clears.
+
+        :param draft_present: Predicate over a snapshot: is the draft still in the
+            composer? (TUI-specific; supplied by the caller.)
+        :param error_message: RuntimeError text raised if the draft never
+            submits (the caller owns the wording so it stays vendor-accurate).
+        :param poll_interval_s: Seconds between polls.
+        :param commit_timeout_s: Max seconds to wait for the draft to land.
+        :param settle_s: Pause after the draft lands before the submit Enter.
+        :param verify_timeout_s: Max seconds to confirm the draft left the box.
+        :param retry_interval_s: Minimum spacing between retry Enters.
+        :raises RuntimeError: With *error_message* if the draft never submits.
+        """
+        draft_seen = False
+        deadline = time.monotonic() + commit_timeout_s
+        while time.monotonic() < deadline:
+            if draft_present(self.snapshot()):
+                draft_seen = True
+                break
+            time.sleep(poll_interval_s)
+        time.sleep(settle_s)
+        self.send_keys(["Enter"])
+        if not draft_seen:
+            # The draft was never observed, so its absence proves nothing —
+            # verification would trivially "pass". Submit blind as before.
+            return
+        deadline = time.monotonic() + verify_timeout_s
+        last_enter = time.monotonic()
+        while time.monotonic() < deadline:
+            time.sleep(poll_interval_s)
+            if not draft_present(self.snapshot()):
+                return
+            if time.monotonic() - last_enter >= retry_interval_s:
+                self.send_keys(["Enter"])
+                last_enter = time.monotonic()
+        raise RuntimeError(error_message)
+
+
+def build_prompt_delivery(
+    *,
+    socket_path: str | Path,
+    target: str,
+    backend_name: str | None = None,
+) -> TerminalDelivery:
+    """Build a :class:`TerminalDelivery` bound to an advertised terminal endpoint.
+
+    The bridges advertise their hosted terminal's private socket + pane target
+    (the runner writes them after launch) and call this to obtain the shared
+    delivery surface, instead of shelling out to a multiplexer themselves. The
+    backend is constructed through the same seam a real
+    :class:`TerminalInstance` uses (:func:`_construct_terminal_backend`), so the
+    surface is backend-agnostic.
+
+    :param socket_path: The terminal's private multiplexer socket path, as the
+        ``str`` a bridge read from its advertisement or a :class:`~pathlib.Path`.
+    :param target: The session/pane target the terminal was launched on, e.g.
+        ``"main"`` or ``"claude:0.0"``.
+    :param backend_name: Backend to construct. ``None`` selects tmux — the POSIX
+        default that hosts every native harness today; a backend-aware
+        advertisement can pass a name once non-tmux delivery is enabled.
+    :returns: A fresh delivery surface bound to this endpoint.
+    """
+    backend = _construct_terminal_backend(
+        backend_name or TmuxBackend.name,
+        socket_path=socket_path,
+        target=target,
+    )
+    return TerminalDelivery(backend)
 
 
 @dataclass

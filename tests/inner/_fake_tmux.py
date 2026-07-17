@@ -18,7 +18,9 @@ Only the tmux vocabulary :class:`TmuxBackend` actually emits is modeled:
 ``set-option`` / ``set-window-option`` / ``set-hook`` / ``unbind-key`` (options,
 mostly ignored), ``new-session`` (create the server), ``list-panes -F
 #{pane_dead}`` (liveness), ``capture-pane`` (snapshot), ``send-keys`` (literal
-paste and named keys), ``kill-server`` (teardown), and ``detach-client``.
+paste and named keys), ``load-buffer`` / ``paste-buffer`` (the delivery surface's
+bracketed non-submitting paste), ``kill-session`` (the delivery hard-stop),
+``kill-server`` (teardown), and ``detach-client``.
 
 Two conventions make otherwise-invisible behavior observable to the suite:
 
@@ -204,6 +206,65 @@ def _handle_kill_server(socket_path: str) -> int:
     return 0 if existed else 1
 
 
+def _handle_kill_session(socket_path: str) -> int:
+    """Kill this session (the delivery hard-stop).
+
+    Modeled like :func:`_handle_kill_server` for the fake's single-session
+    private server: the session's pane is destroyed, so a following liveness
+    probe finds no server and reports ``ENDPOINT_GONE``.
+    """
+    existed = _load(socket_path) is not None
+    _remove(socket_path)
+    return 0 if existed else 1
+
+
+def _handle_load_buffer(cmd: list[str], socket_path: str) -> int:
+    """Load a named paste buffer from a file (``load-buffer -b <name> <path>``).
+
+    The delivery bracketed-paste path streams the payload through a file so it
+    isn't capped by tmux's client->server command limit. The file's bytes are
+    the CR-encoded paste payload; the fake decodes and stashes them under the
+    buffer name for a following ``paste-buffer`` to deposit into the pane.
+    """
+    state = _load(socket_path)
+    if state is None:
+        sys.stderr.write("no server running\n")
+        return 1
+    name = cmd[cmd.index("-b") + 1] if "-b" in cmd else "0"
+    try:
+        payload = Path(cmd[-1]).read_bytes().decode("utf-8", errors="replace")
+    except OSError:
+        sys.stderr.write("can't read buffer file\n")
+        return 1
+    buffers = state.setdefault("buffers", {})
+    assert isinstance(buffers, dict)
+    buffers[name] = payload
+    _save(socket_path, state)
+    return 0
+
+
+def _handle_paste_buffer(cmd: list[str], socket_path: str) -> int:
+    """Paste a named buffer into the pane WITHOUT submitting (``paste-buffer``).
+
+    Appends the buffer's content to the screen — never a submit sentinel, so the
+    conformance suite can prove a bracketed paste is non-submitting. ``-d`` drops
+    the buffer after pasting (mirroring the real flag).
+    """
+    state = _load(socket_path)
+    if state is None:
+        sys.stderr.write("no server running\n")
+        return 1
+    name = cmd[cmd.index("-b") + 1] if "-b" in cmd else "0"
+    buffers = state.setdefault("buffers", {})
+    assert isinstance(buffers, dict)
+    content = buffers.get(name, "")
+    state["screen"] = str(state.get("screen", "")) + content
+    if "-d" in cmd:
+        buffers.pop(name, None)
+    _save(socket_path, state)
+    return 0
+
+
 def main(argv: list[str]) -> int:
     """Run one fake ``tmux`` invocation.
 
@@ -240,8 +301,14 @@ def main(argv: list[str]) -> int:
             rc = _handle_capture(socket_path)
         elif name == "send-keys":
             rc = _handle_send_keys(cmd, socket_path)
+        elif name == "load-buffer":
+            rc = _handle_load_buffer(cmd, socket_path)
+        elif name == "paste-buffer":
+            rc = _handle_paste_buffer(cmd, socket_path)
         elif name == "kill-server":
             rc = _handle_kill_server(socket_path)
+        elif name == "kill-session":
+            rc = _handle_kill_session(socket_path)
         # set-window-option / set-hook / unbind-key / detach-client and any
         # other option command are inert no-ops for the fake.
         if rc != 0:

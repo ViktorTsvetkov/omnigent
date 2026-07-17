@@ -231,6 +231,81 @@ class BackendConformanceSuite:
         finally:
             await backend.close()
 
+    # ------------------------------------------------ delivery surface (sync)
+    #
+    # The synchronous protocol the shared prompt-delivery surface drives. These
+    # mirror the async input/capture tests so each adapter's ``*_sync`` methods
+    # get the same parity coverage — the native bridges deliver through them.
+
+    async def test_send_text_sync_multiline_is_not_submitted(
+        self, adapter: ConformanceAdapter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``send_text_sync`` lands a multi-line literal without submitting it."""
+        backend = adapter.make_backend(tmp_path, monkeypatch)
+        await backend.launch(adapter.launch_request(adapter.alive_command()))
+        try:
+            pasted = "alpha line\nbeta line\ngamma line"
+            backend.send_text_sync(pasted)
+            snapshot = backend.delivery_snapshot_sync()
+            assert pasted in snapshot
+            assert adapter.submit_sentinel not in snapshot
+        finally:
+            await backend.close()
+
+    async def test_send_keys_sync_delivers_named_keys(
+        self, adapter: ConformanceAdapter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``send_keys_sync`` delivers named keys, and Enter submits."""
+        backend = adapter.make_backend(tmp_path, monkeypatch)
+        await backend.launch(adapter.launch_request(adapter.alive_command()))
+        try:
+            backend.send_keys_sync(list(adapter.sample_keys))
+            snapshot = backend.delivery_snapshot_sync()
+            for key in adapter.sample_keys:
+                assert adapter.key_marker(key) in snapshot
+            assert adapter.submit_sentinel not in snapshot
+            backend.send_keys_sync(["Enter"])
+            assert adapter.submit_sentinel in backend.delivery_snapshot_sync()
+        finally:
+            await backend.close()
+
+    async def test_paste_without_submit_sync_is_not_submitted(
+        self, adapter: ConformanceAdapter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``paste_without_submit_sync`` deposits a draft that is NOT submitted.
+
+        Single-line content sidesteps backend-specific newline encoding (tmux
+        maps paste newlines to CR); the invariant under test is that a paste
+        lands editable content and never carries a submit.
+        """
+        backend = adapter.make_backend(tmp_path, monkeypatch)
+        await backend.launch(adapter.launch_request(adapter.alive_command()))
+        try:
+            backend.paste_without_submit_sync("draft-marker-xyz")
+            snapshot = backend.delivery_snapshot_sync()
+            assert "draft-marker-xyz" in snapshot
+            assert adapter.submit_sentinel not in snapshot
+        finally:
+            await backend.close()
+
+    async def test_delivery_snapshot_sync_returns_empty_when_endpoint_gone(
+        self, adapter: ConformanceAdapter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``delivery_snapshot_sync`` degrades to ``""`` (never raises) once gone."""
+        backend = adapter.make_backend(tmp_path, monkeypatch)
+        await backend.launch(adapter.launch_request(adapter.alive_command()))
+        await backend.close()
+        assert backend.delivery_snapshot_sync() == ""
+
+    async def test_kill_session_sync_stops_the_endpoint(
+        self, adapter: ConformanceAdapter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``kill_session_sync`` hard-stops the session (liveness no longer ALIVE)."""
+        backend = adapter.make_backend(tmp_path, monkeypatch)
+        await backend.launch(adapter.launch_request(adapter.alive_command()))
+        backend.kill_session_sync()
+        assert await backend.liveness() != Liveness.ALIVE
+
     async def test_inner_exit_without_keep_alive_is_endpoint_gone(
         self, adapter: ConformanceAdapter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

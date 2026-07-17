@@ -66,6 +66,17 @@ class _FakeBackend(TerminalBackend):
         del ansi, scrollback
         return ""
 
+    def send_text_sync(self, text: str) -> None:
+        del text
+
+    def send_keys_sync(self, keys: Sequence[str]) -> None:
+        del keys
+
+    def paste_without_submit_sync(self, text: str) -> None:
+        del text
+
+    def kill_session_sync(self) -> None: ...
+
 
 def _force_posix(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make selection resolve as POSIX regardless of the test host."""

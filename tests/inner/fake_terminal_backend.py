@@ -161,9 +161,11 @@ class FakeBackend(TerminalBackend):
         # --- Recorded interactions (for test assertions) --------------------
         self.launched = False
         self.closed = False
+        self.killed = False
         self.launch_request: TerminalLaunchRequest | None = None
         self.sent_text: list[str] = []
         self.sent_keys: list[list[str]] = []
+        self.pasted_text: list[str] = []
         self.status_link_updates: list[str | None] = []
         self.detach_calls = 0
 
@@ -303,11 +305,47 @@ class FakeBackend(TerminalBackend):
     async def send_keys(self, keys: Sequence[str]) -> None:
         """Append each named key's marker to the screen; ``Enter`` submits."""
         self._require_endpoint()
+        self._apply_send_keys(keys)
+
+    def _apply_send_keys(self, keys: Sequence[str]) -> None:
+        """Shared send-keys state mutation (async and sync entry points)."""
         for key in keys:
             self._screen += key_marker(key)
             if key == "Enter":
                 self._screen += SUBMIT_SENTINEL
         self.sent_keys.append(list(keys))
+
+    # --------------------------------------------------- delivery surface (sync)
+    #
+    # The synchronous protocol :class:`~omnigent.inner.terminal.TerminalDelivery`
+    # drives. Each records into the same sink its async sibling uses, so a
+    # bridge/tool test can assert delivery regardless of which path it exercised.
+
+    def send_text_sync(self, text: str) -> None:
+        """Sync :meth:`send_text`: append literal *text* (non-submitting)."""
+        self._require_endpoint()
+        self._screen += text
+        self.sent_text.append(text)
+
+    def send_keys_sync(self, keys: Sequence[str]) -> None:
+        """Sync :meth:`send_keys`: append each key's marker; ``Enter`` submits."""
+        self._require_endpoint()
+        self._apply_send_keys(keys)
+
+    def paste_without_submit_sync(self, text: str) -> None:
+        """Paste *text* as a draft — never submits (no ``Enter`` marker).
+
+        Records into :attr:`pasted_text` so a test can prove a paste landed
+        without a submit, the delivery-dance invariant.
+        """
+        self._require_endpoint()
+        self._screen += text
+        self.pasted_text.append(text)
+
+    def kill_session_sync(self) -> None:
+        """Hard-stop this session: mark the endpoint gone and record the kill."""
+        self.killed = True
+        self._endpoint_alive = False
 
     async def capture(self, *, ansi: bool = False, scrollback: int = 0) -> str:
         """Snapshot the screen (scripted, else the accumulated screen)."""

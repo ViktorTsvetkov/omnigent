@@ -857,3 +857,125 @@ class TestPinCodexConfigModel:
         # read_codex_config_model resolves codex-home under the bridge dir.
         _pin_codex_config_model(home, "databricks-gpt-5-4-mini")
         assert read_codex_config_model(bridge_dir) == "databricks-gpt-5-4-mini"
+
+
+# ---------------------------------------------------------------------------
+# Windows spawn/transport enablement (#13): argv0 tagging + listen URL
+# ---------------------------------------------------------------------------
+
+
+class _StopSpawn(Exception):
+    """Sentinel raised by the fake spawn to short-circuit ``start`` post-argv."""
+
+
+async def _async_none(*_args: object, **_kwargs: object) -> None:
+    """Async stand-in returning ``None`` (skips the real codex --version spawn)."""
+    return
+
+
+async def _start_capturing_spawn(
+    server: CodexNativeAppServer,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    is_windows: bool,
+) -> dict[str, object]:
+    """Run ``server.start`` far enough to capture the app-server spawn argv.
+
+    Patches the platform flag, skips the real codex version probe + registry
+    reconcile, and replaces the spawn with a capture-then-raise fake so the
+    argv0/listen logic runs for real without launching anything.
+    """
+    import omnigent.codex_native_app_server as mod
+
+    monkeypatch.setattr(mod, "IS_WINDOWS", is_windows)
+    monkeypatch.setattr(mod, "_codex_cli_version", _async_none)
+    monkeypatch.setattr(mod, "reconcile_codex_native_process_registry", lambda *a, **k: None)
+    captured: dict[str, object] = {}
+
+    async def fake_spawn(*argv: object, **kwargs: object) -> object:
+        captured["argv"] = list(argv)
+        captured["executable"] = kwargs.get("executable")
+        raise _StopSpawn()
+
+    monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_spawn)
+    with pytest.raises(_StopSpawn):
+        await server.start()
+    return captured
+
+
+def _make_server(tmp_path: Path, *, listen_url: str | None) -> CodexNativeAppServer:
+    """Build an app-server for spawn-argv capture with an explicit listen URL."""
+    codex_home = tmp_path / "codex-home"
+    bridge_dir = tmp_path / "bridge"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    server = _test_app_server(tmp_path, codex_home, bridge_dir, workspace)
+    server.listen_url = listen_url
+    return server
+
+
+async def test_start_windows_uses_plain_untagged_argv0(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Windows the app-server spawns with a plain argv[0] (no embedded tag).
+
+    The POSIX argv[0]-tag trick leaks the tag as real args under CreateProcess
+    and codex clap-errors; on Windows the crash-reap registry is inert anyway, so
+    argv[0] is just the executable path.
+    """
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "real-home"))
+    (tmp_path / "real-home").mkdir()
+    server = _make_server(tmp_path, listen_url="ws://127.0.0.1:9999")
+    captured = await _start_capturing_spawn(server, monkeypatch, is_windows=True)
+    argv = captured["argv"]
+    assert argv[0] == server.codex_path
+    assert "omnigent_crash_teardown_tag" not in argv[0]
+    assert captured["executable"] == server.codex_path
+
+
+async def test_start_posix_uses_tagged_argv0(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POSIX keeps the byte-identical tagged argv[0] (crash-reap by cmdline)."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "real-home"))
+    (tmp_path / "real-home").mkdir()
+    server = _make_server(tmp_path, listen_url="ws://127.0.0.1:9999")
+    captured = await _start_capturing_spawn(server, monkeypatch, is_windows=False)
+    argv0 = captured["argv"][0]
+    assert argv0.startswith(Path(server.codex_path).name + " ")
+    assert "omnigent_crash_teardown_tag=" in argv0
+
+
+async def test_start_windows_falls_back_to_ws_listen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Windows server built without a listen URL falls back to loopback ws://."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "real-home"))
+    (tmp_path / "real-home").mkdir()
+    server = _make_server(tmp_path, listen_url=None)
+    captured = await _start_capturing_spawn(server, monkeypatch, is_windows=True)
+    assert isinstance(server.listen_url, str)
+    assert server.listen_url.startswith("ws://127.0.0.1:")
+    assert captured["argv"][3] == server.listen_url  # --listen value
+    assert "unix://" not in captured["argv"][3]
+
+
+async def test_start_posix_falls_back_to_unix_listen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POSIX without a listen URL keeps the byte-identical unix:// fallback."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "real-home"))
+    (tmp_path / "real-home").mkdir()
+    server = _make_server(tmp_path, listen_url=None)
+    captured = await _start_capturing_spawn(server, monkeypatch, is_windows=False)
+    assert server.listen_url is None
+    assert captured["argv"][3] == f"unix://{server.socket_path}"
+
+
+def test_free_loopback_ws_url_is_valid() -> None:
+    """The Windows listen fallback yields a ws://127.0.0.1:<port> URL."""
+    from omnigent.codex_native_app_server import _free_loopback_ws_url
+
+    url = _free_loopback_ws_url()
+    assert url.startswith("ws://127.0.0.1:")
+    assert 0 < int(url.rsplit(":", 1)[1]) < 65536

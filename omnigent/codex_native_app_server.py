@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import shlex
+import socket
 import sys
 import tempfile
 import uuid
@@ -22,6 +23,7 @@ import websockets
 if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.codex_native_bridge import write_policy_hook_config
 from omnigent.codex_native_process_registry import (
     CodexNativeProcessOwnerLock,
@@ -261,6 +263,20 @@ def _inject_mcp_server_config(
     section = _codex_mcp_server_config_section(bridge_dir, python_executable)
     rendered = f"{updated}\n\n{section}" if updated else section
     config_path.write_text(rendered, encoding="utf-8")
+
+
+def _free_loopback_ws_url() -> str:
+    """Return a ``ws://127.0.0.1:<free port>`` app-server listen URL.
+
+    Used as the Windows fallback when a :class:`CodexNativeAppServer` is
+    constructed without an explicit ``listen_url`` (the codex CLI/runner paths
+    always set one). Binds a throwaway loopback socket to let the OS pick a free
+    ephemeral port, then releases it — the small reuse race is acceptable for a
+    per-session app-server and mirrors how the runner picks its ws port.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return f"ws://127.0.0.1:{probe.getsockname()[1]}"
 
 
 class CodexAppServerClient:
@@ -569,12 +585,29 @@ class CodexNativeAppServer:
                     ap_auth_headers=self.ap_auth_headers or {},
                 )
         reconcile_codex_native_process_registry()
+        # On Windows, a default ``unix://`` listener is unreachable by our client
+        # (codex can listen on AF_UNIX, but CPython's asyncio has no AF_UNIX
+        # client there), so fall back to a loopback ``ws://`` listener instead —
+        # authless on loopback (verified against codex 0.144.4). The codex paths
+        # already set ``listen_url`` to ``ws://``; this only guards a server
+        # constructed without one on Windows. POSIX is byte-identical.
+        if IS_WINDOWS and not self.listen_url:
+            self.listen_url = _free_loopback_ws_url()
         resolved_listen = self.listen_url or f"unix://{self.socket_path}"
         self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
         tagged_argv0 = (
             f"{Path(self.codex_path).name} "
             f"{codex_native_session_tag_cmdline_arg(self.process_registry_tag)}"
         )
+        # The tagged argv[0] is a POSIX-only trick: the crash-reap registry finds
+        # leftover children by scanning ``/proc``/``ps`` cmdline for the tag. On
+        # Windows it is BOTH unsafe — CreateProcess re-parses the command line, so
+        # an argv[0] with an embedded space leaks the tag as real arguments and
+        # codex clap-errors ("Usage: codex ...") — AND pointless: the registry is
+        # inert on Windows (its flock, ``/proc``/``ps`` scan, and killpg teardown
+        # are all POSIX-only, so nothing ever reads the tag). Spawn a plain argv[0].
+        if IS_WINDOWS:
+            tagged_argv0 = self.codex_path
         argv = [
             tagged_argv0,
             "app-server",

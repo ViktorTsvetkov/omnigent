@@ -280,9 +280,7 @@ def _multi_flag(tokens: list[str], name: str) -> list[str]:
     the fake collects all of them rather than just the first (:func:`_flag`).
     """
     return [
-        tokens[i + 1]
-        for i, token in enumerate(tokens)
-        if token == name and i + 1 < len(tokens)
+        tokens[i + 1] for i, token in enumerate(tokens) if token == name and i + 1 < len(tokens)
     ]
 
 
@@ -420,6 +418,14 @@ def _handle_server(state_dir: str, session: str) -> int:
         return 1
     state = _load(state_dir, session) or _blank_state(session)
     state["server_running"] = True
+    _save(state_dir, session, state)
+    return 0
+
+
+def _handle_server_stop(state_dir: str, session: str) -> int:
+    """Handle ``server stop`` by marking the named server stopped."""
+    state = _load(state_dir, session) or _blank_state(session)
+    state["server_running"] = False
     _save(state_dir, session, state)
     return 0
 
@@ -782,6 +788,8 @@ def main(argv: list[str]) -> int:
     # ``herdr --session <s> server`` — bring up the session's headless server. A
     # named session's server does NOT auto-start; until it does, socket verbs
     # below fail with the OS NotFound (see _require_server).
+    if command == "server" and rest[1:] == ["stop"]:
+        return _handle_server_stop(state_dir, session)
     if command == "server":
         return _handle_server(state_dir, session)
 

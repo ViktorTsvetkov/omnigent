@@ -57,6 +57,7 @@ from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.cost_plan import (
     COST_CONTROL_LABEL_NAMESPACE,
@@ -6273,7 +6274,9 @@ async def _validate_session_workspace(
     # single-condition edit: insertion cannot express an inline raise's guard.)
     from pathlib import PureWindowsPath
 
-    if not workspace.startswith("/") and not PureWindowsPath(workspace).is_absolute():
+    if not workspace.startswith("/") and not (
+        IS_WINDOWS and PureWindowsPath(workspace).is_absolute()
+    ):
         raise OmnigentError(
             "workspace must be an absolute path starting with /",
             code=ErrorCode.INVALID_INPUT,

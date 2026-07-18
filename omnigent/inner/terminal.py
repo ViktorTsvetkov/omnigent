@@ -2295,6 +2295,7 @@ class HerdrBackend(TerminalBackend):
         self._workspace_id: str | None = None
         self._tab_id: str | None = None
         self._pane_id: str | None = None
+        self._closed = False
         # Last plain snapshot seen by :meth:`busy_state`, for the output-diff
         # corroboration heuristic (native ``agent_status`` reads idle during long
         # foreground tool calls, so a changing screen overrides a native idle).
@@ -2513,7 +2514,7 @@ class HerdrBackend(TerminalBackend):
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await proc.communicate(stdin_data)
+        _, stderr = await self._communicate(proc, args, stdin_data)
         if proc.returncode != 0:
             raise RuntimeError(
                 f"herdr command failed: {' '.join(args)}: "
@@ -2528,13 +2529,38 @@ class HerdrBackend(TerminalBackend):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        stdout, stderr = await self._communicate(proc, args)
         if proc.returncode != 0:
             raise RuntimeError(
                 f"herdr command failed: {' '.join(args)}: "
                 f"{self._normalize_newlines(stderr.decode(errors='replace')).strip()}"
             )
         return stdout.decode(errors="replace")
+
+    async def _communicate(
+        self,
+        proc: asyncio.subprocess.Process,
+        args: Sequence[str],
+        stdin_data: bytes | None = None,
+    ) -> tuple[bytes, bytes]:
+        """Communicate with a herdr child within the CLI timeout."""
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(stdin_data), timeout=self._CLI_TIMEOUT_S
+            )
+            return stdout or b"", stderr or b""
+        except asyncio.TimeoutError as exc:
+            with contextlib.suppress(ProcessLookupError):
+                proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=self._CLI_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                await proc.wait()
+            raise RuntimeError(
+                f"herdr command timed out after {self._CLI_TIMEOUT_S:.0f}s: {' '.join(args)}"
+            ) from exc
 
     async def _run_json(self, *args: str) -> dict[str, Any]:  # type: ignore[explicit-any]
         """Run a herdr socket-API command and parse its JSON envelope.
@@ -2688,6 +2714,7 @@ class HerdrBackend(TerminalBackend):
             the session's headless server cannot be started (see
             :meth:`_ensure_server_running`).
         """
+        self._closed = False
         # A named session's server does not auto-start; bring it up before the
         # first socket-API verb (else ``workspace list`` fails with an OS NotFound).
         await self._ensure_server_running()
@@ -2792,9 +2819,7 @@ class HerdrBackend(TerminalBackend):
         return [*self._base_argv(), *self._pane_argv("get")]
 
     @classmethod
-    def _parse_envelope(
-        cls, stdout: bytes, stderr: bytes = b""
-    ) -> dict[str, Any] | None:  # type: ignore[explicit-any]
+    def _parse_envelope(cls, stdout: bytes, stderr: bytes = b"") -> dict[str, Any] | None:  # type: ignore[explicit-any]
         """Parse a herdr CLI JSON envelope from stdout, falling back to stderr.
 
         herdr prints a success envelope on stdout and — for a failed command —
@@ -2855,6 +2880,8 @@ class HerdrBackend(TerminalBackend):
         stderr is captured (not discarded) because a dead pane's error envelope
         can ride there.
         """
+        if self._closed:
+            return Liveness.ENDPOINT_GONE
         try:
             proc = await asyncio.create_subprocess_exec(
                 *self._pane_get_argv(),
@@ -2870,6 +2897,8 @@ class HerdrBackend(TerminalBackend):
 
     def liveness_sync(self) -> Liveness:
         """Synchronous :meth:`liveness` for the daemon idle-watcher thread."""
+        if self._closed:
+            return Liveness.ENDPOINT_GONE
         try:
             proc = subprocess.run(
                 self._pane_get_argv(),
@@ -2882,17 +2911,22 @@ class HerdrBackend(TerminalBackend):
         return self._interpret_pane_get(proc.returncode, proc.stdout, proc.stderr)
 
     async def close(self) -> None:
-        """Close this terminal's workspace, then reap same-label husks.
+        """Close this terminal's workspaces, then stop its dedicated server.
 
         Idempotent and never raises: a workspace already gone (orphan-reaped, or
         a crashed server) closes quietly. The reap sweep retires any leftover
         same-label workspaces of THIS session (scope: same session + same label —
-        never another session, never ``default``).
+        never another session, never ``default``). The server remains live until
+        workspace cleanup completes so missing workspaces retain their precise
+        liveness signal; it is then stopped to avoid accumulating idle servers.
         """
         if self._workspace_id is not None:
             with contextlib.suppress(RuntimeError):
                 await self._run("workspace", "close", self._workspace_id)
         await self._reap_labeled_workspaces()
+        with contextlib.suppress(RuntimeError):
+            await self._run("server", "stop")
+        self._closed = True
 
     async def _reap_labeled_workspaces(self, *, exclude: str | None = None) -> None:
         """Close every same-label workspace of this session (orphan reaping).

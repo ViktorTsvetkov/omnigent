@@ -18,10 +18,12 @@ to ticket #12; the fake is structured so that opt-in needs no rewrite.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -106,6 +108,26 @@ async def test_close_makes_endpoint_gone(herdr_env: _HerdrEnv) -> None:
     await backend.close()
     assert await backend.liveness() == Liveness.ENDPOINT_GONE
     assert backend.liveness_sync() == Liveness.ENDPOINT_GONE
+    assert herdr_env.load_state(backend)["server_running"] is False
+
+
+async def test_async_command_timeout_terminates_child(herdr_env: _HerdrEnv) -> None:
+    """A hanging herdr CLI is terminated and reported actionably."""
+    backend = herdr_env.make_backend()
+    backend._CLI_TIMEOUT_S = 0.01
+    proc = Mock()
+
+    async def hang(*_: object) -> tuple[bytes, bytes]:
+        await asyncio.Event().wait()
+        return b"", b""
+
+    proc.communicate = AsyncMock(side_effect=hang)
+    proc.wait = AsyncMock(return_value=0)
+
+    with pytest.raises(RuntimeError, match=r"herdr command timed out after 0s: pane list"):
+        await backend._communicate(proc, ("pane", "list"))
+
+    proc.terminate.assert_called_once_with()
 
 
 async def test_inner_exit_is_endpoint_gone_no_keep_alive(herdr_env: _HerdrEnv) -> None:

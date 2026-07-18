@@ -1,0 +1,362 @@
+"""Native Windows terminal backend built on ConPTY via pywinpty."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import threading
+import time
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any, ClassVar
+
+from .terminal import (
+    TERMINAL_TRANSPORT_PTY,
+    Liveness,
+    TerminalBackend,
+    TerminalBackendCapabilities,
+    TerminalLaunchRequest,
+    register_terminal_backend,
+)
+
+
+class ConptyBackend(TerminalBackend):
+    """Host one native Windows process in an isolated ConPTY."""
+
+    name = "conpty"
+    capabilities = TerminalBackendCapabilities(
+        native_popup=False,
+        start_on_attach=False,
+        native_busy_state=False,
+        push_events=True,
+        control_mode_attach=False,
+        attach_transports=frozenset({TERMINAL_TRANSPORT_PTY}),
+        status_line=False,
+    )
+    platforms = frozenset({"windows"})
+
+    _KEYS: ClassVar[dict[str, str]] = {
+        "Enter": "\r",
+        "Escape": "\x1b",
+        "Tab": "\t",
+        "BTab": "\x1b[Z",
+        "BSpace": "\x7f",
+        "Backspace": "\x7f",
+        "Up": "\x1b[A",
+        "Down": "\x1b[B",
+        "Right": "\x1b[C",
+        "Left": "\x1b[D",
+        "Home": "\x1b[H",
+        "End": "\x1b[F",
+        "PPage": "\x1b[5~",
+        "PageUp": "\x1b[5~",
+        "NPage": "\x1b[6~",
+        "PageDown": "\x1b[6~",
+        "IC": "\x1b[2~",
+        "Insert": "\x1b[2~",
+        "DC": "\x1b[3~",
+        "Delete": "\x1b[3~",
+    }
+
+    @classmethod
+    def ensure_available(cls) -> None:
+        """Fail loudly when the Windows ConPTY binding is unavailable."""
+        try:
+            import winpty  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "The conpty terminal backend requires pywinpty on Windows. "
+                "Install omnigent with its Windows runtime dependencies."
+            ) from exc
+
+    @classmethod
+    def construct_for_instance(cls, *, socket_path: Path, target: str) -> TerminalBackend:
+        return cls(socket_path=socket_path, target=target)
+
+    def __init__(self, *, socket_path: Path, target: str = "main") -> None:
+        self._socket_path = socket_path
+        self._target = target
+        self._process: Any | None = None
+        self._screen: Any | None = None
+        self._stream: Any | None = None
+        self._reader: threading.Thread | None = None
+        self._lock = threading.RLock()
+        self._changed = threading.Condition(self._lock)
+        self._output_generation = 0
+        self._handshake_complete = False
+        self._last_output_at = 0.0
+        self._eof = False
+        self._closed = False
+        self._keep_alive_after_exit = False
+        self._reader_error: BaseException | None = None
+
+    async def launch(self, request: TerminalLaunchRequest) -> None:
+        await asyncio.to_thread(self._launch_sync, request)
+
+    def _launch_sync(self, request: TerminalLaunchRequest) -> None:
+        self.ensure_available()
+        import pyte
+        import winpty
+
+        cols, rows = request.size
+        screen = pyte.HistoryScreen(cols, rows, history=max(1, request.scrollback))
+        process = winpty.PtyProcess.spawn(
+            request.command,
+            cwd=request.cwd,
+            env=request.env,
+            dimensions=(rows, cols),
+        )
+        with self._lock:
+            if self._process is not None and not self._closed:
+                process.close(force=True)
+                raise RuntimeError("ConPTY terminal is already running")
+            self._process = process
+            self._screen = screen
+            self._stream = pyte.Stream(screen)
+            self._closed = False
+            self._keep_alive_after_exit = request.keep_alive_after_exit
+            self._reader_error = None
+            self._output_generation = 0
+            self._handshake_complete = False
+            self._last_output_at = 0.0
+            self._eof = False
+            self._reader = threading.Thread(
+                target=self._read_output,
+                name=f"omnigent-conpty-{self._target}",
+                daemon=True,
+            )
+            self._reader.start()
+            self._wait_for_output_locked(0)
+
+    def _read_output(self) -> None:
+        import winpty
+
+        while True:
+            with self._lock:
+                process = self._process
+                closed = self._closed
+            if process is None or closed:
+                return
+            try:
+                chunk = process.read(4096)
+            except EOFError:
+                with self._changed:
+                    self._eof = True
+                    self._changed.notify_all()
+                return
+            except (OSError, RuntimeError, winpty.WinptyError) as exc:
+                with self._changed:
+                    if not self._closed and process.isalive():
+                        self._reader_error = exc
+                    else:
+                        self._eof = True
+                    self._changed.notify_all()
+                return
+            if chunk:
+                with self._changed:
+                    handshake = "\x1b[c" in chunk
+                    if handshake:
+                        # ConPTY asks its host for primary device attributes
+                        # before releasing the child's normal output stream.
+                        process.write("\x1b[?1;2c")
+                        self._handshake_complete = True
+                    if self._stream is not None:
+                        self._stream.feed(chunk)
+                        if self._handshake_complete and not handshake:
+                            self._output_generation += 1
+                            self._last_output_at = time.monotonic()
+                        self._changed.notify_all()
+
+    async def liveness(self) -> Liveness:
+        return self.liveness_sync()
+
+    def liveness_sync(self) -> Liveness:
+        with self._lock:
+            process = self._process
+            if self._closed or process is None:
+                return Liveness.ENDPOINT_GONE
+            if self._reader_error is not None:
+                return Liveness.UNKNOWN
+            try:
+                alive = process.isalive()
+            except (OSError, RuntimeError):
+                return Liveness.UNKNOWN
+            if alive and not self._eof:
+                return Liveness.ALIVE
+            return Liveness.INNER_EXITED if self._keep_alive_after_exit else Liveness.ENDPOINT_GONE
+
+    async def close(self) -> None:
+        await asyncio.to_thread(self._close_sync)
+
+    def _close_sync(self) -> None:
+        with self._lock:
+            process = self._process
+            self._closed = True
+        if process is not None:
+            with contextlib.suppress(Exception):
+                process.close(force=True)
+
+    async def send_text(self, text: str) -> None:
+        await asyncio.to_thread(self.send_text_sync, text)
+
+    def send_text_sync(self, text: str) -> None:
+        # Bracketed paste keeps embedded newlines as editable content instead of
+        # turning each line into a separate submission in terminal applications.
+        self._write(f"\x1b[200~{text}\x1b[201~")
+
+    async def send_keys(self, keys: Sequence[str]) -> None:
+        await asyncio.to_thread(self.send_keys_sync, keys)
+
+    def send_keys_sync(self, keys: Sequence[str]) -> None:
+        encoded = "".join(sequence for key in keys if (sequence := self._translate_key(key)))
+        if encoded:
+            self._write(encoded)
+
+    def paste_without_submit_sync(self, text: str) -> None:
+        self.send_text_sync(text)
+
+    def kill_session_sync(self) -> None:
+        with self._lock:
+            process = self._process
+            self._closed = True
+        if process is None:
+            raise RuntimeError("ConPTY terminal is not running")
+        try:
+            process.close(force=True)
+        except Exception as exc:
+            raise RuntimeError(f"failed to stop ConPTY terminal: {exc}") from exc
+
+    async def capture(self, *, ansi: bool = False, scrollback: int = 0) -> str:
+        return self.capture_sync(ansi=ansi, scrollback=scrollback)
+
+    def capture_sync(self, *, ansi: bool = False, scrollback: int = 0) -> str:
+        with self._lock:
+            if self.liveness_sync() == Liveness.ENDPOINT_GONE:
+                raise RuntimeError("ConPTY terminal endpoint is gone")
+            screen = self._screen
+            if screen is None:
+                raise RuntimeError("ConPTY terminal has not been launched")
+            rows = list(screen.history.top)[-max(0, scrollback) :] if scrollback else []
+            rows.extend(screen.buffer[y] for y in range(screen.lines))
+            rendered = [self._render_row(row, ansi=ansi) for row in rows]
+        return "\n".join(rendered).rstrip()
+
+    def resize(self, cols: int, rows: int) -> None:
+        """Resize both the native pseudoconsole and its server-side screen."""
+        if cols <= 0 or rows <= 0:
+            raise ValueError("terminal dimensions must be positive")
+        with self._lock:
+            process = self._require_live_process()
+            process.setwinsize(rows, cols)
+            self._screen.resize(lines=rows, columns=cols)
+
+    def _write(self, data: str) -> None:
+        with self._changed:
+            process = self._require_live_process()
+            generation = self._output_generation
+            try:
+                process.write(data)
+            except (EOFError, OSError, RuntimeError) as exc:
+                raise RuntimeError(f"failed to write to ConPTY terminal: {exc}") from exc
+            self._wait_for_output_locked(generation)
+
+    def _wait_for_output_locked(self, generation: int) -> None:
+        """Wait until the reader incorporates output produced by an operation."""
+        changed = self._changed.wait_for(
+            lambda: (
+                self._output_generation > generation
+                or self._eof
+                or self._reader_error is not None
+                or self._closed
+            ),
+            timeout=2.0,
+        )
+        if not changed:
+            return
+        # One PTY write can arrive as many tiny reads. Wait until the reader has
+        # drained a complete burst so capture observes the resulting frame.
+        while not (self._eof or self._reader_error is not None or self._closed):
+            quiet_for = time.monotonic() - self._last_output_at
+            if quiet_for >= 0.02:
+                return
+            self._changed.wait(timeout=0.02 - quiet_for)
+
+    def _require_live_process(self) -> Any:
+        process = self._process
+        if self._closed or process is None or not process.isalive():
+            raise RuntimeError("ConPTY terminal endpoint is gone")
+        return process
+
+    @classmethod
+    def _translate_key(cls, key: str) -> str | None:
+        if key in cls._KEYS:
+            return cls._KEYS[key]
+        match = __import__("re").fullmatch(r"C-(.)", key, flags=__import__("re").IGNORECASE)
+        if match:
+            char = match.group(1).upper()
+            return chr(ord(char) & 0x1F)
+        match = __import__("re").fullmatch(r"M-(.)", key, flags=__import__("re").IGNORECASE)
+        if match:
+            return "\x1b" + match.group(1)
+        if len(key) == 1:
+            return key
+        return None
+
+    @staticmethod
+    def _render_row(row: Any, *, ansi: bool) -> str:
+        cells = [row[x] for x in sorted(row)]
+        if not ansi:
+            return "".join(cell.data for cell in cells).rstrip()
+        output: list[str] = []
+        active: tuple[Any, ...] | None = None
+        for cell in cells:
+            style = (
+                cell.fg,
+                cell.bg,
+                cell.bold,
+                cell.italics,
+                cell.underscore,
+                cell.strikethrough,
+                cell.reverse,
+            )
+            if style != active:
+                output.append(ConptyBackend._sgr(style))
+                active = style
+            output.append(cell.data)
+        if active is not None:
+            output.append("\x1b[0m")
+        return "".join(output).rstrip()
+
+    @staticmethod
+    def _sgr(style: tuple[Any, ...]) -> str:
+        fg, bg, bold, italics, underscore, strikethrough, reverse = style
+        codes = ["0"]
+        codes.extend(
+            code
+            for enabled, code in (
+                (bold, "1"),
+                (italics, "3"),
+                (underscore, "4"),
+                (reverse, "7"),
+                (strikethrough, "9"),
+            )
+            if enabled
+        )
+        colors = {
+            "black": 0,
+            "red": 1,
+            "green": 2,
+            "brown": 3,
+            "blue": 4,
+            "magenta": 5,
+            "cyan": 6,
+            "white": 7,
+        }
+        if fg in colors:
+            codes.append(str(30 + colors[fg]))
+        if bg in colors:
+            codes.append(str(40 + colors[bg]))
+        return f"\x1b[{';'.join(codes)}m"
+
+
+register_terminal_backend(ConptyBackend)

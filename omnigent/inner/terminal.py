@@ -3299,6 +3299,8 @@ def register_terminal_backend(backend_cls: type[TerminalBackend]) -> None:
 
 register_terminal_backend(TmuxBackend)
 register_terminal_backend(HerdrBackend)
+if "omnigent.inner.conpty_backend" not in __import__("sys").modules:
+    from . import conpty_backend as _conpty_backend  # noqa: F401
 
 
 # Platform → default backend name used when nothing is explicitly selected.

@@ -23,6 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "tzdata ; sys_platform == 'win32'",
+    "pywinpty>=3,<4 ; sys_platform == 'win32'",
     # SDK path-deps, version-locked: the three packages release together at
     # one version, so a published `omnigent==X` must resolve the SDK wheels
     # built alongside it (release-omnigent.yml verifies these pins match the
@@ -78,6 +79,7 @@ dependencies = [
     # path, so skip them there to avoid shipping an unusable dependency.
     "pexpect>=4.9,<5; platform_system != 'Windows'",
     "pyte>=0.8,<1; platform_system != 'Windows'",
+    "pyte>=0.8,<1; sys_platform == 'win32'",
     "pydantic>=2.0,<3",
     "sqlalchemy>=2.0,<3",
     # Client-side compression for opaque text columns (omnigent/db/compression.py),

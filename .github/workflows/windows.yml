@@ -8,6 +8,7 @@ name: Windows (native)
 # Windows-support unit tests) must pass.
 
 on:
+  workflow_dispatch:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore: ['web/**', 'tests/e2e_ui/**']
@@ -30,6 +31,44 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # This is the hard Windows backend gate. Wiring it into upstream required
+  # checks is deferred to the upstream maintainer.
+  windows-herdr-backend:
+    name: Windows herdr backend
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Herdr adapter and backend conformance (hard)
+        run: >-
+          uv run pytest
+          tests/inner/test_terminal_herdr_lifecycle.py
+          tests/inner/test_terminal_herdr_io.py
+          tests/inner/test_terminal_backend_conformance_herdr.py
+          tests/inner/test_terminal_backend_conformance_fake.py
+          tests/inner/test_terminal_backend_selection.py
+          tests/inner/test_terminal.py
+          tests/terminals/test_snapshot_bridge.py
+          tests/server/routes/test_terminal_attach.py
+          tests/cli/test_codex_native_windows.py
+          tests/cli/test_claude_native_windows.py
+          -q
+
   windows-smoke:
     name: Windows smoke + unit
     if: ${{ !github.event.pull_request.draft }}

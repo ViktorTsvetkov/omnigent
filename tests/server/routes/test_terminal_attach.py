@@ -679,6 +679,7 @@ async def test_attach_terminal_local_fallback_selects_snapshot_for_herdr(
     assert calls == [(backend, True)]
 
 
+@pytest.mark.posix_only
 async def test_attach_terminal_local_fallback_spawns_tmux(
     app: FastAPI,
     server_registry: TerminalRegistry,

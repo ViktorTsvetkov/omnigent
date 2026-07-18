@@ -27,7 +27,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from omnigent.entities import Conversation, SessionPermission
-from omnigent.inner.terminal import TerminalInstance
+from omnigent.inner.terminal import HerdrBackend, TerminalInstance
 from omnigent.runtime import (
     _globals,
     set_runner_client,
@@ -636,6 +636,47 @@ async def test_attach_terminal_local_fallback_missing_closes_4404(
             ws.receive_bytes()
 
     assert exc_info.value.code == 4404
+
+
+async def test_attach_terminal_local_fallback_selects_snapshot_for_herdr(
+    app: FastAPI,
+    server_registry: TerminalRegistry,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The route dispatches herdr's advertised polling transport."""
+    instance = _make_running_instance("claude", "s1", tmp_path)
+    backend = object()
+    instance._backend = backend  # type: ignore[assignment]
+    monkeypatch.setattr(
+        type(instance),
+        "backend_capabilities",
+        property(lambda self: HerdrBackend.capabilities),
+    )
+    monkeypatch.setattr(type(instance), "terminal_backend", property(lambda self: backend))
+
+    async def is_alive() -> bool:
+        return True
+
+    instance.is_alive = is_alive  # type: ignore[method-assign]
+    _seed_registry(server_registry, "conv_snapshot", [instance])
+    calls: list[tuple[object, bool]] = []
+
+    async def fake_snapshot_bridge(websocket: object, *, backend: object, read_only: bool) -> None:
+        calls.append((backend, read_only))
+        await websocket.close()  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.terminal_attach.bridge_snapshot_to_websocket",
+        fake_snapshot_bridge,
+    )
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_snapshot/resources/terminals/terminal_claude_s1/attach?read_only=true"
+    ):
+        pass
+
+    assert calls == [(backend, True)]
 
 
 async def test_attach_terminal_local_fallback_spawns_tmux(

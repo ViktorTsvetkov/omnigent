@@ -66,7 +66,10 @@ _TMUX_CONVERSATION_LINK_OPTION = "@omnigent-conversation-link"
 # so they are interchangeable per attach.
 TERMINAL_TRANSPORT_PTY = "pty"
 TERMINAL_TRANSPORT_CONTROL = "control"
-_VALID_TERMINAL_TRANSPORTS = frozenset({TERMINAL_TRANSPORT_PTY, TERMINAL_TRANSPORT_CONTROL})
+TERMINAL_TRANSPORT_SNAPSHOT = "snapshot"
+_VALID_TERMINAL_TRANSPORTS = frozenset(
+    {TERMINAL_TRANSPORT_PTY, TERMINAL_TRANSPORT_CONTROL, TERMINAL_TRANSPORT_SNAPSHOT}
+)
 # Values that select the PTY path in the config file, beyond the canonical
 # ``pty`` name — the common falsy spellings so ``transport: false`` / ``: off``
 # reads as PTY. Any other value (including ``control`` and truthy spellings)
@@ -169,6 +172,7 @@ def resolve_terminal_transport(
     *,
     override: str | None = None,
     spec_transport: str | None = None,
+    backend_capabilities: TerminalBackendCapabilities | None = None,
 ) -> str:
     """Pick the web-terminal attach transport for one attach.
 
@@ -189,10 +193,27 @@ def resolve_terminal_transport(
     :param spec_transport: The terminal spec's declared transport, or ``None``.
     :returns: ``"control"`` or ``"pty"``.
     """
+    advertised = (
+        backend_capabilities.attach_transports
+        if backend_capabilities is not None
+        else frozenset({TERMINAL_TRANSPORT_CONTROL, TERMINAL_TRANSPORT_PTY})
+    )
     for candidate in (override, spec_transport):
-        if candidate is not None and candidate.strip().lower() in _VALID_TERMINAL_TRANSPORTS:
-            return candidate.strip().lower()
-    return _global_terminal_transport_default()
+        if candidate is not None:
+            normalized = candidate.strip().lower()
+            if normalized in _VALID_TERMINAL_TRANSPORTS and normalized in advertised:
+                return normalized
+    configured = _global_terminal_transport_default()
+    if configured in advertised:
+        return configured
+    for fallback in (
+        TERMINAL_TRANSPORT_CONTROL,
+        TERMINAL_TRANSPORT_PTY,
+        TERMINAL_TRANSPORT_SNAPSHOT,
+    ):
+        if fallback in advertised:
+            return fallback
+    raise RuntimeError("terminal backend advertises no web attach transports")
 
 
 _TMUX_START_ON_ATTACH_CHANNEL = "omnigent-start-on-attach"
@@ -955,6 +976,11 @@ class TerminalBackendCapabilities:
     """The backend offers a control-mode attach transport in addition to a
     PTY attach (tmux ``-C``)."""
 
+    attach_transports: frozenset[str] = field(
+        default_factory=lambda: frozenset({TERMINAL_TRANSPORT_PTY})
+    )
+    """Web attach transports the backend can host."""
+
     status_line: bool = False
     """The backend has a host status line that can carry the cosmetic
     conversation link (tmux's status-left). Where ``False``,
@@ -1476,6 +1502,7 @@ class TmuxBackend(TerminalBackend):
         native_busy_state=False,
         push_events=False,
         control_mode_attach=True,
+        attach_transports=frozenset({TERMINAL_TRANSPORT_CONTROL, TERMINAL_TRANSPORT_PTY}),
         status_line=True,
     )
     # tmux is POSIX-only; native Windows uses a different backend, selected by
@@ -2117,6 +2144,7 @@ class HerdrBackend(TerminalBackend):
         push_events=False,
         # No control-mode attach transport is offered by the CLI adapter.
         control_mode_attach=False,
+        attach_transports=frozenset({TERMINAL_TRANSPORT_SNAPSHOT}),
         # No host status line to carry the cosmetic conversation link, so
         # :meth:`set_status_link` stays the inherited no-op (the link is
         # droppable — the web UI is the primary surface).
@@ -3822,6 +3850,11 @@ class TerminalInstance:
         platform-driven.
         """
         return self._backend.capabilities
+
+    @property
+    def terminal_backend(self) -> TerminalBackend:
+        """Return the backend for capability-driven attach machinery."""
+        return self._backend
 
     @property
     def delivery_target(self) -> str:

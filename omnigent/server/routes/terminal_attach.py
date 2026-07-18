@@ -89,6 +89,7 @@ from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
+from omnigent.terminals.snapshot_bridge import bridge_snapshot_to_websocket
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -242,6 +243,7 @@ def create_terminal_attach_router(
 
         from omnigent.inner.terminal import (
             TERMINAL_TRANSPORT_CONTROL,
+            TERMINAL_TRANSPORT_SNAPSHOT,
             resolve_terminal_transport,
         )
         from omnigent.runtime import telemetry
@@ -249,6 +251,7 @@ def create_terminal_attach_router(
         resolved_transport = resolve_terminal_transport(
             override=transport,
             spec_transport=entry.instance.terminal_transport,
+            backend_capabilities=entry.instance.backend_capabilities,
         )
         with telemetry.span(
             "terminal.attach",
@@ -260,17 +263,24 @@ def create_terminal_attach_router(
                 "terminal.transport": resolved_transport,
             },
         ):
-            bridge = (
-                bridge_tmux_control_to_websocket
-                if resolved_transport == TERMINAL_TRANSPORT_CONTROL
-                else bridge_tmux_pty_to_websocket
-            )
-            await bridge(
-                websocket,
-                socket_path=str(entry.instance.socket_path),
-                tmux_target=entry.instance.tmux_target,
-                read_only=read_only,
-            )
+            if resolved_transport == TERMINAL_TRANSPORT_SNAPSHOT:
+                await bridge_snapshot_to_websocket(
+                    websocket,
+                    backend=entry.instance.terminal_backend,
+                    read_only=read_only,
+                )
+            else:
+                bridge = (
+                    bridge_tmux_control_to_websocket
+                    if resolved_transport == TERMINAL_TRANSPORT_CONTROL
+                    else bridge_tmux_pty_to_websocket
+                )
+                await bridge(
+                    websocket,
+                    socket_path=str(entry.instance.socket_path),
+                    tmux_target=entry.instance.tmux_target,
+                    read_only=read_only,
+                )
 
     return router
 

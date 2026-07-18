@@ -18,7 +18,10 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpe
 from omnigent.inner.terminal import (
     TERMINAL_TRANSPORT_CONTROL,
     TERMINAL_TRANSPORT_PTY,
+    TERMINAL_TRANSPORT_SNAPSHOT,
+    HerdrBackend,
     TerminalInstance,
+    TmuxBackend,
     create_terminal_instance,
     resolve_terminal_transport,
 )
@@ -66,6 +69,27 @@ def test_resolve_terminal_transport_precedence(
     # Per-attach override beats spec.
     assert (
         resolve_terminal_transport(override="pty", spec_transport="control")
+        == TERMINAL_TRANSPORT_PTY
+    )
+
+
+def test_resolve_terminal_transport_uses_backend_advertisement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Polling-only backends select snapshot while tmux keeps its defaults."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+
+    assert (
+        resolve_terminal_transport(backend_capabilities=HerdrBackend.capabilities)
+        == TERMINAL_TRANSPORT_SNAPSHOT
+    )
+    assert (
+        resolve_terminal_transport(backend_capabilities=TmuxBackend.capabilities)
+        == TERMINAL_TRANSPORT_CONTROL
+    )
+    _write_transport_config(tmp_path, "pty")
+    assert (
+        resolve_terminal_transport(backend_capabilities=TmuxBackend.capabilities)
         == TERMINAL_TRANSPORT_PTY
     )
     # Unrecognized override values fall through to the spec rather than break.

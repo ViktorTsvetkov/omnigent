@@ -83,6 +83,7 @@ from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, No
 from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
+from omnigent.terminals.snapshot_bridge import bridge_snapshot_to_websocket
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_TERMINAL_NOT_FOUND,
     bridge_tmux_pty_to_websocket,
@@ -16878,13 +16879,23 @@ def create_runner_app(
         _repop_task.add_done_callback(_COST_POPUP_REPOP_TASKS.discard)
         from omnigent.inner.terminal import (
             TERMINAL_TRANSPORT_CONTROL,
+            TERMINAL_TRANSPORT_SNAPSHOT,
             resolve_terminal_transport,
         )
 
         resolved_transport = resolve_terminal_transport(
             override=transport,
             spec_transport=entry.instance.terminal_transport,
+            backend_capabilities=entry.instance.backend_capabilities,
         )
+        if resolved_transport == TERMINAL_TRANSPORT_SNAPSHOT:
+            await bridge_snapshot_to_websocket(
+                websocket,
+                backend=entry.instance.terminal_backend,
+                read_only=read_only,
+                on_client_interaction=entry.instance.note_client_interaction,
+            )
+            return
         bridge = (
             bridge_tmux_control_to_websocket
             if resolved_transport == TERMINAL_TRANSPORT_CONTROL

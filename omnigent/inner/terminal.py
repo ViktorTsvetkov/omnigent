@@ -67,8 +67,14 @@ _TMUX_CONVERSATION_LINK_OPTION = "@omnigent-conversation-link"
 TERMINAL_TRANSPORT_PTY = "pty"
 TERMINAL_TRANSPORT_CONTROL = "control"
 TERMINAL_TRANSPORT_SNAPSHOT = "snapshot"
+TERMINAL_TRANSPORT_STREAM = "stream"
 _VALID_TERMINAL_TRANSPORTS = frozenset(
-    {TERMINAL_TRANSPORT_PTY, TERMINAL_TRANSPORT_CONTROL, TERMINAL_TRANSPORT_SNAPSHOT}
+    {
+        TERMINAL_TRANSPORT_PTY,
+        TERMINAL_TRANSPORT_CONTROL,
+        TERMINAL_TRANSPORT_SNAPSHOT,
+        TERMINAL_TRANSPORT_STREAM,
+    }
 )
 # Values that select the PTY path in the config file, beyond the canonical
 # ``pty`` name — the common falsy spellings so ``transport: false`` / ``: off``
@@ -210,6 +216,7 @@ def resolve_terminal_transport(
         TERMINAL_TRANSPORT_CONTROL,
         TERMINAL_TRANSPORT_PTY,
         TERMINAL_TRANSPORT_SNAPSHOT,
+        TERMINAL_TRANSPORT_STREAM,
     ):
         if fallback in advertised:
             return fallback

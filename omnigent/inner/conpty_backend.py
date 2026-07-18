@@ -6,12 +6,13 @@ import asyncio
 import contextlib
 import threading
 import time
+from collections import deque
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, ClassVar
 
 from .terminal import (
-    TERMINAL_TRANSPORT_PTY,
+    TERMINAL_TRANSPORT_STREAM,
     Liveness,
     TerminalBackend,
     TerminalBackendCapabilities,
@@ -30,10 +31,11 @@ class ConptyBackend(TerminalBackend):
         native_busy_state=False,
         push_events=True,
         control_mode_attach=False,
-        attach_transports=frozenset({TERMINAL_TRANSPORT_PTY}),
+        attach_transports=frozenset({TERMINAL_TRANSPORT_STREAM}),
         status_line=False,
     )
     platforms = frozenset({"windows"})
+    _OUTPUT_JOURNAL_LIMIT: ClassVar[int] = 8 * 1024 * 1024
 
     _KEYS: ClassVar[dict[str, str]] = {
         "Enter": "\r",
@@ -89,6 +91,11 @@ class ConptyBackend(TerminalBackend):
         self._closed = False
         self._keep_alive_after_exit = False
         self._reader_error: BaseException | None = None
+        self._output_journal: deque[bytes] = deque()
+        self._output_journal_size = 0
+        self._output_subscribers: set[
+            tuple[asyncio.AbstractEventLoop, asyncio.Queue[bytes | None]]
+        ] = set()
 
     async def launch(self, request: TerminalLaunchRequest) -> None:
         await asyncio.to_thread(self._launch_sync, request)
@@ -120,6 +127,8 @@ class ConptyBackend(TerminalBackend):
             self._handshake_complete = False
             self._last_output_at = 0.0
             self._eof = False
+            self._output_journal.clear()
+            self._output_journal_size = 0
             self._reader = threading.Thread(
                 target=self._read_output,
                 name=f"omnigent-conpty-{self._target}",
@@ -142,6 +151,7 @@ class ConptyBackend(TerminalBackend):
             except EOFError:
                 with self._changed:
                     self._eof = True
+                    self._publish_output_locked(None)
                     self._changed.notify_all()
                 return
             except (OSError, RuntimeError, winpty.WinptyError) as exc:
@@ -150,6 +160,7 @@ class ConptyBackend(TerminalBackend):
                         self._reader_error = exc
                     else:
                         self._eof = True
+                        self._publish_output_locked(None)
                     self._changed.notify_all()
                 return
             if chunk:
@@ -160,6 +171,11 @@ class ConptyBackend(TerminalBackend):
                         # before releasing the child's normal output stream.
                         process.write("\x1b[?1;2c")
                         self._handshake_complete = True
+                    browser_output = chunk.replace("\x1b[c", "")
+                    if browser_output:
+                        encoded = browser_output.encode("utf-8")
+                        self._append_output_locked(encoded)
+                        self._publish_output_locked(encoded)
                     if self._stream is not None:
                         self._stream.feed(chunk)
                         if self._handshake_complete and not handshake:
@@ -189,9 +205,11 @@ class ConptyBackend(TerminalBackend):
         await asyncio.to_thread(self._close_sync)
 
     def _close_sync(self) -> None:
-        with self._lock:
+        with self._changed:
             process = self._process
             self._closed = True
+            self._publish_output_locked(None)
+            self._changed.notify_all()
         if process is not None:
             with contextlib.suppress(Exception):
                 process.close(force=True)
@@ -207,6 +225,34 @@ class ConptyBackend(TerminalBackend):
     async def send_keys(self, keys: Sequence[str]) -> None:
         await asyncio.to_thread(self.send_keys_sync, keys)
 
+    async def write_input(self, data: bytes) -> None:
+        """Write browser terminal input without paste-mode decoration."""
+        await asyncio.to_thread(self._write, data.decode("utf-8", errors="replace"))
+
+    async def set_size(self, cols: int, rows: int) -> None:
+        """Resize the ConPTY without blocking the event loop."""
+        await asyncio.to_thread(self.resize, cols, rows)
+
+    def subscribe_output(self) -> asyncio.Queue[bytes | None]:
+        """Subscribe to the VT stream, replaying retained output first."""
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        with self._lock:
+            for chunk in self._output_journal:
+                queue.put_nowait(chunk)
+            if self._eof or self._closed:
+                queue.put_nowait(None)
+            else:
+                self._output_subscribers.add((loop, queue))
+        return queue
+
+    def unsubscribe_output(self, queue: asyncio.Queue[bytes | None]) -> None:
+        """Remove a VT stream subscriber."""
+        with self._lock:
+            self._output_subscribers = {
+                subscriber for subscriber in self._output_subscribers if subscriber[1] is not queue
+            }
+
     def send_keys_sync(self, keys: Sequence[str]) -> None:
         encoded = "".join(sequence for key in keys if (sequence := self._translate_key(key)))
         if encoded:
@@ -216,9 +262,11 @@ class ConptyBackend(TerminalBackend):
         self.send_text_sync(text)
 
     def kill_session_sync(self) -> None:
-        with self._lock:
+        with self._changed:
             process = self._process
             self._closed = True
+            self._publish_output_locked(None)
+            self._changed.notify_all()
         if process is None:
             raise RuntimeError("ConPTY terminal is not running")
         try:
@@ -248,7 +296,25 @@ class ConptyBackend(TerminalBackend):
         with self._lock:
             process = self._require_live_process()
             process.setwinsize(rows, cols)
-            self._screen.resize(lines=rows, columns=cols)
+            screen = self._screen
+            if screen is None:
+                raise RuntimeError("ConPTY terminal has not been launched")
+            screen.resize(lines=rows, columns=cols)
+
+    def _append_output_locked(self, chunk: bytes) -> None:
+        self._output_journal.append(chunk)
+        self._output_journal_size += len(chunk)
+        while (
+            self._output_journal_size > self._OUTPUT_JOURNAL_LIMIT
+            and len(self._output_journal) > 1
+        ):
+            self._output_journal_size -= len(self._output_journal.popleft())
+
+    def _publish_output_locked(self, chunk: bytes | None) -> None:
+        for loop, queue in self._output_subscribers:
+            loop.call_soon_threadsafe(queue.put_nowait, chunk)
+        if chunk is None:
+            self._output_subscribers.clear()
 
     def _write(self, data: str) -> None:
         with self._changed:

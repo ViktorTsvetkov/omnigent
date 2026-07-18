@@ -244,6 +244,7 @@ def create_terminal_attach_router(
         from omnigent.inner.terminal import (
             TERMINAL_TRANSPORT_CONTROL,
             TERMINAL_TRANSPORT_SNAPSHOT,
+            TERMINAL_TRANSPORT_STREAM,
             resolve_terminal_transport,
         )
         from omnigent.runtime import telemetry
@@ -265,6 +266,14 @@ def create_terminal_attach_router(
         ):
             if resolved_transport == TERMINAL_TRANSPORT_SNAPSHOT:
                 await bridge_snapshot_to_websocket(
+                    websocket,
+                    backend=entry.instance.terminal_backend,
+                    read_only=read_only,
+                )
+            elif resolved_transport == TERMINAL_TRANSPORT_STREAM:
+                from omnigent.terminals.conpty_bridge import bridge_conpty_to_websocket
+
+                await bridge_conpty_to_websocket(
                     websocket,
                     backend=entry.instance.terminal_backend,
                     read_only=read_only,

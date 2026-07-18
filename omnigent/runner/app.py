@@ -16942,6 +16942,7 @@ def create_runner_app(
         from omnigent.inner.terminal import (
             TERMINAL_TRANSPORT_CONTROL,
             TERMINAL_TRANSPORT_SNAPSHOT,
+            TERMINAL_TRANSPORT_STREAM,
             resolve_terminal_transport,
         )
 
@@ -16952,6 +16953,16 @@ def create_runner_app(
         )
         if resolved_transport == TERMINAL_TRANSPORT_SNAPSHOT:
             await bridge_snapshot_to_websocket(
+                websocket,
+                backend=entry.instance.terminal_backend,
+                read_only=read_only,
+                on_client_interaction=entry.instance.note_client_interaction,
+            )
+            return
+        if resolved_transport == TERMINAL_TRANSPORT_STREAM:
+            from omnigent.terminals.conpty_bridge import bridge_conpty_to_websocket
+
+            await bridge_conpty_to_websocket(
                 websocket,
                 backend=entry.instance.terminal_backend,
                 read_only=read_only,

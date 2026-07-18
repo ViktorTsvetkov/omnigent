@@ -3299,6 +3299,10 @@ def register_terminal_backend(backend_cls: type[TerminalBackend]) -> None:
 
 register_terminal_backend(TmuxBackend)
 register_terminal_backend(HerdrBackend)
+if IS_WINDOWS:
+    from .psmux_backend import PsmuxBackend
+
+    register_terminal_backend(PsmuxBackend)
 
 
 # Platform → default backend name used when nothing is explicitly selected.

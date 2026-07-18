@@ -22,6 +22,7 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
+    "tzdata ; sys_platform == 'win32'",
     # SDK path-deps, version-locked: the three packages release together at
     # one version, so a published `omnigent==X` must resolve the SDK wheels
     # built alongside it (release-omnigent.yml verifies these pins match the

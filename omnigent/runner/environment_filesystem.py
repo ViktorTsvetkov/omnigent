@@ -15,9 +15,11 @@ import base64
 import os
 import re
 import stat
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.entities.environment_filesystem import (
     DeleteFilesystemResult,
     DirectoryNotEmpty,
@@ -36,6 +38,7 @@ if TYPE_CHECKING:
     from omnigent.inner.os_env import OSEnvironment
 
 _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
+_PYTHON = f'"{sys.executable}"' if IS_WINDOWS else "python3"
 
 
 def _shell_quote(s: str) -> str:
@@ -336,7 +339,7 @@ class CallerProcessFilesystem:
         )
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            f"{_PYTHON} -c {_shell_quote(_script)}",
         )
         if "error" in result:
             raise FilesystemPathNotFound(f"Directory {path!r} not found or not accessible")
@@ -468,7 +471,7 @@ class CallerProcessFilesystem:
         )
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            f"{_PYTHON} -c {_shell_quote(_script)}",
         )
         if "error" in result:
             raise FilesystemPathNotFound(f"Root directory not accessible: {result['error']}")
@@ -649,7 +652,7 @@ class CallerProcessFilesystem:
         )
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            f"{_PYTHON} -c {_shell_quote(_script)}",
         )
         if "error" in result or result.get("exit_code", 1) != 0:
             raise FilesystemPathNotFound(f"Path {path!r} not found")
@@ -766,7 +769,7 @@ class CallerProcessFilesystem:
         )
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            f"{_PYTHON} -c {_shell_quote(_script)}",
         )
         if "error" in result or result.get("exit_code", 1) != 0:
             raise FilesystemPathNotFound(f"Path {validated!r} not found")
@@ -798,7 +801,7 @@ class CallerProcessFilesystem:
         )
         check = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            f"{_PYTHON} -c {_shell_quote(_script)}",
         )
         count = int(check.get("stdout", "0").strip() or "0")
         return count > 0

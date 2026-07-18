@@ -495,7 +495,13 @@ class _HelperProcessClient:
         # paths/booleans — but we still keep the file private and ephemeral.
         r_fd: int | None = None
         if IS_WINDOWS:
-            assert self._tmpdir is not None
+            # Windows has no pass_fds, so the helper config is handed over via a
+            # short-lived file. An ACTIVE sandbox already allocated self._tmpdir;
+            # an INACTIVE ("none") sandbox — used by the read-only working-folder
+            # filesystem view — did not, so allocate one lazily here. Reclaimed by
+            # _stop_locked -> cleanup_private_tmpdir (and the spawn except-branch).
+            if self._tmpdir is None:
+                self._tmpdir = create_private_tmpdir()
             config_file = self._tmpdir / "helper-config.json"
             config_file.write_bytes(config_bytes)
             config_arg = ["--config-file", str(config_file)]

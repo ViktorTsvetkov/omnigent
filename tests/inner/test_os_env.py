@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import (
     _child_shell_env,
@@ -371,6 +372,33 @@ def test_child_shell_env_noop_without_pythonpath(
 # sys_os_shell command's PYTHONPATH. Guards the wiring in _shell_impl, not
 # just _child_shell_env in isolation.
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not IS_WINDOWS, reason="Windows config-file transport only")
+def test_inactive_sandbox_helper_spawn_allocates_tmpdir_lazily(tmp_path: Path) -> None:
+    """An inactive Windows environment can spawn its helper and cleans up."""
+    (tmp_path / "ready.txt").write_text("helper-ready")
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        )
+    )
+    assert os_env is not None
+    assert os_env._helper._tmpdir is None  # type: ignore[attr-defined]
+
+    try:
+        result = asyncio.run(os_env.read("ready.txt"))
+        helper_tmpdir = os_env._helper._tmpdir  # type: ignore[attr-defined]
+        assert result["content"] == "helper-ready"
+        assert helper_tmpdir is not None
+        assert helper_tmpdir.is_dir()
+    finally:
+        os_env.close()
+
+    assert os_env._helper._tmpdir is None  # type: ignore[attr-defined]
+    assert not helper_tmpdir.exists()
 
 
 def test_shell_command_does_not_see_omnigent_project_root(

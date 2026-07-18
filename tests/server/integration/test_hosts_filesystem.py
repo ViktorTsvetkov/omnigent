@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
+from urllib.parse import quote
 
 import pytest
 from asgiref.testing import ApplicationCommunicator
@@ -267,6 +268,50 @@ async def test_list_filesystem_returns_paginated_entries(
     # right icon.
     types = [entry["type"] for entry in payload["data"]]
     assert types == ["directory", "file"]
+
+
+async def test_list_filesystem_windows_absolute_path_is_forwarded_unchanged(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native-Windows absolute path reaches host.list_dir without a slash prefix."""
+    monkeypatch.setattr("omnigent.server.routes.hosts.IS_WINDOWS", True)
+    app, _reg, _comm, replies, _drain = fs_setup
+    windows_path = r"C:\Users\viktor\Downloads"
+    replies[windows_path] = {"entries": [], "has_more": False}
+
+    encoded_path = quote(windows_path, safe="")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem/{encoded_path}")
+
+    assert resp.status_code == 200, resp.text
+
+
+async def test_list_filesystem_posix_path_still_gets_leading_slash(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POSIX keeps forwarding non-tilde route paths with a leading slash."""
+    monkeypatch.setattr("omnigent.server.routes.hosts.IS_WINDOWS", False)
+    app, _reg, _comm, replies, _drain = fs_setup
+    replies["/Users/corey/projects"] = {"entries": [], "has_more": False}
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem/Users/corey/projects")
+
+    assert resp.status_code == 200, resp.text
 
 
 async def test_list_filesystem_root_forwards_tilde(

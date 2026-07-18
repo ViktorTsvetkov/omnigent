@@ -19,11 +19,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+from pathlib import PureWindowsPath
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.db.utils import now_epoch
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
@@ -759,7 +761,12 @@ def create_hosts_router(
         # the URL match. Re-add it unless the path is tilde-prefixed
         # (~/foo stays tilde-prefixed; /Users/x becomes Users/x → /Users/x).
         if not path.startswith("~"):
-            path = "/" + path
+            # A native-Windows host path (C:\...) is already absolute after URL-decoding;
+            # the :path converter only strips a leading POSIX "/". Prepending "/" to a
+            # drive-letter path yields the invalid "/C:\..." and fails host scandir with a 502.
+            # Skip the prepend only for a Windows-absolute path; POSIX behavior is unchanged.
+            if not (IS_WINDOWS and PureWindowsPath(path).is_absolute()):
+                path = "/" + path
         return await _list_host_filesystem(
             request=request,
             host_id=host_id,

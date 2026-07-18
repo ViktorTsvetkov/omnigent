@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 from collections.abc import Callable
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -12,7 +13,8 @@ from fastapi import WebSocket, WebSocketDisconnect
 from omnigent.inner.terminal import TerminalBackend
 
 _POLL_INTERVAL_S = 0.1
-_REDRAW_PREFIX = b"\x1b[H\x1b[2J"
+_REDRAW_PREFIX = b"\x1b[0m\x1b[H\x1b[2J"
+_CAPTURE_ROW_SEP_RE = re.compile(rb"(?<!\r)\n")
 
 
 async def _forward_snapshots_to_ws(
@@ -27,7 +29,10 @@ async def _forward_snapshots_to_ws(
         snapshot = await backend.capture(ansi=True)
         if snapshot != previous:
             previous = snapshot
-            await websocket.send_bytes(_REDRAW_PREFIX + snapshot.encode("utf-8"))
+            body = snapshot.encode("utf-8")
+            body = body[:-1] if body.endswith(b"\n") else body
+            normalized = _CAPTURE_ROW_SEP_RE.sub(b"\r\n", body)
+            await websocket.send_bytes(_REDRAW_PREFIX + normalized + b"\x1b[0m")
         await asyncio.sleep(poll_interval_s)
 
 

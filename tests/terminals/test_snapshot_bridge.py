@@ -46,7 +46,22 @@ async def test_snapshot_forwarder_sends_only_changed_screens() -> None:
     with pytest.raises(RuntimeError, match="stop"):
         await _forward_snapshots_to_ws(websocket, backend, poll_interval_s=0)  # type: ignore[arg-type]
 
-    assert websocket.frames == [b"\x1b[H\x1b[2Jfirst", b"\x1b[H\x1b[2Jsecond"]
+    assert websocket.frames == [
+        b"\x1b[0m\x1b[H\x1b[2Jfirst\x1b[0m",
+        b"\x1b[0m\x1b[H\x1b[2Jsecond\x1b[0m",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_forwarder_normalizes_frame_rows() -> None:
+    backend = _Backend()
+    backend.snapshots = ["first row\nsecond row\n"]
+    websocket = _WebSocket()
+
+    with pytest.raises(RuntimeError, match="stop"):
+        await _forward_snapshots_to_ws(websocket, backend, poll_interval_s=0)  # type: ignore[arg-type]
+
+    assert websocket.frames == [b"\x1b[0m\x1b[H\x1b[2Jfirst row\r\nsecond row\x1b[0m"]
 
 
 @pytest.mark.asyncio

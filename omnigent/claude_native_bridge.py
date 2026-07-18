@@ -2695,13 +2695,14 @@ def write_tmux_target(
     _write_json_file(bridge_dir / _TMUX_FILE, payload)
 
 
-def _build_advertised_prompt_delivery(info: dict[str, str]) -> TerminalDelivery:
+def _build_advertised_prompt_delivery(info: dict[str, str], bridge_dir: Path) -> TerminalDelivery:
     """Build delivery from an advertisement, defaulting legacy records to tmux."""
     backend = info.get("backend")
     if backend is None:
         return build_prompt_delivery(
             socket_path=info["socket_path"],
             target=info["tmux_target"],
+            paste_dir=bridge_dir,
         )
     pane_id = info.get("pane_id")
     if backend == "herdr" and pane_id is None:
@@ -2710,6 +2711,7 @@ def _build_advertised_prompt_delivery(info: dict[str, str]) -> TerminalDelivery:
         socket_path=info["socket_path"],
         target=pane_id or info["tmux_target"],
         backend_name=backend,
+        paste_dir=bridge_dir,
     )
 
 
@@ -2877,7 +2879,7 @@ def inject_user_message(
         or a draft-restore stall that redelivery cannot start).
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = _build_advertised_prompt_delivery(info)
+    delivery = _build_advertised_prompt_delivery(info, bridge_dir)
     # tmux.json only means the tmux session exists; Claude Code's input
     # box mounts a few seconds later. Block until the prompt renders so
     # the first message isn't typed into a still-booting TUI and dropped.
@@ -2964,7 +2966,7 @@ def inject_interrupt(
         time, or if the ``tmux send-keys`` invocation fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = _build_advertised_prompt_delivery(info)
+    delivery = _build_advertised_prompt_delivery(info, bridge_dir)
     # A single named ``Escape`` key (Claude Code cancels an in-flight response
     # on one Escape). Sent as a named key — not literal — so it is the key, not
     # the bytes of the word.
@@ -3006,7 +3008,7 @@ def kill_session(
         time, or if the ``tmux kill-session`` invocation fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = _build_advertised_prompt_delivery(info)
+    delivery = _build_advertised_prompt_delivery(info, bridge_dir)
     delivery.kill()
 
 
@@ -3045,7 +3047,7 @@ def inject_slash_command(
     if "\n" in command:
         raise ValueError("slash command must be a single line")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = _build_advertised_prompt_delivery(info)
+    delivery = _build_advertised_prompt_delivery(info, bridge_dir)
     # ``C-u`` clears any draft the user is mid-typing; otherwise the
     # literal type below concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
@@ -3126,7 +3128,7 @@ def display_cost_approval_popup(
         best-effort miss and the web card remains answerable.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = _build_advertised_prompt_delivery(info)
+    delivery = _build_advertised_prompt_delivery(info, bridge_dir)
     # Capability-gated: the tmux backend overlays the popup on the pane; a
     # backend without a native popup no-ops and the web ApprovalCard remains
     # the answer surface.

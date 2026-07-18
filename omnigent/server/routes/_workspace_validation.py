@@ -30,6 +30,7 @@ import secrets
 from pathlib import PureWindowsPath
 from typing import Any
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.host.frames import HostStatFrame, encode_host_frame
 from omnigent.server.host_registry import HostConnection, HostRegistry
 
@@ -346,7 +347,7 @@ async def validate_workspace(
     # rejected. Everything below stays byte-identical: a POSIX-absolute path
     # falls through to the existing logic, and a truly relative path still hits
     # the ``startswith("/")`` raise.
-    if not workspace.startswith("/") and PureWindowsPath(workspace).is_absolute():
+    if IS_WINDOWS and not workspace.startswith("/") and PureWindowsPath(workspace).is_absolute():
         return await _validate_windows_host_workspace(
             host_registry=host_registry,
             host_id=host_id,

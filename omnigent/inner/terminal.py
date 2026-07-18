@@ -1590,6 +1590,7 @@ class TmuxBackend(TerminalBackend):
         target: str = "main",
         config_path: str = _TMUX_CONFIG_PATH,
         delivery_style: TmuxDeliveryStyle | None = None,
+        paste_dir: str | Path | None = None,
     ) -> None:
         """
         :param socket_path: Private tmux socket path for this instance's
@@ -1612,6 +1613,7 @@ class TmuxBackend(TerminalBackend):
         self._target = target
         self._config_path = config_path
         self._delivery_style = delivery_style or _DEFAULT_TMUX_DELIVERY_STYLE
+        self._paste_dir = Path(paste_dir) if paste_dir is not None else Path(socket_path).parent
 
     def _base_cmd(self) -> list[str]:
         """Build the tmux argv prefix for this instance's private server."""
@@ -1939,7 +1941,7 @@ class TmuxBackend(TerminalBackend):
         """
         paste_buffer = self._delivery_style.paste_buffer
         with tempfile.NamedTemporaryFile(
-            prefix="omnigent_paste_", suffix=".bin", delete=False
+            dir=self._paste_dir, prefix="paste_", suffix=".bin", delete=False
         ) as paste_file:
             paste_file.write(_tmux_paste_payload_bytes(text))
             paste_path = paste_file.name
@@ -3446,6 +3448,7 @@ def _construct_terminal_backend(
     socket_path: str | Path,
     target: str,
     tmux_delivery_style: TmuxDeliveryStyle | None = None,
+    paste_dir: str | Path | None = None,
 ) -> TerminalBackend:
     """Construct the registered backend *name* for a terminal instance.
 
@@ -3477,7 +3480,10 @@ def _construct_terminal_backend(
         raise RuntimeError(f"Unknown terminal backend {name!r}. Known backends: {known}.")
     if backend_cls is TmuxBackend:
         return TmuxBackend(
-            socket_path=socket_path, target=target, delivery_style=tmux_delivery_style
+            socket_path=socket_path,
+            target=target,
+            delivery_style=tmux_delivery_style,
+            paste_dir=paste_dir,
         )
     # Non-tmux hooks take a ``Path``; normalize here (tmux keeps the value raw
     # so a bridge-advertised socket string reaches an identical ``-S`` argv).
@@ -3722,6 +3728,7 @@ def build_prompt_delivery(
     target: str,
     backend_name: str | None = None,
     tmux_delivery_style: TmuxDeliveryStyle | None = None,
+    paste_dir: str | Path | None = None,
 ) -> TerminalDelivery:
     """Build a :class:`TerminalDelivery` bound to an advertised terminal endpoint.
 
@@ -3751,6 +3758,7 @@ def build_prompt_delivery(
         socket_path=socket_path,
         target=target,
         tmux_delivery_style=tmux_delivery_style,
+        paste_dir=paste_dir,
     )
     return TerminalDelivery(backend)
 

@@ -181,7 +181,10 @@ def _resolve_transport_for_view(entry: TerminalListEntry) -> str:
     """
     from omnigent.inner.terminal import resolve_terminal_transport
 
-    return resolve_terminal_transport(spec_transport=entry.instance.terminal_transport)
+    return resolve_terminal_transport(
+        spec_transport=entry.instance.terminal_transport,
+        backend_capabilities=entry.instance.backend_capabilities,
+    )
 
 
 def _terminal_environment_resource(

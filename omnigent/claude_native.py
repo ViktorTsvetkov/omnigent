@@ -2149,7 +2149,11 @@ async def _attach_with_transcript_forwarder(
         :attr:`_AttachOutcome.EXITED`.
     """
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
-    if IS_WINDOWS:
+    if (
+        IS_WINDOWS
+        and attach is attach_local_terminal
+        and not (sys.stdin.isatty() and sys.stdout.isatty())
+    ):
         _print_herdr_local_attach_guidance(prepared)
         return _AttachOutcome.DETACHED
     # ``start_at_end`` covers both reattach (terminal still live,
@@ -2243,33 +2247,15 @@ async def _attach_with_transcript_forwarder(
 
 
 def _print_herdr_local_attach_guidance(prepared: PreparedClaudeTerminal) -> None:
-    """Point a Windows user at the herdr GUI for the hosted Claude pane."""
-    label: str | None = None
-    if prepared.tmux_socket is not None:
-        from omnigent.inner.terminal import HerdrBackend
-
-        label = HerdrBackend.workspace_label_for(
-            prepared.tmux_socket, prepared.tmux_target or "main"
-        )
+    """Explain how to use a ConPTY terminal when local attach is unavailable."""
+    del prepared
+    click.echo("\nClaude is running in a ConPTY terminal on this Windows host.", err=True)
     click.echo(
-        "\nClaude is running in a herdr terminal on this Windows host.", err=True
-    )
-    click.echo(
-        "Local terminal attach is POSIX-only; to watch the native TUI, open the "
-        "herdr app",
+        "No interactive local TTY is attached; open the Web UI to use the native TUI.",
         err=True,
     )
-    if label is not None:
-        click.echo(f"and select the workspace labeled '{label}'.", err=True)
-    else:
-        click.echo(
-            "and select this session's omnigent workspace (label prefix "
-            "'omnigent-ws-').",
-            err=True,
-        )
     click.echo(
-        "The session keeps running on the runner; you can also drive it from the "
-        "Web UI above.",
+        "The session keeps running on the runner; you can also drive it from the Web UI above.",
         err=True,
     )
 
@@ -2413,8 +2399,10 @@ async def _attach_with_reconnect(
                 err=True,
             )
         else:
-            if user_requested_exit or recover is None:
-                return _AttachOutcome.EXITED
+            if user_requested_exit:
+                return _AttachOutcome.DETACHED if IS_WINDOWS else _AttachOutcome.EXITED
+            if recover is None:
+                return _AttachOutcome.DETACHED if IS_WINDOWS else _AttachOutcome.EXITED
             if base_url is not None and session_id is not None and terminal_id is not None:
                 terminal_gone = await _is_terminal_resource_gone(
                     base_url=base_url,
@@ -4332,6 +4320,13 @@ async def attach_local_terminal(
                 ),
                 asyncio.create_task(stop_waiter, name="claude-attach-signal"),
             }
+            if IS_WINDOWS:
+                tasks.add(
+                    asyncio.create_task(
+                        _poll_terminal_resize(ws, stdin_fd),
+                        name="claude-terminal-resize-poller",
+                    )
+                )
             if terminal_gone_probe is not None:
                 tasks.add(
                     asyncio.create_task(
@@ -4541,8 +4536,24 @@ async def _send_resize(ws: Any, stdin_fd: int) -> None:
         size detection.
     :returns: None.
     """
-    size = os.get_terminal_size(stdin_fd) if os.isatty(stdin_fd) else os.terminal_size((80, 24))
+    if IS_WINDOWS:
+        size = os.get_terminal_size() if os.isatty(stdin_fd) else os.terminal_size((80, 24))
+    else:
+        size = (
+            os.get_terminal_size(stdin_fd) if os.isatty(stdin_fd) else os.terminal_size((80, 24))
+        )
     await ws.send(json.dumps({"type": "resize", "cols": size.columns, "rows": size.lines}))
+
+
+async def _poll_terminal_resize(ws: Any, stdin_fd: int, interval_s: float = 0.25) -> None:
+    """Poll console dimensions and forward changes on platforms without SIGWINCH."""
+    previous = os.get_terminal_size() if os.isatty(stdin_fd) else os.terminal_size((80, 24))
+    while True:
+        await asyncio.sleep(interval_s)
+        current = os.get_terminal_size() if os.isatty(stdin_fd) else os.terminal_size((80, 24))
+        if current != previous:
+            previous = current
+            await _send_resize(ws, stdin_fd)
 
 
 def _enter_raw_mode(fd: int) -> list[Any] | None:
@@ -4553,6 +4564,10 @@ def _enter_raw_mode(fd: int) -> list[Any] | None:
     :returns: Previous termios attributes, or ``None`` when *fd* is
         not a TTY.
     """
+    if IS_WINDOWS:
+        from omnigent._win_console import enter_console_mode
+
+        return enter_console_mode()  # type: ignore[return-value]
     if not os.isatty(fd):
         return None
     old_attrs = termios.tcgetattr(fd)
@@ -4569,6 +4584,11 @@ def _restore_terminal(fd: int, old_attrs: list[Any] | None) -> None:
         :func:`_enter_raw_mode`.
     :returns: None.
     """
+    if IS_WINDOWS:
+        from omnigent._win_console import restore_console_mode
+
+        restore_console_mode(old_attrs)  # type: ignore[arg-type]
+        return
     if old_attrs is None:
         return
     with contextlib.suppress(termios.error, OSError):
@@ -4598,6 +4618,8 @@ def _install_attach_signal_handlers(ws: Any, stdin_fd: int) -> _SignalRestore:
     :param stdin_fd: Local stdin file descriptor.
     :returns: Restore handle for previous signal handlers.
     """
+    if IS_WINDOWS:
+        return _SignalRestore(lambda: None, asyncio.Event())
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
     previous: dict[signal.Signals, Any] = {}

@@ -2451,6 +2451,26 @@ def test_write_tmux_target_persists_herdr_delivery_address(tmp_path: Path) -> No
     assert payload["pane_id"] == "w1:p2"
 
 
+def test_write_tmux_target_persists_conpty_control_channel(tmp_path: Path) -> None:
+    """A ConPTY advertisement carries the runner URL and bearer token."""
+    bridge_dir = tmp_path / "bridge"
+
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("C:/omnigent/terminal.endpoint"),
+        tmux_target="main",
+        backend="conpty",
+        pane_id="main",
+        control_url="http://127.0.0.1:6767/v1/sessions/c/resources/terminals/claude/main/control",
+        control_token="secret",
+    )
+
+    payload = json.loads((bridge_dir / "tmux.json").read_text(encoding="utf-8"))
+    assert payload["backend"] == "conpty"
+    assert payload["control_url"].endswith("/claude/main/control")
+    assert payload["control_token"] == "secret"
+
+
 @pytest.mark.parametrize("injector", ["user", "interrupt", "slash"])
 def test_claude_injectors_select_advertised_herdr_backend(
     monkeypatch: pytest.MonkeyPatch,

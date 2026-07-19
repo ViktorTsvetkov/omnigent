@@ -9,6 +9,7 @@ the factory/instance wiring that puts the selected backend to use.
 
 from __future__ import annotations
 
+import json
 import shutil
 from collections.abc import Sequence
 from pathlib import Path
@@ -190,16 +191,11 @@ def test_config_without_terminal_table_falls_through(
 # ---------------------------------------------------------------------------
 
 
-def test_windows_defaults_to_herdr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Native Windows with nothing selected → the herdr backend (#11).
-
-    The Windows-native default the herdr adapter registers; binary/protocol
-    availability is enforced separately by ``HerdrBackend.ensure_available`` at
-    the factory, so resolution itself just names herdr.
-    """
+def test_windows_defaults_to_conpty(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Native Windows with nothing selected uses the in-process ConPTY backend."""
     _force_windows(monkeypatch)
     _isolate_config(monkeypatch, tmp_path)
-    assert resolve_terminal_backend_name() == "herdr"
+    assert resolve_terminal_backend_name() == "conpty"
 
 
 def test_platform_without_default_raises_availability_error(
@@ -207,7 +203,7 @@ def test_platform_without_default_raises_availability_error(
 ) -> None:
     """A platform with no default backend → clear availability RuntimeError.
 
-    Both registered platforms now have a default (tmux on POSIX, herdr on
+    Both registered platforms now have a default (tmux on POSIX, ConPTY on
     Windows), so the no-default path is exercised via an unknown platform tag —
     the same loud failure any future unsupported platform would hit, distinct
     from the platform-mismatch error.
@@ -340,6 +336,51 @@ def test_build_prompt_delivery_without_backend_remains_tmux(tmp_path: Path) -> N
     assert isinstance(delivery.backend, TmuxBackend)
     assert delivery.backend._socket_path == socket_path
     assert delivery.backend._target == "main"
+
+
+def test_build_prompt_delivery_conpty_forwards_to_runner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """ConPTY delivery uses the advertised authenticated control endpoint."""
+    requests: list[tuple[dict[str, object], str | None]] = []
+
+    class _Response:
+        def __init__(self, result: object) -> None:
+            self._result = result
+
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps({"result": self._result}).encode()
+
+    def _urlopen(request: object, *, timeout: float) -> _Response:
+        assert timeout == 10.0
+        payload = json.loads(request.data.decode())  # type: ignore[attr-defined]
+        requests.append((payload, request.get_header("Authorization")))  # type: ignore[attr-defined]
+        result = "alive" if payload["operation"] == "liveness" else None
+        return _Response(result)
+
+    monkeypatch.setattr(terminal_mod.urllib.request, "urlopen", _urlopen)
+    delivery = build_prompt_delivery(
+        socket_path=tmp_path / "unused.endpoint",
+        target="main",
+        backend_name="conpty",
+        control_url="http://127.0.0.1/control",
+        control_token="secret",
+    )
+
+    delivery.paste_without_submit("one\ntwo")
+    delivery.send_keys(["Enter", "Escape"])
+    assert delivery.is_alive()
+    assert requests == [
+        ({"operation": "paste_without_submit", "text": "one\ntwo"}, "Bearer secret"),
+        ({"operation": "send_keys", "keys": ["Enter", "Escape"]}, "Bearer secret"),
+        ({"operation": "liveness"}, "Bearer secret"),
+    ]
 
 
 def test_construct_terminal_backend_registered_but_unwired_raises(

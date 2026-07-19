@@ -311,12 +311,29 @@ def _publish_tmux_target_for_bridge(
     # generic runner module's import-time graph.
     from omnigent.claude_native_bridge import bridge_dir_for_bridge_id, write_tmux_target
 
+    control_url: str | None = None
+    control_token: str | None = None
+    if instance.backend_name == "conpty":
+        runner_url = os.environ.get("RUNNER_SERVER_URL", "").rstrip("/")
+        if runner_url:
+            control_url = (
+                f"{runner_url}/v1/sessions/{urllib.parse.quote(session_id, safe='')}"
+                f"/resources/terminals/{urllib.parse.quote(terminal_name, safe='')}"
+                f"/{urllib.parse.quote(session_key, safe='')}/control"
+            )
+        from omnigent.runner._entry import _make_auth_token_factory
+
+        token_factory = _make_auth_token_factory()
+        control_token = token_factory() if token_factory is not None else None
+
     write_tmux_target(
         bridge_dir_for_bridge_id(bridge_id),
         socket_path=instance.socket_path,
         tmux_target=instance.tmux_target,
         backend=instance.backend_name,
         pane_id=instance.delivery_target,
+        control_url=control_url,
+        control_token=control_token,
     )
 
 
@@ -15888,6 +15905,52 @@ def create_runner_app(
             before=before,
             order=order,
         )
+
+    @app.post(
+        "/v1/sessions/{session_id}/resources/terminals/{terminal_name}/{session_key}/control"
+    )
+    async def control_session_terminal(
+        session_id: str,
+        terminal_name: str,
+        session_key: str,
+        request: Request,
+    ) -> JSONResponse:
+        """Drive a live runner-owned terminal backend from a harness subprocess."""
+        if terminal_registry is None:
+            raise HTTPException(status_code=503, detail="Terminal registry is unavailable")
+        instance = terminal_registry.get(session_id, terminal_name, session_key)
+        if instance is None or not instance.running:
+            raise HTTPException(status_code=404, detail="Terminal is not running")
+        body = await request.json()
+        operation = body.get("operation")
+        backend = instance.terminal_backend
+        if operation == "send_text":
+            backend.send_text_sync(str(body.get("text", "")))
+            result: object = None
+        elif operation == "send_keys":
+            keys = body.get("keys")
+            if not isinstance(keys, list) or not all(isinstance(key, str) for key in keys):
+                raise HTTPException(status_code=400, detail="send_keys requires string keys")
+            backend.send_keys_sync(keys)
+            result = None
+        elif operation == "paste_without_submit":
+            backend.paste_without_submit_sync(str(body.get("text", "")))
+            result = None
+        elif operation == "snapshot":
+            result = backend.capture_sync(
+                ansi=bool(body.get("ansi", False)),
+                scrollback=int(body.get("scrollback", 0)),
+            )
+        elif operation == "liveness":
+            result = backend.liveness_sync().value
+        elif operation == "kill":
+            backend.kill_session_sync()
+            result = None
+        else:
+            raise HTTPException(
+                status_code=400, detail=f"Unknown terminal operation: {operation!r}"
+            )
+        return JSONResponse(status_code=200, content={"result": result})
 
     @app.post("/v1/sessions/{session_id}/resources/terminals")
     async def create_session_terminal(

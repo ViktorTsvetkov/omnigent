@@ -52,7 +52,7 @@ from fastapi import (
     WebSocketException,
     status,
 )
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from starlette.datastructures import UploadFile as StarletteUploadFile
@@ -18502,6 +18502,26 @@ def create_sessions_router(
             if key in ("limit", "after", "before", "order")
         }
         return await _proxy_get_to_runner(session_id, path, params=forwarded or None)
+
+    @router.post(
+        "/sessions/{session_id}/resources/terminals/{terminal_name}/{session_key}/control",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def control_session_terminal(
+        session_id: str,
+        terminal_name: str,
+        session_key: str,
+        request: Request,
+    ) -> JSONResponse:
+        """Proxy terminal-control operations to the session's runner."""
+        await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        path = (
+            f"/v1/sessions/{session_id}/resources/terminals/{terminal_name}/{session_key}/control"
+        )
+        status, payload = await _proxy_post_to_runner(session_id, path, body)
+        return JSONResponse(status_code=status, content=payload)
 
     @router.post(
         "/sessions/{session_id}/resources/terminals",

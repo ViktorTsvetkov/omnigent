@@ -2661,6 +2661,8 @@ def write_tmux_target(
     pid: int | None = None,
     backend: str | None = None,
     pane_id: str | None = None,
+    control_url: str | None = None,
+    control_token: str | None = None,
 ) -> None:
     """
     Advertise the tmux socket + target for the Claude terminal.
@@ -2678,6 +2680,8 @@ def write_tmux_target(
     :param backend: Optional hosting backend. ``None``/``"tmux"`` preserves the
         legacy advertisement; non-tmux delivery records the backend name.
     :param pane_id: Backend-native pane address, required by herdr delivery.
+    :param control_url: Runner terminal-control endpoint for ConPTY delivery.
+    :param control_token: Bearer token for the ConPTY control endpoint.
     :returns: None.
     """
     _ensure_secure_dir(bridge_dir)
@@ -2692,6 +2696,11 @@ def write_tmux_target(
         payload["backend"] = backend
         if pane_id is not None:
             payload["pane_id"] = pane_id
+        if backend == "conpty":
+            if control_url is not None:
+                payload["control_url"] = control_url
+            if control_token is not None:
+                payload["control_token"] = control_token
     _write_json_file(bridge_dir / _TMUX_FILE, payload)
 
 
@@ -2707,6 +2716,18 @@ def _build_advertised_prompt_delivery(info: dict[str, str], bridge_dir: Path) ->
     pane_id = info.get("pane_id")
     if backend == "herdr" and pane_id is None:
         raise RuntimeError("Claude herdr terminal advertisement is missing pane_id")
+    if backend == "conpty":
+        control_url = info.get("control_url")
+        if control_url is None:
+            raise RuntimeError("Claude conpty terminal advertisement is missing control_url")
+        return build_prompt_delivery(
+            socket_path=info["socket_path"],
+            target=pane_id or info["tmux_target"],
+            backend_name=backend,
+            control_url=control_url,
+            control_token=info.get("control_token"),
+            paste_dir=bridge_dir,
+        )
     return build_prompt_delivery(
         socket_path=info["socket_path"],
         target=pane_id or info["tmux_target"],
@@ -3541,10 +3562,16 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
             info = {"socket_path": socket_path, "tmux_target": tmux_target}
             backend = payload.get("backend")
             pane_id = payload.get("pane_id")
+            control_url = payload.get("control_url")
+            control_token = payload.get("control_token")
             if isinstance(backend, str):
                 info["backend"] = backend
             if isinstance(pane_id, str):
                 info["pane_id"] = pane_id
+            if isinstance(control_url, str):
+                info["control_url"] = control_url
+            if isinstance(control_token, str):
+                info["control_token"] = control_token
             return info
         time.sleep(0.05)
     raise RuntimeError(

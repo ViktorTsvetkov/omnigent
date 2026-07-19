@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import enum
+import json
 import logging
 import os
 import re
@@ -17,6 +18,8 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
@@ -3313,12 +3316,11 @@ if IS_WINDOWS:
 # Platform → default backend name used when nothing is explicitly selected.
 # POSIX defaults to tmux (the compatibility contract: an absent backend field
 # means tmux, so every pre-existing persisted spec keeps working unchanged).
-# Native Windows defaults to herdr, the Windows-native backend (#11); it fails
-# loudly via ``HerdrBackend.ensure_available`` if the herdr binary is missing or
-# speaks an unsupported protocol, rather than an incidental hard-raise.
+# Native Windows defaults to ConPTY, whose live handle remains runner-owned;
+# advertised delivery reaches it through the authenticated control channel.
 _PLATFORM_DEFAULT_BACKEND: dict[str, str] = {
     "posix": TmuxBackend.name,
-    "windows": HerdrBackend.name,
+    "windows": "conpty",
 }
 
 
@@ -3409,8 +3411,8 @@ def resolve_terminal_backend_name(*, spec_backend: str | None = None) -> str:
         raise RuntimeError(
             f"No terminal multiplexer backend supports this platform "
             f"({platform_tag}); native harnesses require a platform-native "
-            "backend. tmux is POSIX-only and the Windows-native backend "
-            "(herdr) is not yet available. Run an SDK-based harness via "
+            "backend. tmux is POSIX-only and no Windows-native backend "
+            "is available. Run an SDK-based harness via "
             "`omnigent run <agent.yaml>` (e.g. the claude-sdk, cursor, "
             "copilot, or codex harness) or use the web UI."
         )
@@ -3731,6 +3733,70 @@ class TerminalDelivery:
         self.send_keys(["Enter"])
 
 
+class _RemoteConptyBackend(TerminalBackend):
+    """Forward delivery primitives to the runner process that owns a ConPTY."""
+
+    name = "conpty"
+    capabilities = TerminalBackendCapabilities(native_popup=False)
+    platforms = frozenset({"windows"})
+
+    def __init__(self, *, control_url: str, control_token: str | None) -> None:
+        self._control_url = control_url
+        self._control_token = control_token
+
+    def _call(self, operation: str, **payload: object) -> object:
+        body = json.dumps({"operation": operation, **payload}).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self._control_token:
+            headers["Authorization"] = f"Bearer {self._control_token}"
+        request = urllib.request.Request(self._control_url, data=body, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=10.0) as response:
+                decoded = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"ConPTY control request failed ({exc.code}): {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"ConPTY control endpoint is unreachable: {exc.reason}") from exc
+        return decoded.get("result")
+
+    async def launch(self, _request: TerminalLaunchRequest) -> None:
+        raise RuntimeError("A remote ConPTY proxy cannot launch terminals")
+
+    async def liveness(self) -> Liveness:
+        return await asyncio.to_thread(self.liveness_sync)
+
+    def liveness_sync(self) -> Liveness:
+        return Liveness(str(self._call("liveness")))
+
+    async def close(self) -> None:
+        await asyncio.to_thread(self.kill_session_sync)
+
+    async def send_text(self, text: str) -> None:
+        await asyncio.to_thread(self.send_text_sync, text)
+
+    async def send_keys(self, keys: Sequence[str]) -> None:
+        await asyncio.to_thread(self.send_keys_sync, keys)
+
+    async def capture(self, *, ansi: bool = False, scrollback: int = 0) -> str:
+        return await asyncio.to_thread(self.capture_sync, ansi=ansi, scrollback=scrollback)
+
+    def capture_sync(self, *, ansi: bool = False, scrollback: int = 0) -> str:
+        return str(self._call("snapshot", ansi=ansi, scrollback=scrollback))
+
+    def send_text_sync(self, text: str) -> None:
+        self._call("send_text", text=text)
+
+    def send_keys_sync(self, keys: Sequence[str]) -> None:
+        self._call("send_keys", keys=list(keys))
+
+    def paste_without_submit_sync(self, text: str) -> None:
+        self._call("paste_without_submit", text=text)
+
+    def kill_session_sync(self) -> None:
+        self._call("kill")
+
+
 def build_prompt_delivery(
     *,
     socket_path: str | Path,
@@ -3738,6 +3804,8 @@ def build_prompt_delivery(
     backend_name: str | None = None,
     tmux_delivery_style: TmuxDeliveryStyle | None = None,
     paste_dir: str | Path | None = None,
+    control_url: str | None = None,
+    control_token: str | None = None,
 ) -> TerminalDelivery:
     """Build a :class:`TerminalDelivery` bound to an advertised terminal endpoint.
 
@@ -3762,6 +3830,12 @@ def build_prompt_delivery(
         order, per-command timeout) passes its own. Inert for non-tmux backends.
     :returns: A fresh delivery surface bound to this endpoint.
     """
+    if backend_name == "conpty":
+        if control_url is None:
+            raise RuntimeError("ConPTY prompt delivery requires a runner control URL")
+        return TerminalDelivery(
+            _RemoteConptyBackend(control_url=control_url, control_token=control_token)
+        )
     backend = _construct_terminal_backend(
         backend_name or TmuxBackend.name,
         socket_path=socket_path,

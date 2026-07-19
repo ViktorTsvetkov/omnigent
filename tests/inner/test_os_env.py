@@ -541,6 +541,32 @@ def test_active_windows_low_il_helper_rpc_and_cleanup(tmp_path: Path) -> None:
     assert (allowed / "result.txt").read_text() == "native pipes"
 
 
+@pytest.mark.skipif(not IS_WINDOWS, reason="native Windows sandbox only")
+def test_active_windows_appcontainer_helper_rpc(tmp_path: Path) -> None:
+    """The real helper starts with secured pipes and a zero-capability profile."""
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(
+                type="windows_appcontainer",
+                read_paths=["allowed"],
+                write_paths=["allowed"],
+                allow_network=False,
+            ),
+        )
+    )
+    assert os_env is not None
+    try:
+        assert asyncio.run(os_env.write("allowed/result.txt", "appcontainer rpc"))["created"]
+        assert asyncio.run(os_env.read("allowed/result.txt"))["content"] == "appcontainer rpc"
+    finally:
+        os_env.close()
+    assert (allowed / "result.txt").read_text() == "appcontainer rpc"
+
+
 def test_posix_helper_spawn_contract_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

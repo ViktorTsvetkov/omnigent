@@ -201,16 +201,12 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
             ),
             credential_proxy=sandbox_spec.credential_proxy,
         )
-        if policy.read_roots is not None:
-            raise ValueError(
-                "windows_low_il cannot enforce read_paths; AppContainer/C3 is required "
-                "for read confinement and is not implemented yet"
+        if policy.read_roots is not None or not policy.allow_network:
+            policy.backend_type = "windows_appcontainer"
+            _LOGGER.debug(
+                "windows sandbox resolved tier=windows_appcontainer enforced=filesystem,network"
             )
-        if not policy.allow_network:
-            raise ValueError(
-                "windows_low_il cannot enforce allow_network=false; AppContainer/C3 is "
-                "required for network denial and is not implemented yet"
-            )
+            return policy
         _LOGGER.debug("windows sandbox resolved tier=%s", self.isolation_tier)
         return policy
 
@@ -240,9 +236,9 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
         bufsize: int,
     ) -> SandboxLaunchResult:
         """Launch Low-IL suspended, assign its Job, and only then resume."""
-        from .windows_sandbox_process import launch_low_integrity_process
+        from .windows_sandbox_process import launch_windows_sandbox_process
 
-        return launch_low_integrity_process(
+        return launch_windows_sandbox_process(
             argv,
             policy,
             cwd=cwd,
@@ -324,3 +320,40 @@ if hasattr(ctypes, "windll"):
     _configure_prototypes()
 
 register_backend(WindowsJobObjectSandboxBackend())
+
+
+class WindowsAppContainerSandboxBackend(WindowsJobObjectSandboxBackend):
+    """Selectable zero-capability AppContainer read/write and network jail."""
+
+    type_name = "windows_appcontainer"
+    isolation_tier = "windows_appcontainer"
+
+    def resolve(self, spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
+        sandbox_spec = spec.sandbox or OSEnvSandboxSpec(type=self.type_name)
+        policy = SandboxPolicy(
+            backend_type=self.type_name,
+            active=True,
+            read_roots=(
+                [(cwd / path).resolve() for path in sandbox_spec.read_paths]
+                if sandbox_spec.read_paths is not None
+                else []
+            ),
+            write_roots=[(cwd / path).resolve() for path in (sandbox_spec.write_paths or [])],
+            write_files=[(cwd / path).resolve() for path in (sandbox_spec.write_files or [])],
+            allow_network=sandbox_spec.allow_network,
+            env_passthrough=(
+                list(sandbox_spec.env_passthrough)
+                if sandbox_spec.env_passthrough is not None
+                else None
+            ),
+            credential_proxy=sandbox_spec.credential_proxy,
+        )
+        if policy.allow_network:
+            raise ValueError(
+                "windows_appcontainer only supports allow_network=false; select "
+                "windows_jobobject for the Low-IL network-open tier"
+            )
+        return policy
+
+
+register_backend(WindowsAppContainerSandboxBackend())

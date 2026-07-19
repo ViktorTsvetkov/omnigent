@@ -19,12 +19,17 @@ if os.name != "nt":
 
 from .sandbox import SandboxLaunchResult, SandboxPolicy
 from .windows_jobobject_sandbox import assign_process_handle_to_job
-from .windows_security import WindowsLaunchSecurity, prepare_low_integrity_launch
+from .windows_security import (
+    WindowsLaunchSecurity,
+    prepare_appcontainer_launch,
+    prepare_low_integrity_launch,
+)
 
 CREATE_SUSPENDED = 0x00000004
 CREATE_UNICODE_ENVIRONMENT = 0x00000400
 EXTENDED_STARTUPINFO_PRESENT = 0x00080000
 PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
+PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = 0x00020009
 STARTF_USESTDHANDLES = 0x00000100
 HANDLE_FLAG_INHERIT = 0x00000001
 STILL_ACTIVE = 259
@@ -207,14 +212,41 @@ class _WindowsContainment:
         self.close()
 
 
-def _pipe(*, parent_reads: bool, text: bool, bufsize: int) -> tuple[TextIO | BinaryIO, int]:
+def _pipe(
+    *,
+    parent_reads: bool,
+    text: bool,
+    bufsize: int,
+    appcontainer_sid: wintypes.LPVOID | None = None,
+) -> tuple[TextIO | BinaryIO, int]:
     read_handle = wintypes.HANDLE()
     write_handle = wintypes.HANDLE()
-    attributes = _SECURITY_ATTRIBUTES(ctypes.sizeof(_SECURITY_ATTRIBUTES), None, True)
-    if not kernel32.CreatePipe(
-        ctypes.byref(read_handle), ctypes.byref(write_handle), ctypes.byref(attributes), 0
-    ):
-        raise ctypes.WinError(ctypes.get_last_error(), "CreatePipe")
+    descriptor = wintypes.LPVOID()
+    sid_text = wintypes.LPWSTR()
+    try:
+        if appcontainer_sid:
+            if not advapi32.ConvertSidToStringSidW(appcontainer_sid, ctypes.byref(sid_text)):
+                raise ctypes.WinError(ctypes.get_last_error(), "ConvertSidToStringSidW")
+            sddl = f"D:(A;;GA;;;SY)(A;;GA;;;OW)(A;;GRGW;;;{sid_text.value})"
+            if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl, 1, ctypes.byref(descriptor), None
+            ):
+                raise ctypes.WinError(
+                    ctypes.get_last_error(),
+                    "ConvertStringSecurityDescriptorToSecurityDescriptorW(pipe)",
+                )
+        attributes = _SECURITY_ATTRIBUTES(
+            ctypes.sizeof(_SECURITY_ATTRIBUTES), descriptor or None, True
+        )
+        if not kernel32.CreatePipe(
+            ctypes.byref(read_handle), ctypes.byref(write_handle), ctypes.byref(attributes), 0
+        ):
+            raise ctypes.WinError(ctypes.get_last_error(), "CreatePipe")
+    finally:
+        if sid_text:
+            kernel32.LocalFree(sid_text)
+        if descriptor:
+            kernel32.LocalFree(descriptor)
     parent_handle = read_handle if parent_reads else write_handle
     child_handle = write_handle if parent_reads else read_handle
     try:
@@ -244,7 +276,7 @@ def _pipe(*, parent_reads: bool, text: bool, bufsize: int) -> tuple[TextIO | Bin
         raise
 
 
-def launch_low_integrity_process(
+def launch_windows_sandbox_process(
     argv: list[str],
     policy: SandboxPolicy,
     *,
@@ -261,20 +293,39 @@ def launch_low_integrity_process(
         raise ValueError("Windows sandbox launch currently requires redirected PIPE stdio")
     if not text:
         raise ValueError("Windows sandbox helper launch requires text=True")
-    security = prepare_low_integrity_launch(policy)
+    security = (
+        prepare_appcontainer_launch(policy, executable=argv[0])
+        if policy.backend_type == "windows_appcontainer"
+        else prepare_low_integrity_launch(policy)
+    )
     streams: list[TextIO | BinaryIO] = []
     child_handles: list[int] = []
     process = _SharedHandle(None)
     thread = _SharedHandle(None)
     job = None
     try:
-        parent_stdin, child_stdin = _pipe(parent_reads=False, text=text, bufsize=bufsize)
+        parent_stdin, child_stdin = _pipe(
+            parent_reads=False,
+            text=text,
+            bufsize=bufsize,
+            appcontainer_sid=security.appcontainer_sid,
+        )
         streams.append(parent_stdin)
         child_handles.append(child_stdin)
-        parent_stdout, child_stdout = _pipe(parent_reads=True, text=text, bufsize=bufsize)
+        parent_stdout, child_stdout = _pipe(
+            parent_reads=True,
+            text=text,
+            bufsize=bufsize,
+            appcontainer_sid=security.appcontainer_sid,
+        )
         streams.append(parent_stdout)
         child_handles.append(child_stdout)
-        parent_stderr, child_stderr = _pipe(parent_reads=True, text=text, bufsize=bufsize)
+        parent_stderr, child_stderr = _pipe(
+            parent_reads=True,
+            text=text,
+            bufsize=bufsize,
+            appcontainer_sid=security.appcontainer_sid,
+        )
         streams.append(parent_stderr)
         child_handles.append(child_stderr)
         startup = _STARTUPINFOEXW()
@@ -286,11 +337,14 @@ def launch_low_integrity_process(
             hStdError=wintypes.HANDLE(child_stderr),
         )
         attribute_size = ctypes.c_size_t()
-        kernel32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(attribute_size))
+        attribute_count = 2 if security.security_capabilities is not None else 1
+        kernel32.InitializeProcThreadAttributeList(
+            None, attribute_count, 0, ctypes.byref(attribute_size)
+        )
         attribute_buffer = ctypes.create_string_buffer(attribute_size.value)
         startup.lpAttributeList = ctypes.cast(attribute_buffer, wintypes.LPVOID)
         if not kernel32.InitializeProcThreadAttributeList(
-            startup.lpAttributeList, 1, 0, ctypes.byref(attribute_size)
+            startup.lpAttributeList, attribute_count, 0, ctypes.byref(attribute_size)
         ):
             raise ctypes.WinError(ctypes.get_last_error(), "InitializeProcThreadAttributeList")
         inherited_handles = (wintypes.HANDLE * 3)(child_stdin, child_stdout, child_stderr)
@@ -307,25 +361,44 @@ def launch_low_integrity_process(
             raise ctypes.WinError(
                 ctypes.get_last_error(), "UpdateProcThreadAttribute(handle list)"
             )
+        if security.security_capabilities is not None and not kernel32.UpdateProcThreadAttribute(
+            startup.lpAttributeList,
+            0,
+            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+            ctypes.byref(security.security_capabilities),
+            ctypes.sizeof(security.security_capabilities),
+            None,
+            None,
+        ):
+            kernel32.DeleteProcThreadAttributeList(startup.lpAttributeList)
+            raise ctypes.WinError(
+                ctypes.get_last_error(), "UpdateProcThreadAttribute(security capabilities)"
+            )
         info = _PROCESS_INFORMATION()
         command = ctypes.create_unicode_buffer(quote_windows_argv(argv))
-        environment = ctypes.create_unicode_buffer(build_environment_block(env))
-        assert security.token.value is not None
+        launch_env = dict(env)
+        if policy.write_roots:
+            launch_env["TEMP"] = os.fspath(policy.write_roots[0])
+            launch_env["TMP"] = os.fspath(policy.write_roots[0])
+        environment = ctypes.create_unicode_buffer(build_environment_block(launch_env))
         try:
-            if not advapi32.CreateProcessAsUserW(
-                wintypes.HANDLE(security.token.value),
-                None,
-                command,
-                None,
-                None,
-                True,
-                CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
-                environment,
-                os.fspath(cwd),
-                ctypes.byref(startup.StartupInfo),
-                ctypes.byref(info),
-            ):
-                raise ctypes.WinError(ctypes.get_last_error(), "CreateProcessAsUserW")
+            flags = CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT
+            if security.token is not None:
+                assert security.token.value is not None
+                created = advapi32.CreateProcessAsUserW(
+                    wintypes.HANDLE(security.token.value), None, command, None, None, True,
+                    flags, environment, os.fspath(cwd), ctypes.byref(startup.StartupInfo),
+                    ctypes.byref(info),
+                )
+                api = "CreateProcessAsUserW"
+            else:
+                created = kernel32.CreateProcessW(
+                    None, command, None, None, True, flags, environment, os.fspath(cwd),
+                    ctypes.byref(startup.StartupInfo), ctypes.byref(info),
+                )
+                api = "CreateProcessW"
+            if not created:
+                raise ctypes.WinError(ctypes.get_last_error(), api)
         finally:
             kernel32.DeleteProcThreadAttributeList(startup.lpAttributeList)
         process.value = int(info.hProcess)
@@ -363,6 +436,9 @@ def launch_low_integrity_process(
         raise
 
 
+launch_low_integrity_process = launch_windows_sandbox_process
+
+
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
 kernel32.CreatePipe.argtypes = [
@@ -379,6 +455,7 @@ kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
 kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
 kernel32.ResumeThread.restype = wintypes.DWORD
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
 kernel32.InitializeProcThreadAttributeList.argtypes = [
     wintypes.LPVOID,
     wintypes.DWORD,
@@ -395,6 +472,18 @@ kernel32.UpdateProcThreadAttribute.argtypes = [
     wintypes.LPVOID,
 ]
 kernel32.DeleteProcThreadAttributeList.argtypes = [wintypes.LPVOID]
+kernel32.CreateProcessW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.LPWSTR,
+    wintypes.LPVOID,
+    wintypes.LPVOID,
+    wintypes.BOOL,
+    wintypes.DWORD,
+    wintypes.LPVOID,
+    wintypes.LPCWSTR,
+    ctypes.POINTER(_STARTUPINFOW),
+    ctypes.POINTER(_PROCESS_INFORMATION),
+]
 advapi32.CreateProcessAsUserW.argtypes = [
     wintypes.HANDLE,
     wintypes.LPCWSTR,
@@ -407,4 +496,14 @@ advapi32.CreateProcessAsUserW.argtypes = [
     wintypes.LPCWSTR,
     ctypes.POINTER(_STARTUPINFOW),
     ctypes.POINTER(_PROCESS_INFORMATION),
+]
+advapi32.ConvertSidToStringSidW.argtypes = [
+    wintypes.LPVOID,
+    ctypes.POINTER(wintypes.LPWSTR),
+]
+advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.LPVOID),
+    ctypes.POINTER(wintypes.DWORD),
 ]

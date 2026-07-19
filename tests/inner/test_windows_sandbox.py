@@ -5,6 +5,7 @@ import ctypes.wintypes as wintypes
 import json
 import msvcrt
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -93,17 +94,47 @@ def test_unicode_environment_block_is_sorted_and_double_nul() -> None:
     assert block == "Alpha=é雪\0b=two\0z=last\0\0"
 
 
-def test_read_roots_and_network_deny_fail_before_spawn(tmp_path: Path) -> None:
+def test_read_roots_and_network_deny_route_to_appcontainer(tmp_path: Path) -> None:
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.inner.windows_jobobject_sandbox import WindowsJobObjectSandboxBackend
 
     backend = WindowsJobObjectSandboxBackend()
-    with pytest.raises(ValueError, match=r"AppContainer/C3.*not implemented"):
-        backend.resolve(OSEnvSpec(sandbox=OSEnvSandboxSpec(read_paths=["read"])), tmp_path)
-    with pytest.raises(ValueError, match=r"network denial.*not implemented"):
-        backend.resolve(
-            OSEnvSpec(sandbox=OSEnvSandboxSpec(read_paths=None, allow_network=False)), tmp_path
+    read_policy = backend.resolve(
+        OSEnvSpec(sandbox=OSEnvSandboxSpec(read_paths=["read"], allow_network=False)), tmp_path
+    )
+    deny_policy = backend.resolve(
+        OSEnvSpec(sandbox=OSEnvSandboxSpec(read_paths=None, allow_network=False)), tmp_path
+    )
+    assert read_policy.backend_type == "windows_appcontainer"
+    assert deny_policy.backend_type == "windows_appcontainer"
+
+
+def test_explicit_appcontainer_rejects_open_network(tmp_path: Path) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.windows_jobobject_sandbox import WindowsAppContainerSandboxBackend
+
+    with pytest.raises(ValueError, match=r"only supports allow_network=false"):
+        WindowsAppContainerSandboxBackend().resolve(
+            OSEnvSpec(
+                sandbox=OSEnvSandboxSpec(type="windows_appcontainer", allow_network=True)
+            ),
+            tmp_path,
         )
+
+
+def test_appcontainer_egress_rejected_before_setup(tmp_path: Path, monkeypatch) -> None:
+    import omnigent.inner.windows_security as security
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    policy = SandboxPolicy("windows_appcontainer", True, [], [tmp_path], [], False)
+    policy.egress_relay_port = 12345
+    monkeypatch.setattr(
+        security,
+        "create_or_open_appcontainer_profile",
+        lambda: pytest.fail("profile setup must not run"),
+    )
+    with pytest.raises(ValueError, match=r"loopback.*hang"):
+        security.prepare_appcontainer_launch(policy)
 
 
 def test_native_launch_owner_keeps_launcher_argv_unwrapped(policy, tmp_path: Path) -> None:
@@ -354,6 +385,88 @@ def test_handle_count_returns_to_baseline_after_normal_and_failed_launch(
         _launch(policy, [sys.executable, "-c", "pass"])
     assert kernel32.GetProcessHandleCount(kernel32.GetCurrentProcess(), ctypes.byref(count))
     assert count.value <= baseline + 2
+
+
+def test_appcontainer_filesystem_and_network_jail() -> None:
+    from omnigent.inner.sandbox import SandboxPolicy
+    from omnigent.inner.windows_sandbox_process import launch_windows_sandbox_process
+
+    base = Path(r"C:\omni-sbx") / f"pytest-c3-{uuid.uuid4().hex}"
+    base.mkdir(parents=True)
+    subprocess.run(["icacls", str(base), "/inheritance:r"], check=True, capture_output=True)
+    subprocess.run(
+        ["icacls", str(base), "/grant:r", f"{os.environ['USERNAME']}:(OI)(CI)F"],
+        check=True,
+        capture_output=True,
+    )
+    allowed, readonly, forbidden = base / "write", base / "read", base / "forbidden"
+    for path in (allowed, readonly, forbidden):
+        path.mkdir()
+    dacl_before = subprocess.run(
+        ["icacls", str(allowed)], check=True, capture_output=True, text=True
+    ).stdout
+    (readonly / "seed.txt").write_text("readonly")
+    (forbidden / "seed.txt").write_text("secret")
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    port = listener.getsockname()[1]
+    policy = SandboxPolicy(
+        "windows_appcontainer", True, [readonly], [allowed], [], False
+    )
+    script = r"""
+import json, pathlib, socket, sys
+allowed, readonly, forbidden = map(pathlib.Path, sys.argv[1:4])
+port = int(sys.argv[4]); out = {}
+def attempt(name, fn):
+    try: out[name] = fn() or 'ok'
+    except OSError as exc:
+        out[name] = f'denied:{getattr(exc, "winerror", None) or exc.errno}:{type(exc).__name__}'
+attempt('write_allowed', lambda: (allowed / 'new.txt').write_text('ok'))
+attempt('read_allowed', lambda: (readonly / 'seed.txt').read_text())
+attempt('write_readonly', lambda: (readonly / 'bad.txt').write_text('bad'))
+attempt('read_forbidden', lambda: (forbidden / 'seed.txt').read_text())
+attempt('write_forbidden', lambda: (forbidden / 'bad.txt').write_text('bad'))
+for host, target_port in [('1.1.1.1', 80), ('8.8.8.8', 53), ('127.0.0.1', port)]:
+    attempt(
+        f'net:{host}',
+        lambda h=host, p=target_port: socket.create_connection((h, p), 1).close(),
+    )
+print(json.dumps(out))
+"""
+    result = launch_windows_sandbox_process(
+        [sys.executable, "-c", script, str(allowed), str(readonly), str(forbidden), str(port)],
+        policy,
+        cwd=allowed,
+        env=os.environ,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        result.process.stdin.close()
+        assert result.process.wait(20) == 0
+        output = json.loads(result.process.stdout.read())
+        assert result.process.stderr.read() == ""
+    finally:
+        result.containment.close()
+        listener.close()
+    assert output["write_allowed"] == 2
+    assert output["read_allowed"] == "readonly"
+    assert output["write_readonly"].startswith("denied:13")
+    assert output["read_forbidden"].startswith("denied:13")
+    assert output["write_forbidden"].startswith("denied:13")
+    assert output["net:1.1.1.1"].startswith("denied:10013")
+    assert output["net:8.8.8.8"].startswith("denied:10013")
+    assert "TimeoutError" in output["net:127.0.0.1"]
+    assert (
+        subprocess.run(
+            ["icacls", str(allowed)], check=True, capture_output=True, text=True
+        ).stdout
+        == dacl_before
+    )
 
 
 def test_existing_appcontainer_profile_is_deleted_on_close() -> None:

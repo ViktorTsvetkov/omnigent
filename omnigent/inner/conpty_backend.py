@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import threading
 import time
 from collections import deque
@@ -36,6 +37,7 @@ class ConptyBackend(TerminalBackend):
     )
     platforms = frozenset({"windows"})
     _OUTPUT_JOURNAL_LIMIT: ClassVar[int] = 8 * 1024 * 1024
+    _OSC_COLOR_QUERY: ClassVar[re.Pattern[str]] = re.compile(r"\x1b\]1[012];\?(?:\x07|\x1b\\)")
 
     _KEYS: ClassVar[dict[str, str]] = {
         "Enter": "\r",
@@ -171,7 +173,7 @@ class ConptyBackend(TerminalBackend):
                         # before releasing the child's normal output stream.
                         process.write("\x1b[?1;2c")
                         self._handshake_complete = True
-                    browser_output = chunk.replace("\x1b[c", "")
+                    browser_output = self._OSC_COLOR_QUERY.sub("", chunk.replace("\x1b[c", ""))
                     if browser_output:
                         encoded = browser_output.encode("utf-8")
                         self._append_output_locked(encoded)

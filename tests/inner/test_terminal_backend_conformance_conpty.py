@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -15,6 +16,21 @@ from tests.inner.terminal_backend_conformance import (
 )
 
 _CHILD = Path(__file__).with_name("_conpty_conformance_child.py")
+
+
+class _OutputProcess:
+    def __init__(self, chunk: str) -> None:
+        self._chunks = iter((chunk,))
+
+    def read(self, size: int) -> str:
+        del size
+        try:
+            return next(self._chunks)
+        except StopIteration:
+            raise EOFError from None
+
+    def write(self, data: str) -> None:
+        del data
 
 
 class ConptyConformanceAdapter(ConformanceAdapter):
@@ -59,3 +75,38 @@ class TestConptyConformance(BackendConformanceSuite):
     @pytest.fixture
     def adapter(self) -> ConformanceAdapter:
         return ConptyConformanceAdapter()
+
+
+@pytest.mark.windows_only
+def test_read_output_strips_only_osc_color_queries(tmp_path: Path) -> None:
+    backend = ConptyBackend(socket_path=tmp_path / "conpty", target="main")
+    backend._process = _OutputProcess(  # type: ignore[assignment]
+        "before\x1b]10;?\x1b\\middle\x1b]11;?\x07"
+        "\x1b]12;?\x1b\\after\x1b]10;rgb:1818/1818/1b1b\x1b\\"
+    )
+
+    backend._read_output()
+
+    assert b"".join(backend._output_journal) == (
+        b"beforemiddleafter\x1b]10;rgb:1818/1818/1b1b\x1b\\"
+    )
+
+
+@pytest.mark.windows_only
+@pytest.mark.asyncio
+async def test_osc_color_queries_are_not_replayed_on_resubscribe(tmp_path: Path) -> None:
+    backend = ConptyBackend(socket_path=tmp_path / "conpty", target="main")
+    backend._process = _OutputProcess(  # type: ignore[assignment]
+        "ready\x1b]10;?\x1b\\\x1b]11;?\x07"
+    )
+    backend._read_output()
+
+    first = backend.subscribe_output()
+    assert await asyncio.wait_for(first.get(), timeout=1) == b"ready"
+    assert await asyncio.wait_for(first.get(), timeout=1) is None
+
+    second = backend.subscribe_output()
+    replay = await asyncio.wait_for(second.get(), timeout=1)
+    assert replay == b"ready"
+    assert b"]10;" not in replay
+    assert b"]11;" not in replay

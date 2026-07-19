@@ -36,6 +36,7 @@ from .credential_proxy import (
 from .datamodel import CredentialProxySpec, OSEnvSpec
 from .sandbox import (
     ContainmentHandle,
+    ProcessHandle,
     SandboxPolicy,
     activate_sandbox,
     cleanup_private_tmpdir,
@@ -341,7 +342,7 @@ class _HelperProcessClient:
         # the live listener; the policy already carries it for the
         # helper itself. Cleared in :meth:`_stop_egress_proxy_locked`.
         self._egress_relay_port: int | None = None
-        self._proc: subprocess.Popen[str] | None = None
+        self._proc: ProcessHandle | None = None
         # Parent-held containment handle from the sandbox backend's
         # post_spawn hook (e.g. a Windows Job Object). Closed in
         # ``_stop_locked`` to tear down the helper's process tree.
@@ -551,17 +552,32 @@ class _HelperProcessClient:
         if r_fd is not None:
             popen_kwargs["pass_fds"] = (r_fd,)
         try:
-            self._proc = subprocess.Popen(
-                spawn_argv,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                cwd=str(self.cwd),
-                env=env,
-                **popen_kwargs,
-            )
+            if IS_WINDOWS and sandbox.active:
+                result = backend.launch_windows(
+                    spawn_argv,
+                    sandbox,
+                    cwd=self.cwd,
+                    env=env,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
+                self._proc = result.process
+                self._sandbox_handle = result.containment
+            else:
+                self._proc = subprocess.Popen(
+                    spawn_argv,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    cwd=str(self.cwd),
+                    env=env,
+                    **popen_kwargs,
+                )
         except Exception:
             cleanup_private_tmpdir(self._tmpdir)
             self._tmpdir = None
@@ -580,7 +596,7 @@ class _HelperProcessClient:
         # launcher backends (they isolate via wrap_launcher_argv before
         # exec); on Windows this assigns the helper to a kill-on-close
         # Job Object so the whole tree is torn down in ``_stop_locked``.
-        if sandbox.active and self._proc.pid is not None:
+        if not (IS_WINDOWS and sandbox.active) and sandbox.active and self._proc.pid is not None:
             self._sandbox_handle = get_backend(sandbox.backend_type).post_spawn(
                 sandbox, self._proc.pid
             )

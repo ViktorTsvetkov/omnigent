@@ -6,10 +6,12 @@ import asyncio
 import base64
 import os
 import shutil
+import subprocess
 import sys
 import tracemalloc
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -509,6 +511,98 @@ def test_inactive_sandbox_helper_spawn_allocates_tmpdir_lazily(tmp_path: Path) -
 
     assert os_env._helper._tmpdir is None  # type: ignore[attr-defined]
     assert not helper_tmpdir.exists()
+
+
+@pytest.mark.skipif(not IS_WINDOWS, reason="native Windows sandbox only")
+def test_active_windows_low_il_helper_rpc_and_cleanup(tmp_path: Path) -> None:
+    """The real helper uses native redirected pipes and restores labels."""
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    seeded = tmp_path / "seeded.txt"
+    seeded.write_text("reads remain open")
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(
+                type="windows_jobobject",
+                read_paths=None,
+                write_paths=["allowed"],
+                allow_network=True,
+            ),
+        )
+    )
+    assert os_env is not None
+    try:
+        assert asyncio.run(os_env.write("allowed/result.txt", "native pipes"))["created"]
+        assert asyncio.run(os_env.read("seeded.txt"))["content"] == "reads remain open"
+    finally:
+        os_env.close()
+    assert (allowed / "result.txt").read_text() == "native pipes"
+
+
+def test_posix_helper_spawn_contract_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Freeze the existing POSIX argv, environment, and Popen keyword contract."""
+    import omnigent.inner.os_env as os_env_module
+
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 1234
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def poll(self) -> int:
+            return 0
+
+    def fake_popen(argv: list[str], **kwargs: object) -> FakeProcess:
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(os_env_module, "IS_WINDOWS", False)
+    monkeypatch.setattr(os_env_module.subprocess, "Popen", fake_popen)
+    policy = _inactive_policy()
+    client = os_env_module._HelperProcessClient(cwd=tmp_path, shell_path="/bin/sh", sandbox=policy)
+    client._start_locked()
+
+    argv = cast(list[str], captured["argv"])
+    kwargs = cast(dict[str, object], captured["kwargs"])
+    assert argv[:4] == [sys.executable, "-m", "omnigent.inner.os_env", "helper"]
+    assert argv[4] == "--config-fd"
+    assert argv[5].isdigit()
+    assert set(kwargs) == {
+        "stdin",
+        "stdout",
+        "stderr",
+        "text",
+        "bufsize",
+        "cwd",
+        "env",
+        "pass_fds",
+    }
+    assert kwargs | {"env": "<snapshot>", "pass_fds": "<fd>"} == {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "bufsize": 1,
+        "cwd": str(tmp_path),
+        "env": "<snapshot>",
+        "pass_fds": "<fd>",
+    }
+    assert kwargs["pass_fds"] == (int(argv[5]),)
+    expected_env = build_helper_env(os.environ, policy)
+    project_root = str(_project_root())
+    existing = expected_env.get("PYTHONPATH")
+    expected_env["PYTHONPATH"] = (
+        f"{project_root}{os.pathsep}{existing}" if existing else project_root
+    )
+    assert kwargs["env"] == expected_env
+    client.close()
 
 
 def test_shell_command_does_not_see_omnigent_project_root(

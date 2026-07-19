@@ -16,24 +16,23 @@ So this backend trades a different set of guarantees than its POSIX siblings:
   killed together when Omnigent closes the job handle, including on an
   unexpected Omnigent crash, since the OS closes handles of dead processes) and
   optional CPU/memory ceilings.
-- **NOT provided**: filesystem isolation (read/write roots), network isolation,
-  or syscall filtering. ``read_paths`` / ``write_paths`` / ``allow_network`` in
-  the spec are therefore *advisory* here and not enforced — see the one-time
-  warning emitted by :meth:`resolve`.
+- **Provided**: Low-integrity write confinement. ``write_paths`` and
+  ``write_files`` receive reversible mandatory labels before launch.
+- **NOT provided**: read confinement, network isolation, or syscall filtering.
+  Unsupported requests fail before spawning instead of degrading silently.
 
-A Job Object cannot prepend a launcher to argv the way ``bwrap`` does — a
-process is assigned to a job only after it exists. The backend therefore keeps
-:meth:`wrap_launcher_argv` as the no-op default and does its work in
-:meth:`post_spawn`, which the parent calls right after ``subprocess.Popen``.
+A Job Object cannot prepend a launcher to argv the way ``bwrap`` does. The
+backend therefore owns native process creation: it creates the child suspended,
+assigns the Job, and resumes only after containment succeeds. ``post_spawn``
+remains as a compatibility path for callers that already created a process.
 """
 
 from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wintypes
-import functools
 import logging
-import sys
+from collections.abc import Mapping
 from pathlib import Path
 from types import TracebackType
 
@@ -41,6 +40,7 @@ from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .sandbox import (
     ContainmentHandle,
     SandboxBackend,
+    SandboxLaunchResult,
     SandboxPolicy,
     register_backend,
 )
@@ -50,21 +50,6 @@ _LOGGER = logging.getLogger(__name__)
 # Win32 constants (winnt.h). JobObjectExtendedLimitInformation is class 9.
 _JobObjectExtendedLimitInformation = 9
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
-
-
-@functools.cache
-def _warn_no_fs_isolation_once() -> None:
-    """Log the Windows no-filesystem-isolation caveat once per process.
-
-    ``functools.cache`` memoizes the (argument-free) call so operators see the
-    warning a single time rather than once per spawned helper.
-    """
-    _LOGGER.warning(
-        "windows_jobobject provides process-tree containment + resource "
-        "limits only; it does NOT isolate the filesystem or network. "
-        "read_paths/write_paths/allow_network in os_env.sandbox are not "
-        "enforced on Windows. Run on Linux/macOS for full sandboxing."
-    )
 
 
 class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
@@ -137,6 +122,34 @@ class _JobHandle:
         self.close()
 
 
+def assign_process_handle_to_job(process_handle: int) -> _JobHandle:
+    """Create a kill-on-close Job and assign an already-open process handle."""
+    kernel32 = ctypes.windll.kernel32
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error(), "CreateJobObjectW")
+    try:
+        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+            wintypes.HANDLE(job),
+            _JobObjectExtendedLimitInformation,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error(), "SetInformationJobObject")
+        if not kernel32.AssignProcessToJobObject(
+            wintypes.HANDLE(job), wintypes.HANDLE(process_handle)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error(), "AssignProcessToJobObject")
+        result = _JobHandle(int(job))
+        job = None
+        return result
+    finally:
+        if job:
+            kernel32.CloseHandle(wintypes.HANDLE(job))
+
+
 class WindowsJobObjectSandboxBackend(SandboxBackend):
     """Process-containment backend for Windows via Job Objects.
 
@@ -144,6 +157,7 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
     """
 
     type_name = "windows_jobobject"
+    isolation_tier = "windows_low_il"
 
     def resolve(self, spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
         """
@@ -151,9 +165,8 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
 
         The policy is marked ``active`` so the helper runs through the
         sandbox spawn path (private ``$TMPDIR``, ``start_in_scratch``
-        support) and :meth:`post_spawn` is invoked. The read/write roots
-        are carried for shape-compatibility with the POSIX backends but
-        are **not enforced** — a one-time warning makes that explicit.
+        support). The native launch owner enforces write roots at Low IL,
+        assigns a Job while suspended, and only then resumes the helper.
 
         :param spec: The agent's :class:`OSEnvSpec`.
         :param cwd: Effective working directory of the helper.
@@ -180,8 +193,6 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
             read_roots=read_roots,
             write_roots=write_roots,
             write_files=write_files,
-            # No network isolation is possible here, so report the spec's
-            # request faithfully but understand it is not enforced.
             allow_network=sandbox_spec.allow_network,
             env_passthrough=(
                 list(sandbox_spec.env_passthrough)
@@ -190,13 +201,17 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
             ),
             credential_proxy=sandbox_spec.credential_proxy,
         )
-        if (
-            policy.read_roots is None
-            and policy.allow_network
-            and not policy.write_roots
-            and not policy.write_files
-        ):
-            _warn_no_fs_isolation_once()
+        if policy.read_roots is not None:
+            raise ValueError(
+                "windows_low_il cannot enforce read_paths; AppContainer/C3 is required "
+                "for read confinement and is not implemented yet"
+            )
+        if not policy.allow_network:
+            raise ValueError(
+                "windows_low_il cannot enforce allow_network=false; AppContainer/C3 is "
+                "required for network denial and is not implemented yet"
+            )
+        _LOGGER.debug("windows sandbox resolved tier=%s", self.isolation_tier)
         return policy
 
     def wrap_launcher_argv(
@@ -207,25 +222,37 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
         chdir: Path | None = None,
         target: str | None = None,
     ) -> list[str]:
-        """Launch write-granted policies through the low-IL wrapper."""
-        del target
-        if (
-            policy.read_roots is None
-            and policy.allow_network
-            and not policy.write_roots
-            and not policy.write_files
-        ):
-            return argv
-        from .windows_sandbox_launch import encode_policy
+        """Return argv unchanged; the native Windows backend owns creation."""
+        del policy, cwd, chdir, target
+        return argv
 
-        return [
-            sys.executable,
-            "-m",
-            "omnigent.inner.windows_sandbox_launch",
-            encode_policy(policy, chdir or cwd),
-            "--",
-            *argv,
-        ]
+    def launch_windows(
+        self,
+        argv: list[str],
+        policy: SandboxPolicy,
+        *,
+        cwd: Path,
+        env: Mapping[str, str],
+        stdin: int,
+        stdout: int,
+        stderr: int,
+        text: bool,
+        bufsize: int,
+    ) -> SandboxLaunchResult:
+        """Launch Low-IL suspended, assign its Job, and only then resume."""
+        from .windows_sandbox_process import launch_low_integrity_process
+
+        return launch_low_integrity_process(
+            argv,
+            policy,
+            cwd=cwd,
+            env=env,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            text=text,
+            bufsize=bufsize,
+        )
 
     def activate(self, policy: SandboxPolicy) -> None:
         """No-op: containment is applied by :meth:`post_spawn` from the parent.
@@ -236,52 +263,9 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
         del policy
 
     def post_spawn(self, policy: SandboxPolicy, pid: int) -> ContainmentHandle | None:
-        """
-        Assign the just-spawned helper ``pid`` to a kill-on-close Job Object.
-
-        Creates an anonymous Job Object with
-        ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` (plus any configured memory
-        ceiling), then assigns ``pid``. Returns a handle the caller holds for
-        the helper's lifetime; closing it terminates the whole tree.
-
-        Degrades gracefully (returns ``None`` after logging) if the Win32
-        calls fail — e.g. the process is already in a job that forbids
-        nesting/breakaway, which can happen inside some CI containers.
-
-        :param policy: The resolved policy (read for resource ceilings).
-        :param pid: OS process id of the just-spawned helper.
-        :returns: A :class:`_JobHandle`, or ``None`` if containment could
-            not be established.
-        """
+        """Compatibility path for callers that already created the child."""
         del policy
         kernel32 = ctypes.windll.kernel32
-
-        job = kernel32.CreateJobObjectW(None, None)
-        if not job:
-            _LOGGER.warning(
-                "windows_jobobject: CreateJobObject failed (err=%d); helper pid "
-                "%d runs without Job Object containment.",
-                ctypes.get_last_error(),
-                pid,
-            )
-            return None
-
-        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        if not kernel32.SetInformationJobObject(
-            wintypes.HANDLE(job),
-            _JobObjectExtendedLimitInformation,
-            ctypes.byref(info),
-            ctypes.sizeof(info),
-        ):
-            _LOGGER.warning(
-                "windows_jobobject: SetInformationJobObject failed (err=%d); "
-                "closing job and continuing uncontained.",
-                ctypes.get_last_error(),
-            )
-            kernel32.CloseHandle(wintypes.HANDLE(job))
-            return None
-
         proc_handle = kernel32.OpenProcess(
             _PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, wintypes.DWORD(pid)
         )
@@ -291,27 +275,20 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
                 pid,
                 ctypes.get_last_error(),
             )
-            kernel32.CloseHandle(wintypes.HANDLE(job))
             return None
-
         try:
-            if not kernel32.AssignProcessToJobObject(
-                wintypes.HANDLE(job), wintypes.HANDLE(proc_handle)
-            ):
+            try:
+                return assign_process_handle_to_job(int(proc_handle))
+            except OSError as exc:
                 _LOGGER.warning(
-                    "windows_jobobject: AssignProcessToJobObject(pid=%d) failed "
-                    "(err=%d) — process may already be in a non-nestable job. "
-                    "Continuing without Job Object containment.",
+                    "windows_jobobject: job assignment for pid %d failed (%s); "
+                    "continuing without Job Object containment.",
                     pid,
-                    ctypes.get_last_error(),
+                    exc,
                 )
-                kernel32.CloseHandle(wintypes.HANDLE(job))
                 return None
         finally:
             kernel32.CloseHandle(wintypes.HANDLE(proc_handle))
-
-        _LOGGER.debug("windows_jobobject: assigned helper pid %d to job", pid)
-        return _JobHandle(job)
 
 
 def os_name() -> str:

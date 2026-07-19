@@ -11,10 +11,10 @@ import subprocess
 import sys
 import tempfile
 from abc import ABC, abstractmethod
-from collections.abc import MutableMapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Protocol, TypeAlias, cast
+from typing import Protocol, TextIO, TypeAlias, cast
 
 from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
 
@@ -271,6 +271,37 @@ class ContainmentHandle(Protocol):
         pass
 
 
+class ProcessHandle(Protocol):
+    """Small subprocess surface used by the OS-environment helper."""
+
+    pid: int
+
+    @property
+    def stdin(self) -> TextIO | None: ...
+
+    @property
+    def stdout(self) -> TextIO | None: ...
+
+    @property
+    def stderr(self) -> TextIO | None: ...
+
+    def poll(self) -> int | None: ...
+
+    def wait(self, timeout: float | None = None) -> int: ...
+
+    def terminate(self) -> None: ...
+
+    def kill(self) -> None: ...
+
+
+@dataclass
+class SandboxLaunchResult:
+    """A process created by a sandbox backend and its lifetime owner."""
+
+    process: ProcessHandle
+    containment: ContainmentHandle | None
+
+
 class SandboxBackend(ABC):
     """
     Backend interface for host sandbox implementations.
@@ -367,6 +398,23 @@ class SandboxBackend(ABC):
         """
         del policy, pid
         return None
+
+    def launch_windows(
+        self,
+        argv: list[str],
+        policy: SandboxPolicy,
+        *,
+        cwd: Path,
+        env: Mapping[str, str],
+        stdin: int,
+        stdout: int,
+        stderr: int,
+        text: bool,
+        bufsize: int,
+    ) -> SandboxLaunchResult:
+        """Create a Windows child with security attributes installed at spawn."""
+        del argv, policy, cwd, env, stdin, stdout, stderr, text, bufsize
+        raise NotImplementedError(f"{self.type_name} does not own Windows process launch")
 
 
 _BACKENDS: dict[str, SandboxBackend] = {}

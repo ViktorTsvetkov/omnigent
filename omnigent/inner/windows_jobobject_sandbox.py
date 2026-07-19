@@ -190,7 +190,12 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
             ),
             credential_proxy=sandbox_spec.credential_proxy,
         )
-        if not policy.write_roots and not policy.write_files:
+        if (
+            policy.read_roots is None
+            and policy.allow_network
+            and not policy.write_roots
+            and not policy.write_files
+        ):
             _warn_no_fs_isolation_once()
         return policy
 
@@ -204,7 +209,12 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
     ) -> list[str]:
         """Launch write-granted policies through the low-IL wrapper."""
         del target
-        if not policy.write_roots and not policy.write_files:
+        if (
+            policy.read_roots is None
+            and policy.allow_network
+            and not policy.write_roots
+            and not policy.write_files
+        ):
             return argv
         from .windows_sandbox_launch import encode_policy
 

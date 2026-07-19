@@ -621,6 +621,11 @@ class _HelperProcessClient:
                 pass
             if proc.poll() is None:
                 try:
+                    if IS_WINDOWS:
+                        # The Windows wrapper restores AppContainer ACLs and
+                        # deletes its ephemeral profile after helper EOF.
+                        proc.wait(timeout=10)
+                        return
                     proc.terminate()
                     proc.wait(timeout=1)
                 except Exception:  # noqa: BLE001 — terminate may fail on already-exited process; escalate to kill

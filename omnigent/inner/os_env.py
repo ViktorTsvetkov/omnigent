@@ -7,6 +7,7 @@ import base64
 import codecs
 import contextlib
 import json
+import ntpath
 import os
 import shutil
 import subprocess
@@ -911,7 +912,10 @@ def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
             "os_env.start_in_scratch requires an active sandbox; "
             f"resolved sandbox type {sandbox.backend_type!r} is inactive"
         )
-    shell_path = shutil.which("bash") or shutil.which("sh")
+    if IS_WINDOWS:
+        shell_path = _resolve_windows_shell()
+    else:
+        shell_path = shutil.which("bash") or shutil.which("sh")
     if shell_path is None:
         # No POSIX shell on PATH. On Windows fall back to cmd.exe; elsewhere
         # keep the historical /bin/sh default.
@@ -930,6 +934,45 @@ def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
         _egress_rules=egress_rules,
         _egress_allow_private_destinations=egress_allow_private,
     )
+
+
+def _is_windows_bash_launcher(path: str) -> bool:
+    """Return whether ``path`` is a Windows-directory WSL launcher."""
+    windows_dir = os.environ.get("WINDIR") or os.environ.get("SYSTEMROOT")
+    if not windows_dir or ntpath.basename(path).lower() != "bash.exe":
+        return False
+    candidate = ntpath.normcase(ntpath.abspath(path))
+    for dirname in ("System32", "Sysnative", "SysWOW64"):
+        system_dir = ntpath.normcase(ntpath.abspath(ntpath.join(windows_dir, dirname)))
+        try:
+            if ntpath.commonpath((candidate, system_dir)) == system_dir:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _resolve_windows_shell() -> str:
+    """Resolve a Windows-native shell, preferring a usable Git Bash."""
+    bash_path = shutil.which("bash")
+    if bash_path and not _is_windows_bash_launcher(bash_path):
+        return bash_path
+
+    git_roots = {
+        os.path.join(root, "Git")
+        for name in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA")
+        if (root := os.environ.get(name))
+    }
+    for root in sorted(git_roots):
+        for relative in (("bin", "bash.exe"), ("usr", "bin", "bash.exe")):
+            candidate = os.path.join(root, *relative)
+            if os.path.isfile(candidate):
+                return candidate
+
+    sh_path = shutil.which("sh")
+    if sh_path:
+        return sh_path
+    return os.environ.get("COMSPEC", "cmd.exe")
 
 
 def default_os_env_spec_for_type(env_type: str) -> OSEnvSpec:
@@ -1496,10 +1539,11 @@ def _is_within(path: Path, root: Path) -> bool:
         return False
 
 
-def _shell_argv(shell_path: str, command: str) -> list[str]:
+def _shell_argv(shell_path: str, command: str) -> list[str] | str:
     shell_name = Path(shell_path).name.lower()
     if shell_name in ("cmd.exe", "cmd"):
-        return [shell_path, "/c", command]
+        shell = subprocess.list2cmdline([shell_path])
+        return f'{shell} /d /s /c "{command}"'
     if shell_name in ("powershell.exe", "powershell", "pwsh.exe", "pwsh"):
         return [shell_path, "-NoProfile", "-Command", command]
     if shell_name in ("bash", "bash.exe"):

@@ -4916,13 +4916,17 @@ def create_terminal_instance(
             egress_rules = list(sandbox_spec.egress_rules)
             egress_allow_private = bool(sandbox_spec.egress_allow_private_destinations)
 
+    command = spec.command or "bash"
+    if IS_WINDOWS and Path(command).name.lower() in ("bash", "bash.exe"):
+        command = getattr(os_env, "shell_path", command)
+
     instance = TerminalInstance(
         name=name,
         session_key=session_key,
         socket_path=socket_path,
         private_dir=private_dir,
         os_env=os_env,
-        command=spec.command or "bash",
+        command=command,
         args=list(spec.args),
         env=dict(spec.env),
         env_unset=list(spec.env_unset),

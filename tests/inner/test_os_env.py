@@ -6,6 +6,7 @@ import asyncio
 import base64
 import os
 import shutil
+import sys
 import tracemalloc
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from omnigent.inner.os_env import (
     _child_shell_env,
     _project_root,
     _read_impl,
+    _resolve_windows_shell,
     _shell_impl,
     build_helper_env,
     create_os_environment,
@@ -61,6 +63,57 @@ def _active_policy() -> SandboxPolicy:
         write_files=[],
         allow_network=True,
     )
+
+
+def test_windows_shell_skips_system32_bash_and_prefers_git_bash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The WSL launcher must not win over an installed Git Bash."""
+    git_bash = tmp_path / "Git" / "bin" / "bash.exe"
+    git_bash.parent.mkdir(parents=True)
+    git_bash.touch()
+    monkeypatch.setenv("WINDIR", r"C:\Windows")
+    monkeypatch.setenv("ProgramFiles", str(tmp_path))
+    monkeypatch.delenv("ProgramFiles(x86)", raising=False)
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: r"C:\Windows\System32\bash.exe" if name == "bash" else None,
+    )
+
+    assert _resolve_windows_shell() == str(git_bash)
+
+
+def test_windows_shell_falls_back_to_comspec_after_wsl_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A machine without Git Bash uses its native command processor."""
+    monkeypatch.setenv("WINDIR", r"C:\Windows")
+    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+    for name in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: r"C:\Windows\Sysnative\bash.exe" if name == "bash" else None,
+    )
+
+    assert _resolve_windows_shell() == r"C:\Windows\System32\cmd.exe"
+
+
+@pytest.mark.skipif(not IS_WINDOWS, reason="cmd.exe is Windows-only")
+def test_cmd_shell_runs_quoted_python_executable(tmp_path: Path) -> None:
+    """The filesystem helper's quoted Python command survives cmd parsing."""
+    result = _shell_impl(
+        command=f'"{sys.executable}" -c "print(\'cmd-fallback-ok\')"',
+        timeout=10,
+        shell_path=os.environ.get("COMSPEC", "cmd.exe"),
+        cwd=tmp_path,
+    )
+
+    assert result["exit_code"] == 0
+    assert result["stdout"].strip() == "cmd-fallback-ok"
 
 
 def test_build_helper_env_inactive_strips_binding_token() -> None:

@@ -54,6 +54,32 @@ def test_get_returns_none_for_unknown_triple() -> None:
     assert reg.get("conv_nope", "bash", "s1") is None
 
 
+@pytest.mark.asyncio
+async def test_launch_captures_newly_exited_terminal_from_backend(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Windows launch diagnostics read output through the terminal backend."""
+    reg = TerminalRegistry()
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "terminal.sock",
+        private_dir=tmp_path / "terminal",
+    )
+    instance.launch = AsyncMock()  # type: ignore[method-assign]
+    instance.is_alive = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    instance.close = AsyncMock()  # type: ignore[method-assign]
+    instance.terminal_backend.capture = AsyncMock(return_value="launcher failed\n")  # type: ignore[method-assign]
+    created = TerminalCreateResult(instance=instance, cwd=tmp_path)
+    monkeypatch.setattr(registry_mod, "IS_WINDOWS", True)
+    monkeypatch.setattr(registry_mod, "create_terminal_instance", lambda *args, **kwargs: created)
+
+    with pytest.raises(RuntimeError, match="Last output:\\nlauncher failed"):
+        await reg.launch("conv", "bash", "s1", TerminalEnvSpec())
+
+    instance.terminal_backend.capture.assert_awaited_once_with(scrollback=200)  # type: ignore[attr-defined]
+
+
 def test_list_for_conversation_returns_empty_for_unknown_id() -> None:
     """
     Listing a conversation that never registered terminals must

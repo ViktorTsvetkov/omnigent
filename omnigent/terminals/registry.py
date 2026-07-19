@@ -233,7 +233,9 @@ class TerminalRegistry:
             message = f"terminal {terminal_name}:{session_key} exited before it became available"
             if IS_WINDOWS:
                 try:
-                    last_output = (await created.instance.capture(scrollback=200)).strip()
+                    last_output = (
+                        await created.instance.terminal_backend.capture(scrollback=200)
+                    ).strip()
                 except Exception:
                     logger.exception(
                         "Failed to capture output from newly exited terminal %s:%s in conv %s",

@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import TerminalInstance, create_terminal_instance
 
@@ -229,6 +230,21 @@ class TerminalRegistry:
         )
         await created.instance.launch(cwd=created.cwd)
         if not await created.instance.is_alive():
+            message = f"terminal {terminal_name}:{session_key} exited before it became available"
+            if IS_WINDOWS:
+                try:
+                    last_output = (await created.instance.capture(scrollback=200)).strip()
+                except Exception:
+                    logger.exception(
+                        "Failed to capture output from newly exited terminal %s:%s in conv %s",
+                        terminal_name,
+                        session_key,
+                        conversation_id,
+                    )
+                    last_output = ""
+                if last_output:
+                    message = f"{message}\nLast output:\n{last_output}"
+                logger.error("%s", message)
             try:
                 await asyncio.wait_for(created.instance.close(), timeout=_CLOSE_TIMEOUT_S)
             except asyncio.TimeoutError:
@@ -238,9 +254,7 @@ class TerminalRegistry:
                     session_key,
                     conversation_id,
                 )
-            raise RuntimeError(
-                f"terminal {terminal_name}:{session_key} exited before it became available"
-            )
+            raise RuntimeError(message)
 
         with self._lock:
             slot = self._by_conversation.setdefault(conversation_id, {})

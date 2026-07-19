@@ -115,9 +115,7 @@ def test_explicit_appcontainer_rejects_open_network(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match=r"only supports allow_network=false"):
         WindowsAppContainerSandboxBackend().resolve(
-            OSEnvSpec(
-                sandbox=OSEnvSandboxSpec(type="windows_appcontainer", allow_network=True)
-            ),
+            OSEnvSpec(sandbox=OSEnvSandboxSpec(type="windows_appcontainer", allow_network=True)),
             tmp_path,
         )
 
@@ -411,9 +409,7 @@ def test_appcontainer_filesystem_and_network_jail() -> None:
     listener.bind(("127.0.0.1", 0))
     listener.listen()
     port = listener.getsockname()[1]
-    policy = SandboxPolicy(
-        "windows_appcontainer", True, [readonly], [allowed], [], False
-    )
+    policy = SandboxPolicy("windows_appcontainer", True, [readonly], [allowed], [], False)
     script = r"""
 import json, pathlib, socket, sys
 allowed, readonly, forbidden = map(pathlib.Path, sys.argv[1:4])
@@ -462,59 +458,74 @@ print(json.dumps(out))
     assert output["net:8.8.8.8"].startswith("denied:10013")
     assert "TimeoutError" in output["net:127.0.0.1"]
     assert (
-        subprocess.run(
-            ["icacls", str(allowed)], check=True, capture_output=True, text=True
-        ).stdout
+        subprocess.run(["icacls", str(allowed)], check=True, capture_output=True, text=True).stdout
         == dacl_before
     )
 
 
-def test_existing_appcontainer_profile_is_deleted_on_close() -> None:
-    """C3 primitives remain covered even though C3 integration is out of scope."""
-    from omnigent.inner.windows_sandbox import create_appcontainer_profile
+@pytest.mark.parametrize("close_reason", ["normal-exit", "job-kill"])
+def test_appcontainer_close_only_releases_per_run_resources(
+    close_reason: str, monkeypatch
+) -> None:
+    import inspect
 
-    name = f"omnigent-test-{uuid.uuid4().hex}"
-    profile = create_appcontainer_profile(name)
-    assert profile.sid
-    derived = create_appcontainer_profile(name)
-    assert not derived.created
-    derived.close()
-    profile.close()
+    import omnigent.inner.windows_sandbox_process as process
+    import omnigent.inner.windows_security as security
 
-    recreated = create_appcontainer_profile(name)
-    try:
-        assert recreated.created
-    finally:
-        recreated.close()
+    calls: list[str] = []
 
+    class CloseSpy:
+        def __init__(self, name: str) -> None:
+            self.name = name
 
-def test_existing_appcontainer_process_can_use_granted_root(tmp_path: Path) -> None:
-    """The C1+C2 launch changes do not regress existing C3 primitives."""
-    from omnigent.inner.windows_sandbox import (
-        cleanup_appcontainer,
-        create_appcontainer_profile,
-        create_process_appcontainer,
-        wait_process,
+        def close(self) -> None:
+            calls.append(self.name)
+
+    def forbidden() -> None:
+        pytest.fail("per-run close must not tear down install-level AppContainer state")
+
+    monkeypatch.setattr(security, "teardown_appcontainer", forbidden)
+    monkeypatch.setattr(security, "teardown_appcontainer_read_grants", forbidden)
+    monkeypatch.setattr(security, "cleanup_appcontainer_profile", forbidden)
+    monkeypatch.setattr(security.kernel32, "LocalFree", lambda _sid: calls.append("sid"))
+    launch_security = security.WindowsLaunchSecurity(
+        None,
+        acl_leases=[CloseSpy("write-acl")],
+        appcontainer_sid=wintypes.LPVOID(1),
+    )
+    containment = process._WindowsContainment(
+        CloseSpy("job"),
+        launch_security,
+        process._SharedHandle(None),
+        process._SharedHandle(None),
     )
 
-    profile = create_appcontainer_profile(f"omnigent-test-{uuid.uuid4().hex}")
-    grants = []
-    output = tmp_path / "appcontainer.txt"
-    try:
-        _, process, grants = create_process_appcontainer(
-            profile.sid,
-            [
-                sys._base_executable,
-                "-c",
-                "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ok')",
-                str(output),
-            ],
-            tmp_path,
-            os.environ,
-            [],
-            [tmp_path],
-        )
-        assert wait_process(process) == 0
-    finally:
-        cleanup_appcontainer(profile, grants)
-    assert output.read_text() == "ok"
+    containment.close()
+
+    assert close_reason in {"normal-exit", "job-kill"}
+    assert calls == ["job", "write-acl", "sid"]
+    assert launch_security.appcontainer_sid is None
+    close_source = inspect.getsource(security.WindowsLaunchSecurity.close)
+    assert "teardown_appcontainer" not in close_source
+    assert "cleanup_appcontainer_profile" not in close_source
+
+
+def test_explicit_appcontainer_teardown_owns_durable_state(monkeypatch) -> None:
+    import inspect
+
+    import omnigent.inner.windows_security as security
+
+    calls: list[str] = []
+    grant_source = inspect.getsource(security.teardown_appcontainer_read_grants)
+    profile_source = inspect.getsource(security.cleanup_appcontainer_profile)
+    monkeypatch.setattr(
+        security, "teardown_appcontainer_read_grants", lambda: calls.append("read-grants")
+    )
+    monkeypatch.setattr(security, "cleanup_appcontainer_profile", lambda: calls.append("profile"))
+
+    security.teardown_appcontainer()
+
+    assert calls == ["read-grants", "profile"]
+    assert "DeriveAppContainerSidFromAppContainerName" in grant_source
+    assert "REVOKE_ACCESS" in grant_source
+    assert "DeleteAppContainerProfile" in profile_source

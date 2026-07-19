@@ -9,6 +9,7 @@ import shutil
 import sys
 import tracemalloc
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -98,8 +99,64 @@ def test_windows_shell_falls_back_to_comspec_after_wsl_launcher(
         "which",
         lambda name: r"C:\Windows\Sysnative\bash.exe" if name == "bash" else None,
     )
+    monkeypatch.setattr(os.path, "isfile", lambda _path: False)
+
+    registry = SimpleNamespace(
+        HKEY_LOCAL_MACHINE=object(),
+        HKEY_CURRENT_USER=object(),
+        OpenKey=lambda hive, key: (_ for _ in ()).throw(FileNotFoundError()),
+    )
+    monkeypatch.setitem(sys.modules, "winreg", registry)
 
     assert _resolve_windows_shell() == r"C:\Windows\System32\cmd.exe"
+
+
+def test_windows_shell_finds_literal_git_bash_without_discovery_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default Git install is found without PATH or ProgramFiles."""
+    for name in ("PATH", "ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SystemDrive", "C:")
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        os.path,
+        "isfile",
+        lambda path: path == r"C:\Program Files\Git\usr\bin\bash.exe",
+    )
+
+    assert _resolve_windows_shell() == r"C:\Program Files\Git\usr\bin\bash.exe"
+
+
+def test_windows_shell_finds_registry_git_bash_without_discovery_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Git for Windows registry entry works with a filtered runner env."""
+    for name in ("PATH", "ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+
+    class FakeKey:
+        def __enter__(self) -> FakeKey:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    registry = SimpleNamespace(
+        HKEY_LOCAL_MACHINE=object(),
+        HKEY_CURRENT_USER=object(),
+        OpenKey=lambda hive, key: FakeKey(),
+        QueryValueEx=lambda key, name: (r"D:\Apps\Git", 1),
+    )
+    monkeypatch.setitem(sys.modules, "winreg", registry)
+    monkeypatch.setattr(
+        os.path,
+        "isfile",
+        lambda path: path == r"D:\Apps\Git\bin\bash.exe",
+    )
+
+    assert _resolve_windows_shell() == r"D:\Apps\Git\bin\bash.exe"
 
 
 @pytest.mark.skipif(not IS_WINDOWS, reason="cmd.exe is Windows-only")

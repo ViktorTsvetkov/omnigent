@@ -958,12 +958,48 @@ def _resolve_windows_shell() -> str:
     if bash_path and not _is_windows_bash_launcher(bash_path):
         return bash_path
 
-    git_roots = {
-        os.path.join(root, "Git")
-        for name in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA")
-        if (root := os.environ.get(name))
-    }
-    for root in sorted(git_roots):
+    program_files = os.environ.get("PROGRAMFILES")
+    program_files_x86 = os.environ.get("PROGRAMFILES(X86)")
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    system_drive = os.environ.get("SYSTEMDRIVE", "C:")
+    git_roots = [
+        root
+        for root in (
+            os.path.join(program_files, "Git") if program_files else None,
+            os.path.join(program_files_x86, "Git") if program_files_x86 else None,
+            os.path.join(local_app_data, "Programs", "Git") if local_app_data else None,
+        )
+        if root
+    ]
+    try:
+        import winreg
+
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            for key_name in (
+                r"SOFTWARE\GitForWindows",
+                r"SOFTWARE\WOW6432Node\GitForWindows",
+            ):
+                try:
+                    with winreg.OpenKey(hive, key_name) as key:
+                        install_path, _ = winreg.QueryValueEx(key, "InstallPath")
+                    if isinstance(install_path, str):
+                        git_roots.append(install_path)
+                except OSError:
+                    continue
+    except ImportError:
+        pass
+
+    git_roots.extend(
+        root
+        for root in (
+            os.path.join(system_drive + os.sep, "Program Files", "Git"),
+            os.path.join(system_drive + os.sep, "Program Files (x86)", "Git"),
+            r"C:\Program Files\Git",
+            r"C:\Program Files (x86)\Git",
+        )
+        if root
+    )
+    for root in dict.fromkeys(git_roots):
         for relative in (("bin", "bash.exe"), ("usr", "bin", "bash.exe")):
             candidate = os.path.join(root, *relative)
             if os.path.isfile(candidate):

@@ -33,6 +33,7 @@ import ctypes
 import ctypes.wintypes as wintypes
 import functools
 import logging
+import sys
 from pathlib import Path
 from types import TracebackType
 
@@ -167,15 +168,13 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
             )
 
         sandbox_spec = spec.sandbox or OSEnvSandboxSpec(type=self.type_name)
-        _warn_no_fs_isolation_once()
-
         read_roots: list[Path] | None = None
         if sandbox_spec.read_paths is not None:
             read_roots = [(cwd / r).resolve() for r in sandbox_spec.read_paths]
         write_roots = [(cwd / w).resolve() for w in (sandbox_spec.write_paths or [])]
         write_files = [(cwd / f).resolve() for f in (sandbox_spec.write_files or [])]
 
-        return SandboxPolicy(
+        policy = SandboxPolicy(
             backend_type=self.type_name,
             active=True,
             read_roots=read_roots,
@@ -191,6 +190,32 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
             ),
             credential_proxy=sandbox_spec.credential_proxy,
         )
+        if not policy.write_roots and not policy.write_files:
+            _warn_no_fs_isolation_once()
+        return policy
+
+    def wrap_launcher_argv(
+        self,
+        argv: list[str],
+        policy: SandboxPolicy,
+        cwd: Path,
+        chdir: Path | None = None,
+        target: str | None = None,
+    ) -> list[str]:
+        """Launch write-granted policies through the low-IL wrapper."""
+        del target
+        if not policy.write_roots and not policy.write_files:
+            return argv
+        from .windows_sandbox_launch import encode_policy
+
+        return [
+            sys.executable,
+            "-m",
+            "omnigent.inner.windows_sandbox_launch",
+            encode_policy(policy, chdir or cwd),
+            "--",
+            *argv,
+        ]
 
     def activate(self, policy: SandboxPolicy) -> None:
         """No-op: containment is applied by :meth:`post_spawn` from the parent.

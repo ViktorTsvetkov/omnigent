@@ -15667,11 +15667,11 @@ def test_publish_terminal_pending_emits_pending_then_clear() -> None:
     assert all(p.session_id == "7cef62c6518d5591cc7991974e33ec4c" for p in published)
 
 
-def test_publish_native_terminal_start_error_emits_failed_status_only(
+def test_publish_native_terminal_start_error_emits_failed_status_with_cause(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
-    Native terminal startup failure publishes a generic ``failed`` status.
+    Native terminal startup failure publishes a diagnosable ``failed`` status.
 
     The runner must stay alive when terminal auto-create fails, but the
     affected session should only receive ``session.status: failed`` from
@@ -15680,9 +15680,9 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
     and then publish/persist a second error when the user message
     fast-fails against the same terminal.
 
-    The published/returned message is a fixed, client-safe string — the raw
-    exception text (which can embed paths/CLI details) is logged for
-    operators, not surfaced on the session stream.
+    The published/returned message includes the raw exception text so a launch
+    or Codex config failure is diagnosable without runner-log access. The same
+    cause remains logged for operators.
 
     :param caplog: Pytest log capture fixture, used to confirm the raw
         cause is logged server-side.
@@ -15697,19 +15697,19 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
             _capture,
             "415c9954e2fe4b9276083a4d2c66f689",
             "Codex",
-            ImportError("Native Codex requires the 'codex' CLI on PATH."),
+            RuntimeError('error loading config: unknown field "removed_key" in config.toml'),
         )
 
-    # Generic, client-safe payload — no raw exception text.
+    # The underlying cause is visible in both the payload and operator logs.
     assert error == {
         "code": "native_terminal_start_failed",
-        "message": "Native Codex terminal failed to start; see runner logs for details.",
+        "message": (
+            "Native Codex terminal failed to start: "
+            'error loading config: unknown field "removed_key" in config.toml'
+        ),
     }
-    # The raw cause must NOT leak into the surfaced message, but MUST be
-    # logged for operators. If this fails, the redaction regressed (raw
-    # text back in the payload) or the server-side log was dropped.
-    assert "requires the 'codex' CLI" not in error["message"]
-    assert "requires the 'codex' CLI on PATH." in caplog.text
+    assert 'unknown field "removed_key"' in error["message"]
+    assert 'unknown field "removed_key"' in caplog.text
     assert [p.event for p in published] == [
         {
             "type": "session.status",

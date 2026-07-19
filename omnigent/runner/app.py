@@ -5240,11 +5240,12 @@ def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) 
         e.g. ``ImportError("Native Codex requires the 'codex' CLI on PATH.")``.
     :param runtime_name: Human-readable runtime name, e.g. ``"Codex"``.
     :returns: ``{"code": ..., "message": ...}`` payload for SSE and
-        JSON error responses. The message is a fixed, client-safe string;
-        the raw cause is logged for operators, not surfaced to the caller.
+        JSON error responses. The message includes the underlying exception
+        so launch and configuration failures are diagnosable by the caller.
     """
     _logger.warning("Native %s terminal start failed: %s", runtime_name, exc, exc_info=True)
-    message = f"Native {runtime_name} terminal failed to start; see runner logs for details."
+    detail = str(exc).strip() or type(exc).__name__
+    message = f"Native {runtime_name} terminal failed to start: {detail}"
     return {"code": _NATIVE_TERMINAL_START_FAILED_CODE, "message": message}
 
 

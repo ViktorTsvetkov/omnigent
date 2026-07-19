@@ -473,6 +473,31 @@ def test_create_terminal_instance_propagates_keep_alive_after_exit(
         shutil.rmtree(result.instance.private_dir, ignore_errors=True)
 
 
+@pytest.mark.parametrize("shell", ["powershell", "pwsh", "cmd"])
+def test_create_terminal_instance_resolves_native_windows_shell_to_absolute_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shell: str
+) -> None:
+    executable = tmp_path / "System32" / f"{shell}.exe"
+    executable.parent.mkdir()
+    executable.touch()
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        terminal_mod,
+        "resolve_windows_interactive_shell_path",
+        lambda command: str(executable) if command == shell else None,
+    )
+    spec = TerminalEnvSpec(
+        command=shell,
+        os_env=OSEnvSpec(type="caller_process", cwd=str(tmp_path)),
+    )
+
+    result = create_terminal_instance(name=shell, session_key="s1", spec=spec)
+    try:
+        assert result.instance.command == str(executable)
+    finally:
+        shutil.rmtree(result.instance.private_dir, ignore_errors=True)
+
+
 @pytest.mark.asyncio
 async def test_launch_keeps_server_alive_when_opted_in(
     tmp_path: Path,

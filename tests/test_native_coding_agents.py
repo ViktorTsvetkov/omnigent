@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+import omnigent.native_coding_agents as native_coding_agents_mod
 from omnigent._wrapper_labels import (
     KIRO_NATIVE_WRAPPER_VALUE,
     PI_NATIVE_WRAPPER_VALUE,
@@ -141,8 +142,7 @@ def test_native_shell_terminal_spec_falls_back_to_bash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With no shells installed the spec still offers a single bash terminal."""
-    monkeypatch.setattr("shutil.which", lambda name: None)
-    monkeypatch.delenv("SHELL", raising=False)
+    monkeypatch.setattr(native_coding_agents_mod, "installed_interactive_shells", lambda: ["bash"])
     spec = native_shell_terminal_spec()
     assert list(spec) == ["bash"]
     assert spec["bash"]["command"] == "bash"

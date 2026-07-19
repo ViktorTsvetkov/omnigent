@@ -18,6 +18,7 @@ import getpass
 import hashlib
 import logging
 import os
+import re
 import shutil
 import sys
 from contextlib import suppress
@@ -227,6 +228,41 @@ _KNOWN_INTERACTIVE_SHELLS = frozenset({"bash", "zsh", "fish", "sh", "dash", "ksh
 _OFFERED_INTERACTIVE_SHELLS = ("bash", "zsh", "fish")
 
 
+def resolve_windows_interactive_shell_path(command: str) -> str | None:
+    """Resolve a native Windows interactive shell to an absolute executable."""
+    name = Path(command).name.lower()
+    if name in {"cmd", "cmd.exe"}:
+        windir = Path(os.environ.get("WINDIR") or os.environ.get("SYSTEMROOT") or r"C:\Windows")
+        candidates = (windir / "System32" / "cmd.exe",)
+    elif name in {"powershell", "powershell.exe"}:
+        windir = Path(os.environ.get("WINDIR") or os.environ.get("SYSTEMROOT") or r"C:\Windows")
+        candidates = (windir / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe",)
+    elif name in {"pwsh", "pwsh.exe"}:
+        roots = [Path(os.environ.get("PROGRAMFILES") or r"C:\Program Files") / "PowerShell"]
+        literal_root = Path(r"C:\Program Files\PowerShell")
+        if literal_root not in roots:
+            roots.append(literal_root)
+        candidates = tuple(
+            path
+            for root in roots
+            for path in sorted(
+                root.glob("*/pwsh.exe"),
+                key=lambda item: tuple(int(part) for part in re.findall(r"\d+", item.parent.name)),
+                reverse=True,
+            )
+        )
+        path_on_path = shutil.which("pwsh")
+        if path_on_path:
+            candidates += (Path(path_on_path),)
+    else:
+        return None
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate.resolve())
+    return None
+
+
 def default_interactive_shell() -> str:
     """
     Basename of the user's login shell for an interactive terminal.
@@ -240,7 +276,7 @@ def default_interactive_shell() -> str:
     :returns: A shell basename such as ``"zsh"``, ``"fish"``, or ``"bash"``.
     """
     if IS_WINDOWS:
-        # Native tmux/PTY terminals are unsupported on Windows anyway.
+        # Git Bash remains the default tool-compatible interactive shell.
         return "bash"
     import shutil
 
@@ -264,8 +300,13 @@ def installed_interactive_shells() -> list[str]:
     """
     ordered = [default_interactive_shell()]
     if IS_WINDOWS:
-        # Native tmux/PTY terminals are unsupported on Windows anyway; the lone
-        # bash default from above is all we can meaningfully offer.
+        # ConPTY hosts native shells, but its runner has a deliberately stripped
+        # PATH, so only offer executables found at resolvable absolute paths.
+        powershell = "pwsh" if resolve_windows_interactive_shell_path("pwsh") else "powershell"
+        if resolve_windows_interactive_shell_path(powershell):
+            ordered.append(powershell)
+        if resolve_windows_interactive_shell_path("cmd"):
+            ordered.append("cmd")
         return ordered
     import shutil
 

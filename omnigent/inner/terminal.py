@@ -26,7 +26,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TypeAlias
 
-from omnigent._platform import IS_WINDOWS
+from omnigent._platform import IS_WINDOWS, resolve_windows_interactive_shell_path
 from omnigent.runner.identity import strip_runner_auth_secrets
 
 from . import _proc
@@ -4917,8 +4917,22 @@ def create_terminal_instance(
             egress_allow_private = bool(sandbox_spec.egress_allow_private_destinations)
 
     command = spec.command or "bash"
-    if IS_WINDOWS and Path(command).name.lower() in ("bash", "bash.exe"):
-        command = getattr(os_env, "shell_path", command)
+    if IS_WINDOWS:
+        command_name = Path(command).name.lower()
+        if command_name in ("bash", "bash.exe"):
+            command = getattr(os_env, "shell_path", command)
+        elif command_name in {
+            "powershell",
+            "powershell.exe",
+            "pwsh",
+            "pwsh.exe",
+            "cmd",
+            "cmd.exe",
+        }:
+            resolved_command = resolve_windows_interactive_shell_path(command)
+            if resolved_command is None:
+                raise RuntimeError(f"Windows interactive shell is not installed: {command}")
+            command = resolved_command
 
     instance = TerminalInstance(
         name=name,

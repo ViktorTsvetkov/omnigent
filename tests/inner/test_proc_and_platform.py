@@ -119,6 +119,53 @@ def test_installed_interactive_shells_always_nonempty(
     assert _platform.installed_interactive_shells() == ["bash"]
 
 
+def test_installed_interactive_shells_on_windows_offers_native_shells(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    windir = tmp_path / "Windows"
+    program_files = tmp_path / "Program Files"
+    cmd = windir / "System32" / "cmd.exe"
+    powershell = windir / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    pwsh = program_files / "PowerShell" / "7" / "pwsh.exe"
+    for executable in (cmd, powershell, pwsh):
+        executable.parent.mkdir(parents=True, exist_ok=True)
+        executable.touch()
+
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setenv("WINDIR", str(windir))
+    monkeypatch.setenv("PROGRAMFILES", str(program_files))
+    monkeypatch.setattr(_platform.shutil, "which", lambda _name: None)
+
+    assert _platform.installed_interactive_shells() == ["bash", "pwsh", "cmd"]
+    assert _platform.resolve_windows_interactive_shell_path("pwsh") == str(pwsh.resolve())
+    assert _platform.resolve_windows_interactive_shell_path("powershell") == str(
+        powershell.resolve()
+    )
+    assert _platform.resolve_windows_interactive_shell_path("cmd.exe") == str(cmd.resolve())
+
+
+def test_installed_interactive_shells_on_windows_falls_back_to_windows_powershell(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    windir = tmp_path / "Windows"
+    powershell = windir / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    powershell.parent.mkdir(parents=True)
+    powershell.touch()
+
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setenv("WINDIR", str(windir))
+    monkeypatch.setenv("PROGRAMFILES", str(tmp_path / "missing"))
+    monkeypatch.setattr(_platform.shutil, "which", lambda _name: None)
+    real_resolver = _platform.resolve_windows_interactive_shell_path
+    monkeypatch.setattr(
+        _platform,
+        "resolve_windows_interactive_shell_path",
+        lambda command: None if command in {"pwsh", "cmd"} else real_resolver(command),
+    )
+
+    assert _platform.installed_interactive_shells() == ["bash", "powershell"]
+
+
 def test_stable_user_id_is_stable_and_path_safe() -> None:
     uid = _platform.stable_user_id()
     assert uid == _platform.stable_user_id()

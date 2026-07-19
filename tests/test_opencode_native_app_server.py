@@ -124,6 +124,49 @@ def test_filtered_server_env_drops_global_opencode_config(
     assert env["XDG_CONFIG_HOME"] == str(tmp_path / "xdg-config")
 
 
+def test_filtered_server_env_includes_windows_essentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
+
+    windows_env = {name: f"value-{name}" for name in WINDOWS_ENV_PASSTHROUGH}
+    windows_env.update({"TEMP": r"C:\temp", "TMP": r"C:\tmp"})
+    monkeypatch.setattr(appsrv, "IS_WINDOWS", True)
+    monkeypatch.setattr(appsrv.os, "environ", windows_env)
+
+    env = filtered_server_env(bridge_dir=tmp_path, auth_secret="pw")
+
+    for name, value in windows_env.items():
+        assert env[name] == value
+
+
+def test_filtered_server_env_posix_allowlist_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    parent_env = {
+        "PATH": "/usr/bin",
+        "HOME": "/home/tester",
+        "ANTHROPIC_API_KEY": "secret-key",
+        "SYSTEMROOT": r"C:\Windows",
+        "TEMP": r"C:\temp",
+        "RANDOM_UNRELATED": "nope",
+    }
+    monkeypatch.setattr(appsrv, "IS_WINDOWS", False)
+    monkeypatch.setattr(appsrv.os, "environ", parent_env)
+
+    env = filtered_server_env(bridge_dir=tmp_path, auth_secret="pw")
+
+    assert env == {
+        "PATH": "/usr/bin",
+        "HOME": "/home/tester",
+        "ANTHROPIC_API_KEY": "secret-key",
+        "XDG_DATA_HOME": str(tmp_path / "xdg-data"),
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg-config"),
+        "OPENCODE_SERVER_PASSWORD": "pw",
+        "OPENCODE_SERVER_USERNAME": "opencode",
+    }
+
+
 def _server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> OpenCodeNativeServer:
     monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
     return OpenCodeNativeServer(

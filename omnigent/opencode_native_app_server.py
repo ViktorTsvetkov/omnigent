@@ -39,6 +39,7 @@ from pathlib import Path
 import httpx
 from packaging.version import InvalidVersion, Version
 
+from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
 from omnigent.opencode_native_bridge import (
     OPENCODE_DEFAULT_USERNAME,
     OPENCODE_SERVER_PASSWORD_ENV_VAR,
@@ -342,12 +343,15 @@ def filtered_server_env(
     :returns: The environment mapping for the server subprocess.
     """
     env: dict[str, str] = {}
+    passthrough_keys = _ENV_PASSTHROUGH_KEYS
+    if IS_WINDOWS:
+        passthrough_keys = (*passthrough_keys, *WINDOWS_ENV_PASSTHROUGH, "TEMP", "TMP")
     for key, value in os.environ.items():
         if key in _ENV_OPENCODE_CONFIG_DENYLIST:
             # Never inherit the parent's global OpenCode config — the
             # per-session XDG dirs are the only config source.
             continue
-        if key in _ENV_PASSTHROUGH_KEYS or key.startswith(_ENV_PASSTHROUGH_PREFIXES):
+        if key in passthrough_keys or key.startswith(_ENV_PASSTHROUGH_PREFIXES):
             env[key] = value
     env.update(extra_env or {})
     env["XDG_DATA_HOME"] = str(xdg_data_home_for_bridge_dir(bridge_dir))

@@ -3391,7 +3391,7 @@ def resolve_terminal_backend_name(*, spec_backend: str | None = None) -> str:
     2. The :data:`_TERMINAL_BACKEND_ENV_VAR` env override.
     3. ``terminal.backend`` in ``~/.omnigent/config.yaml`` (the user config).
     4. The platform default in :data:`_PLATFORM_DEFAULT_BACKEND` — tmux on
-       POSIX; none on Windows (yet).
+       POSIX; ConPTY on native Windows.
 
     An absent value at every tier resolves to the platform default, which is
     the compatibility contract that keeps pre-existing specs working as tmux.
@@ -3400,7 +3400,7 @@ def resolve_terminal_backend_name(*, spec_backend: str | None = None) -> str:
     :returns: The resolved backend name (not yet validated against the
         registry or platform — see :func:`select_terminal_backend_class`).
     :raises RuntimeError: When no tier selects a backend and the current
-        platform has no default (native Windows until herdr lands).
+        platform has no default.
     """
     for candidate in (spec_backend, _env_terminal_backend(), _read_terminal_backend_config()):
         if candidate is not None and candidate.strip():
@@ -4838,11 +4838,8 @@ def create_terminal_instance(
     """
     # Select the multiplexer backend at the single construction point, by the
     # documented precedence (per-terminal spec → env → user config → platform
-    # default). This is the one place platform support is decided: on native
-    # Windows there is no backend yet, so selection raises a clear availability
-    # error (a ``RuntimeError``, as the old hard-raise was) rather than an
-    # incidental failure deeper in construction. ``ensure_available`` then
-    # gates the chosen backend's binary with an install hint.
+    # default). On native Windows selection chooses ConPTY by default, and
+    # ``ensure_available`` checks that pywinpty is installed.
     backend_cls = select_terminal_backend_class(spec_backend=spec.terminal_backend)
     backend_cls.ensure_available()
 

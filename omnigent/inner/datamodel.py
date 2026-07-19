@@ -739,7 +739,7 @@ class TerminalEnvSpec:
         terminal, e.g. ``"tmux"``. ``None`` defers to the selection precedence
         (env ``OMNIGENT_TERMINAL_BACKEND`` → ``terminal.backend`` in
         ``~/.omnigent/config.yaml`` → the platform default: tmux on POSIX,
-        none yet on Windows). The most specific tier wins, so a non-``None``
+        ConPTY on native Windows). The most specific tier wins, so a non-``None``
         value here overrides both the env var and the config. An unknown or
         platform-incompatible name fails loudly at
         :func:`omnigent.inner.terminal.select_terminal_backend_class`.

@@ -4588,10 +4588,11 @@ def _ensure_native_terminal_backend_available(harness: str) -> None:
     the terminal — the terminal only needs to *host* the CLI. Such a harness can
     run wherever a platform-native terminal multiplexer backend is available, so
     on Windows this resolves the seam's backend for this platform and probes its
-    binary via :meth:`~omnigent.inner.terminal.TerminalBackend.ensure_available`
-    (herdr: installed + protocol supported). A missing/too-old/unsupported
-    backend raises the seam's own actionable error (herdr install hint / protocol
-    gate / "no backend for this platform") as a :class:`click.ClickException`.
+    dependencies via
+    :meth:`~omnigent.inner.terminal.TerminalBackend.ensure_available`. ConPTY is
+    the default and checks pywinpty; an override such as herdr checks its own
+    requirements. An unavailable backend raises the seam's actionable error as
+    a :class:`click.ClickException`.
 
     POSIX is left **byte-identical** to the old no-op: tmux hosting there is
     unchanged and its availability keeps failing at terminal-creation time as

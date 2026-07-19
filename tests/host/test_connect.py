@@ -1312,6 +1312,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "OMNIGENT_LOG_LEVEL": "DEBUG",
         "OMNIGENT_LOG_TO_STDERR": "1",
         "OMNIGENT_LOG_TTY_FD": "9",
+        "OMNIGENT_TERMINAL_BACKEND": "herdr",
     }
 
     env = _build_runner_env(
@@ -1328,6 +1329,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     assert env["HOME"] == "/home/alice"
     assert env["LANG"] == "en_US.UTF-8"
     assert env["LC_CTYPE"] == "UTF-8"
+    assert env["OMNIGENT_TERMINAL_BACKEND"] == "herdr"
     # Databricks config selectors are allowlisted ambient passthrough —
     # the ambient value reaches the runner unmodified (no flag override).
     assert env["DATABRICKS_CONFIG_PROFILE"] == "ambient"

@@ -2665,10 +2665,10 @@ def _preflight_local_tools() -> None:
     :returns: None.
     :raises click.ClickException: If required tools are missing.
     """
-    # On native Windows the runner hosts Codex in a herdr pane, not a tmux one:
-    # backend availability is already gated CLI-side by
+    # On native Windows the runner uses the platform-selected backend (ConPTY by
+    # default), not tmux. Backend availability is already gated CLI-side by
     # `_ensure_native_terminal_backend_available` (the `omnigent codex` entry),
-    # and the POSIX local-tmux attach degrades to herdr-UI guidance
+    # and the POSIX local-tmux attach degrades to Windows-backend guidance
     # (`_attach_terminal_resource`). Local tmux is therefore not required here, so
     # skip the tmux preflight rather than reject an otherwise-supported host.
     if IS_WINDOWS:

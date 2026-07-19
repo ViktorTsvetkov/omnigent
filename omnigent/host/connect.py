@@ -317,6 +317,7 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # cli._ensure_host_daemon), never to a (possibly hosted) runner.
         "OMNIGENT_CONFIG_HOME",
         "OMNIGENT_DATA_DIR",
+        "OMNIGENT_TERMINAL_BACKEND",
         # Auth provider selection. The env-unset default was flipped
         # to "accounts", so the whole CLI → daemon → local-server chain has
         # to agree on the mode. Without this, the daemon strips

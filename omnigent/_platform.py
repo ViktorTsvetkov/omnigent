@@ -134,6 +134,8 @@ IS_DARWIN = sys.platform == "darwin"
 #:   ``expanduser("~")`` resolve (the Windows analog of POSIX ``HOME``).
 #: - ``APPDATA`` / ``LOCALAPPDATA`` are where Windows apps (keyring, pip, npm,
 #:   …) keep per-user config and cache.
+#: - ``TEMP`` / ``TMP`` let native tools extract temporary assets and addons
+#:   (including Bun's OpenTUI library).
 #: - The rest let a Windows process and shell resolve binaries normally.
 #:
 #: All are path/identity constants, not credentials — consistent with POSIX
@@ -154,6 +156,8 @@ WINDOWS_ENV_PASSTHROUGH: tuple[str, ...] = (
     "HOMEPATH",
     "APPDATA",
     "LOCALAPPDATA",
+    "TEMP",
+    "TMP",
 )
 
 

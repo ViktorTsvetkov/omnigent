@@ -40,6 +40,10 @@ def test_platform_flags_are_mutually_consistent() -> None:
     assert _platform.IS_WINDOWS != _platform.IS_POSIX
 
 
+def test_windows_env_passthrough_includes_temp_directories() -> None:
+    assert {"TEMP", "TMP"} <= set(_platform.WINDOWS_ENV_PASSTHROUGH)
+
+
 def test_default_shell_argv_runs_an_echo() -> None:
     argv = _platform.default_shell_argv("echo omnigent-shell-ok")
     out = subprocess.run(argv, capture_output=True, text=True, check=True)

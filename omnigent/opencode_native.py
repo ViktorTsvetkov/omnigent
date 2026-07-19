@@ -33,6 +33,7 @@ import httpx
 import yaml
 
 from omnigent._native_resume_hint import echo_native_resume_hint
+from omnigent._platform import IS_WINDOWS
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._wrapper_labels import OPENCODE_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
@@ -55,6 +56,7 @@ from omnigent.native_terminal import (
     DAEMON_TERMINAL_READY_TIMEOUT_S as _DAEMON_TERMINAL_READY_TIMEOUT_S,
 )
 from omnigent.native_terminal import bind_session_runner as _bind_session_runner
+from omnigent.native_terminal import terminal_attach_url as _attach_url
 from omnigent.native_terminal import url_component
 from omnigent.opencode_native_state import read_launch_state, write_launch_state
 
@@ -247,7 +249,11 @@ def _run_with_remote_server(  # pragma: no cover
                 enabled=auto_open_conversation,
                 warn=lambda message: click.echo(message, err=True),
             )
-            await _attach_terminal_resource(prepared)
+            await _attach_terminal_resource(
+                base_url=base_url,
+                headers=headers,
+                prepared=prepared,
+            )
             if resolved_session_id is None:
                 echo_native_resume_hint(
                     native_command="opencode",
@@ -578,16 +584,28 @@ def _launched_opencode_terminal_from_payload(payload: object) -> LaunchedOpenCod
 
 
 async def _attach_terminal_resource(  # pragma: no cover
+    *,
+    base_url: str,
+    headers: dict[str, str],
     prepared: PreparedOpenCodeTerminal,
 ) -> None:
     """Attach the current terminal to the prepared OpenCode terminal resource."""
     reason = _direct_tmux_unavailable_reason(prepared)
-    if reason is not None:
-        raise click.ClickException(
-            f"Runner-owned OpenCode terminal requires direct tmux attach, but {reason}"
+    if reason is None:
+        assert prepared.tmux_socket is not None and prepared.tmux_target is not None
+        await _attach_direct_tmux(prepared.tmux_socket, prepared.tmux_target)
+        return
+    if IS_WINDOWS:
+        from omnigent.claude_native import attach_local_terminal
+
+        await attach_local_terminal(
+            _attach_url(base_url, prepared.session_id, prepared.terminal_id),
+            headers=headers,
         )
-    assert prepared.tmux_socket is not None and prepared.tmux_target is not None
-    await _attach_direct_tmux(prepared.tmux_socket, prepared.tmux_target)
+        return
+    raise click.ClickException(
+        f"Runner-owned OpenCode terminal requires direct tmux attach, but {reason}"
+    )
 
 
 async def _attach_direct_tmux(socket_path: Path, tmux_target: str) -> None:  # pragma: no cover

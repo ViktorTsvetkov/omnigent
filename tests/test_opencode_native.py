@@ -573,7 +573,7 @@ def test_run_with_remote_server_aligns_cwd_before_daemon_prepare(
             reattached=True,
         )
 
-    async def fake_attach(_prepared: object) -> None:
+    async def fake_attach(**_kwargs: object) -> None:
         order.append("attach")
 
     monkeypatch.setattr(chat_mod, "_remote_headers", lambda *_a, **_k: {})
@@ -633,7 +633,7 @@ def test_run_with_remote_server_records_launch_after_create(
             reattached=False,
         )
 
-    async def fake_attach(_prepared: object) -> None:
+    async def fake_attach(**_kwargs: object) -> None:
         order.append("attach")
 
     def fake_record(session_id: str) -> None:

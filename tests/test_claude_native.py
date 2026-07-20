@@ -3350,6 +3350,174 @@ async def test_websocket_to_stdout_does_not_block_event_loop() -> None:
         os.close(stdout_r)
 
 
+def _make_capped_os_write(
+    cap: int, log: list[bytes]
+) -> Any:
+    """
+    Build a fake ``os.write`` that caps each call and records chunks.
+
+    Emulates the Windows ``CONOUT$`` short-write behavior: a single
+    ``os.write`` never delivers more than *cap* bytes, and the caller
+    must honor the returned count to deliver the rest.
+
+    :param cap: Maximum bytes a single write delivers, e.g. ``32767``.
+    :param log: List that each delivered chunk is appended to, in order.
+    :returns: A ``write(fd, data) -> int`` replacement callable.
+    """
+
+    def _fake(fd: int, data: Any) -> int:
+        """Deliver at most *cap* bytes and record what was delivered."""
+        chunk = bytes(data[:cap])
+        log.append(chunk)
+        return len(chunk)
+
+    return _fake
+
+
+@pytest.mark.parametrize("size", [65536, 262144])
+def test_write_all_console_delivers_full_buffer_past_short_write_cap(
+    monkeypatch: pytest.MonkeyPatch, size: int
+) -> None:
+    """
+    ``_write_all_console`` loops past the 32767-byte console cap.
+
+    Regression: on Windows a single ``os.write`` to ``CONOUT$`` silently
+    caps at 32767 bytes and drops the tail, so a large replay frame
+    rendered blank/partial. With ``os.write`` mocked to deliver at most
+    32767 bytes per call, the helper must loop until every byte of the
+    65536/262144 buffer is written, in order.
+    """
+    log: list[bytes] = []
+    monkeypatch.setattr(claude_native.os, "write", _make_capped_os_write(32767, log))
+    payload = bytes((i * 31 + 7) % 256 for i in range(size))
+
+    claude_native._write_all_console(1, payload)
+
+    assert len(log) > 1, "helper must issue multiple writes past the 32767 cap"
+    assert b"".join(log) == payload, "every byte must be delivered, in order"
+
+
+def test_write_all_console_honors_genuine_partial_short_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_write_all_console`` honors partial writes smaller than a chunk.
+
+    A write that returns fewer bytes than requested (here capped well
+    below the 16 KiB chunk) must advance the offset by exactly the
+    returned count, never re-sending or skipping bytes.
+    """
+    log: list[bytes] = []
+    monkeypatch.setattr(claude_native.os, "write", _make_capped_os_write(7000, log))
+    payload = bytes((i * 13 + 1) % 256 for i in range(65536))
+
+    claude_native._write_all_console(1, payload)
+
+    assert all(len(chunk) <= 7000 for chunk in log)
+    assert b"".join(log) == payload
+
+
+def test_write_all_console_raises_when_write_makes_no_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_write_all_console`` raises when a write returns ``<= 0``.
+
+    A stuck console (no forward progress) must surface as an ``OSError``
+    rather than spin forever.
+    """
+    monkeypatch.setattr(claude_native.os, "write", lambda fd, data: 0)
+
+    with pytest.raises(OSError, match="no progress"):
+        claude_native._write_all_console(1, b"x" * 100)
+
+
+@pytest.mark.asyncio
+async def test_websocket_to_stdout_posix_issues_single_os_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    On POSIX, ``_websocket_to_stdout`` keeps the original single write.
+
+    Pins the supreme-law requirement that the POSIX path is byte-for-byte
+    identical to upstream: each frame is delivered by exactly one
+    ``os.write(stdout_fd, bytes(message))`` and the chunked Windows helper
+    is never entered.
+    """
+    monkeypatch.setattr(claude_native, "IS_WINDOWS", False)
+    writes: list[tuple[int, bytes]] = []
+
+    def _record_write(fd: int, data: Any) -> int:
+        """Record a single POSIX write and report full delivery."""
+        payload = bytes(data)
+        writes.append((fd, payload))
+        return len(payload)
+
+    monkeypatch.setattr(claude_native.os, "write", _record_write)
+
+    frame = b"z" * 65536
+
+    class _FakeWS:
+        """Async-iterable yielding one large binary frame then closing."""
+
+        def __init__(self) -> None:
+            self._sent = False
+            self.close_code: int | None = None
+
+        def __aiter__(self) -> _FakeWS:
+            return self
+
+        async def __anext__(self) -> bytes:
+            if self._sent:
+                raise StopAsyncIteration
+            self._sent = True
+            return frame
+
+    await claude_native._websocket_to_stdout(_FakeWS(), 7)
+
+    assert writes == [(7, frame)], (
+        "POSIX must deliver each frame with exactly one os.write, unchanged"
+    )
+
+
+@pytest.mark.asyncio
+async def test_websocket_to_stdout_windows_delivers_full_large_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    On Windows, a >32767-byte frame is delivered in full via the loop.
+
+    With ``IS_WINDOWS`` forced on and ``os.write`` capped at 32767 bytes,
+    a single 65536-byte output frame must still reach stdout in full and
+    in order, rather than being truncated to 32767 bytes.
+    """
+    monkeypatch.setattr(claude_native, "IS_WINDOWS", True)
+    log: list[bytes] = []
+    monkeypatch.setattr(claude_native.os, "write", _make_capped_os_write(32767, log))
+
+    frame = bytes((i * 17 + 3) % 256 for i in range(65536))
+
+    class _FakeWS:
+        """Async-iterable yielding one large binary frame then closing."""
+
+        def __init__(self) -> None:
+            self._sent = False
+            self.close_code: int | None = None
+
+        def __aiter__(self) -> _FakeWS:
+            return self
+
+        async def __anext__(self) -> bytes:
+            if self._sent:
+                raise StopAsyncIteration
+            self._sent = True
+            return frame
+
+    await claude_native._websocket_to_stdout(_FakeWS(), 9)
+
+    assert b"".join(log) == frame, "Windows must deliver the full frame, not 32767 bytes"
+
+
 class _AttachWSStub:
     """
     Fake attach WebSocket for local terminal attach tests.

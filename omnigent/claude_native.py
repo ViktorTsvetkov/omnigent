@@ -4450,6 +4450,36 @@ async def _stdin_to_websocket(
         await ws.send(data)
 
 
+def _write_all_console(fd: int, data: bytes) -> None:
+    """
+    Write every byte of *data* to a console fd, looping past short writes.
+
+    A single ``os.write`` to a Windows console handle (``CONOUT$``)
+    silently caps at 32767 bytes (0x7FFF): a 65536-byte write returns
+    32767 and the tail is discarded, so a large replay frame (e.g. a
+    journal/screen replay when attaching to an already-busy session)
+    renders blank or partial. This helper honors ``os.write``'s return
+    value and re-issues the write for the remaining bytes, in chunks of
+    16 KiB (well under the cap), until the whole buffer is delivered.
+
+    Windows-only: the POSIX pump keeps its single ``os.write`` and never
+    calls this helper.
+
+    :param fd: Destination console file descriptor, e.g. stdout.
+    :param data: Frame bytes to deliver in full.
+    :returns: None once every byte has been written.
+    :raises OSError: If a write makes no progress (returns ``<= 0``),
+        so a stuck console surfaces instead of looping forever.
+    """
+    mv = memoryview(data)
+    off, total = 0, len(mv)
+    while off < total:
+        written = os.write(fd, mv[off : off + 16384])
+        if written <= 0:
+            raise OSError("console write made no progress")
+        off += written
+
+
 async def _websocket_to_stdout(ws: Any, stdout_fd: int) -> None:
     """
     Copy terminal WebSocket bytes to local stdout.
@@ -4471,7 +4501,13 @@ async def _websocket_to_stdout(ws: Any, stdout_fd: int) -> None:
     async for message in ws:
         if isinstance(message, str):
             continue
-        await asyncio.to_thread(os.write, stdout_fd, bytes(message))
+        if IS_WINDOWS:
+            # Windows consoles cap a single os.write at 32767 bytes and
+            # silently drop the tail; loop past the cap so large frames
+            # render in full. POSIX keeps the original single write.
+            await asyncio.to_thread(_write_all_console, stdout_fd, bytes(message))
+        else:
+            await asyncio.to_thread(os.write, stdout_fd, bytes(message))
     close_code = getattr(ws, "close_code", None)
     if close_code == WS_CLOSE_TERMINAL_NOT_FOUND:
         raise ConnectionClosedError(

@@ -110,3 +110,65 @@ async def test_osc_color_queries_are_not_replayed_on_resubscribe(tmp_path: Path)
     assert replay == b"ready"
     assert b"]10;" not in replay
     assert b"]11;" not in replay
+
+
+class _WriteRecordingProcess:
+    """Minimal live ConPTY process stub that records writes."""
+
+    def __init__(self) -> None:
+        self.writes: list[str] = []
+
+    def isalive(self) -> bool:
+        return True
+
+    def write(self, data: str) -> None:
+        self.writes.append(data)
+
+
+def _backend_with_recording_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[ConptyBackend, _WriteRecordingProcess, list[int]]:
+    """Build a backend whose capture-sync barrier is counted, not executed."""
+    backend = ConptyBackend(socket_path=tmp_path / "conpty", target="main")
+    process = _WriteRecordingProcess()
+    backend._process = process  # type: ignore[assignment]
+    waits: list[int] = []
+    monkeypatch.setattr(
+        ConptyBackend,
+        "_wait_for_output_locked",
+        lambda self, generation: waits.append(generation),
+    )
+    return backend, process, waits
+
+
+@pytest.mark.windows_only
+@pytest.mark.asyncio
+async def test_write_input_skips_the_capture_quiet_barrier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Interactive input must not wait for the reader, or typing serialises."""
+    backend, process, waits = _backend_with_recording_process(tmp_path, monkeypatch)
+
+    await backend.write_input(b"hello")
+
+    assert process.writes == ["hello"]
+    assert waits == []
+
+
+@pytest.mark.windows_only
+def test_send_text_and_keys_still_wait_for_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The automation path keeps the barrier so capture sees the new frame."""
+    backend, process, waits = _backend_with_recording_process(tmp_path, monkeypatch)
+
+    backend.send_text_sync("hi")
+    assert len(waits) == 1
+
+    backend.send_keys_sync(["Enter"])
+    assert len(waits) == 2
+
+    backend.paste_without_submit_sync("more")
+    assert len(waits) == 3
+
+    assert process.writes == ["\x1b[200~hi\x1b[201~", "\r", "\x1b[200~more\x1b[201~"]

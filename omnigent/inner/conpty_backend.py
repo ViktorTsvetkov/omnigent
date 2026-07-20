@@ -228,8 +228,28 @@ class ConptyBackend(TerminalBackend):
         await asyncio.to_thread(self.send_keys_sync, keys)
 
     async def write_input(self, data: bytes) -> None:
-        """Write browser terminal input without paste-mode decoration."""
-        await asyncio.to_thread(self._write, data.decode("utf-8", errors="replace"))
+        """
+        Write interactive terminal input without paste-mode decoration.
+
+        Deliberately skips :meth:`_wait_for_output_locked`. That barrier
+        exists so an automation caller that writes and then calls
+        :meth:`capture_sync` observes the resulting frame — the
+        interactive byte stream has no such read-after-write, and paying
+        it here froze typing: the attach bridge writes one frame at a
+        time and does not read the next one off the WebSocket until the
+        write completes, so a ~31 ms per-frame barrier capped input at
+        ~32 frames/s. A paste or a fast burst then backlogged in the
+        socket buffer for seconds with no echo, and landed all at once.
+
+        :param data: Raw input bytes to write to the ConPTY, e.g.
+            ``b"ls\\r"``.
+        :returns: None once the bytes have been handed to the ConPTY.
+        """
+        await asyncio.to_thread(
+            self._write,
+            data.decode("utf-8", errors="replace"),
+            wait_for_output=False,
+        )
 
     async def set_size(self, cols: int, rows: int) -> None:
         """Resize the ConPTY without blocking the event loop."""
@@ -318,7 +338,18 @@ class ConptyBackend(TerminalBackend):
         if chunk is None:
             self._output_subscribers.clear()
 
-    def _write(self, data: str) -> None:
+    def _write(self, data: str, *, wait_for_output: bool = True) -> None:
+        """
+        Write *data* to the ConPTY, optionally synchronising with the reader.
+
+        :param data: Text to write to the pseudoconsole.
+        :param wait_for_output: When true (the default), block until the
+            reader thread has incorporated the resulting output, so a
+            following :meth:`capture_sync` observes the new frame. The
+            interactive path (:meth:`write_input`) passes false: it has
+            no read-after-write and the wait would serialise typing.
+        :raises RuntimeError: If the ConPTY is gone or the write fails.
+        """
         with self._changed:
             process = self._require_live_process()
             generation = self._output_generation
@@ -326,7 +357,8 @@ class ConptyBackend(TerminalBackend):
                 process.write(data)
             except (EOFError, OSError, RuntimeError) as exc:
                 raise RuntimeError(f"failed to write to ConPTY terminal: {exc}") from exc
-            self._wait_for_output_locked(generation)
+            if wait_for_output:
+                self._wait_for_output_locked(generation)
 
     def _wait_for_output_locked(self, generation: int) -> None:
         """Wait until the reader incorporates output produced by an operation."""

@@ -60,6 +60,15 @@ _GOOSE_DELIVERY_STYLE = TmuxDeliveryStyle(
 )
 
 
+def _prompt_delivery(info: dict[str, str]) -> TerminalDelivery:
+    """Build goose's tmux-backed delivery surface from an advertised ``info`` dict."""
+    return build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_GOOSE_DELIVERY_STYLE,
+    )
+
+
 def bridge_dir_for_session_id(session_id: str) -> Path:
     """Return the per-session bridge dir, e.g. ``/tmp/omnigent-<uid>/goose-native/<hash>``."""
     digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
@@ -297,11 +306,7 @@ def inject_user_message(
     if not content:
         raise RuntimeError("goose-native injection requires non-empty content")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_GOOSE_DELIVERY_STYLE,
-    )
+    delivery = _prompt_delivery(info)
     # Fast-fail if the TUI already exited: otherwise _settle_pane polls a dead
     # pane for the full timeout and the web message is silently lost.
     if not delivery.is_alive():
@@ -343,11 +348,7 @@ def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT
     :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_GOOSE_DELIVERY_STYLE,
-    )
+    delivery = _prompt_delivery(info)
     # A named ``Escape`` key (not literal): goose cancels an in-flight turn on one
     # Escape. ``send_keys`` sends the key name — ``send-keys -t <target> Escape``.
     delivery.send_keys(["Escape"])
@@ -362,11 +363,7 @@ def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) 
     :raises RuntimeError: If the tmux target is not advertised or kill-session fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_GOOSE_DELIVERY_STYLE,
-    )
+    delivery = _prompt_delivery(info)
     delivery.kill()
 
 
@@ -384,11 +381,7 @@ def capture_goose_pane(bridge_dir: Path) -> str | None:
     info = read_tmux_info(bridge_dir)
     if info is None:
         return None
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_GOOSE_DELIVERY_STYLE,
-    )
+    delivery = _prompt_delivery(info)
     # ``is_alive`` (has-session) distinguishes a dead pane (``None``) from a live
     # but empty capture (``""``); ``snapshot`` returns ``""`` on a transient miss,
     # matching the private ``_capture_pane``.
@@ -418,9 +411,5 @@ def send_goose_pane_keys(bridge_dir: Path, *keys: str) -> None:
     info = read_tmux_info(bridge_dir)
     if info is None:
         raise RuntimeError("goose-native tmux target not advertised")
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_GOOSE_DELIVERY_STYLE,
-    )
+    delivery = _prompt_delivery(info)
     delivery.send_keys_atomic(keys)

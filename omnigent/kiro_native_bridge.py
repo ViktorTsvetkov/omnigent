@@ -526,6 +526,15 @@ def _paste_payload_bytes(text: str) -> bytes:
     return bytes(body)
 
 
+def _prompt_delivery(info: dict[str, str]) -> TerminalDelivery:
+    """Build kiro's tmux-backed delivery surface from an advertised ``info`` dict."""
+    return build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_KIRO_DELIVERY_STYLE,
+    )
+
+
 def _paste_literal_text_via_delivery(delivery: TerminalDelivery, text: str) -> None:
     """Deliver text through the shared terminal surface without submitting."""
     delivery.paste_without_submit(text + "\n")
@@ -601,11 +610,7 @@ def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     # No ``-l``: tmux must interpret ``Escape`` as a key name.
-    build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_KIRO_DELIVERY_STYLE,
-    ).send_keys(["Escape"])
+    _prompt_delivery(info).send_keys(["Escape"])
 
 
 def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
@@ -618,11 +623,7 @@ def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) 
     :raises RuntimeError: If the tmux target is not advertised or kill-session fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_KIRO_DELIVERY_STYLE,
-    ).kill()
+    _prompt_delivery(info).kill()
 
 
 def send_kiro_permission_verdict(

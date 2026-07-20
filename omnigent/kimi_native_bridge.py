@@ -74,6 +74,15 @@ _KIMI_DELIVERY_STYLE = TmuxDeliveryStyle(
 )
 
 
+def _prompt_delivery(info: dict[str, str]) -> TerminalDelivery:
+    """Build kimi's tmux-backed delivery surface from an advertised ``info`` dict."""
+    return build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_KIMI_DELIVERY_STYLE,
+    )
+
+
 def bridge_dir_for_session_id(session_id: str) -> Path:
     """Return the per-session bridge dir, e.g. ``/tmp/omnigent-<uid>/kimi-native/<hash>``."""
     digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
@@ -340,11 +349,7 @@ def inject_user_message(
     if not content:
         raise RuntimeError("kimi-native injection requires non-empty content")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_KIMI_DELIVERY_STYLE,
-    )
+    delivery = _prompt_delivery(info)
     # Fast-fail if the TUI already exited: otherwise _settle_pane polls a dead
     # pane for the full timeout and the web message is silently lost. A clear
     # error lets run_turn surface ExecutorError so the UI can say "restart".
@@ -388,11 +393,7 @@ def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT
     :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_KIMI_DELIVERY_STYLE,
-    )
+    delivery = _prompt_delivery(info)
     # A named ``Escape`` key (not literal): kimi cancels an in-flight turn on one
     # Escape. ``send_keys`` sends it as the key name — ``send-keys -t <target>
     # Escape`` — not the bytes of the word.
@@ -432,11 +433,7 @@ def inject_approval_keystroke(
     :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_KIMI_DELIVERY_STYLE,
-    )
+    delivery = _prompt_delivery(info)
     if not delivery.is_alive():
         return False
     if _PERMISSION_PROMPT_MARKER not in delivery.snapshot():
@@ -459,9 +456,5 @@ def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) 
     :raises RuntimeError: If the tmux target is not advertised or kill-session fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_KIMI_DELIVERY_STYLE,
-    )
+    delivery = _prompt_delivery(info)
     delivery.kill()

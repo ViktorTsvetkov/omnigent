@@ -114,6 +114,15 @@ _CURSOR_DELIVERY_STYLE = TmuxDeliveryStyle(
 )
 
 
+def _prompt_delivery(info: dict[str, str]) -> TerminalDelivery:
+    """Build cursor's tmux-backed delivery surface from an advertised ``info`` dict."""
+    return build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_CURSOR_DELIVERY_STYLE,
+    )
+
+
 def bridge_dir_for_session_id(session_id: str) -> Path:
     """Return the per-session bridge dir, e.g. ``/tmp/omnigent-<uid>/cursor-native/<hash>``."""
     digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
@@ -588,11 +597,7 @@ def capture_cursor_pane(bridge_dir: Path) -> str | None:
     info = read_tmux_info(bridge_dir)
     if info is None:
         return None
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_CURSOR_DELIVERY_STYLE,
-    )
+    delivery = _prompt_delivery(info)
     # ``is_alive`` (has-session) distinguishes a dead pane (``None``) from a live
     # but empty capture (``""``); ``snapshot`` returns ``""`` on a transient miss,
     # matching the private ``_capture_pane``.
@@ -623,11 +628,7 @@ def send_cursor_pane_keys(bridge_dir: Path, *keys: str) -> None:
     info = read_tmux_info(bridge_dir)
     if info is None:
         raise RuntimeError("cursor-native tmux target not advertised")
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_CURSOR_DELIVERY_STYLE,
-    )
+    delivery = _prompt_delivery(info)
     delivery.send_keys_atomic(keys)
 
 
@@ -719,11 +720,7 @@ def inject_user_message(
     if not content:
         raise RuntimeError("cursor-native injection requires non-empty content")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_CURSOR_DELIVERY_STYLE,
-    )
+    delivery = _prompt_delivery(info)
     # Fast-fail if the TUI already exited: otherwise _settle_pane polls a dead
     # pane for the full timeout and the web message is silently lost. A clear
     # error lets run_turn surface ExecutorError so the UI can say "restart".
@@ -783,11 +780,7 @@ def inject_model_command(
     if not model:
         raise RuntimeError("cursor-native model switch requires a non-empty model id")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_CURSOR_DELIVERY_STYLE,
-    )
+    delivery = _prompt_delivery(info)
     if not delivery.is_alive():
         raise RuntimeError(
             "cursor terminal is no longer running (the TUI exited); restart the session"
@@ -864,11 +857,7 @@ def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT
     :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_CURSOR_DELIVERY_STYLE,
-    )
+    delivery = _prompt_delivery(info)
     # A named ``Escape`` key (not literal): cursor-agent cancels a running turn on
     # one Escape. ``send_keys`` sends the key name — ``send-keys -t <target>
     # Escape``.
@@ -890,9 +879,5 @@ def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) 
     :raises RuntimeError: If the tmux target is not advertised or kill-session fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_CURSOR_DELIVERY_STYLE,
-    )
+    delivery = _prompt_delivery(info)
     delivery.kill()

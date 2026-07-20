@@ -448,11 +448,7 @@ def inject_compress_command(bridge_dir: Path, *, timeout_s: float = 5.0) -> None
     :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_HERMES_DELIVERY_STYLE,
-    )
+    delivery = _prompt_delivery(info)
     # Clear any draft the user is mid-typing.
     delivery.send_keys(["C-u"])
     # Paste ``/compress`` literally.
@@ -589,6 +585,15 @@ def _submit_needle(content: str) -> str:
             return stripped[:24]
     stripped = content.strip()
     return stripped[:24] if len(stripped) >= 4 else ""
+
+
+def _prompt_delivery(info: dict[str, str]) -> TerminalDelivery:
+    """Build hermes's tmux-backed delivery surface from an advertised ``info`` dict."""
+    return build_prompt_delivery(
+        socket_path=info["socket_path"],
+        target=info["tmux_target"],
+        tmux_delivery_style=_HERMES_DELIVERY_STYLE,
+    )
 
 
 def _settle_pane(delivery: TerminalDelivery, *, timeout_s: float) -> None:
@@ -777,11 +782,7 @@ def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT
     :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_HERMES_DELIVERY_STYLE,
-    ).send_keys(["C-c"])
+    _prompt_delivery(info).send_keys(["C-c"])
 
 
 def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
@@ -793,11 +794,7 @@ def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) 
     :raises RuntimeError: If the tmux target is not advertised or kill-session fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_HERMES_DELIVERY_STYLE,
-    ).kill()
+    _prompt_delivery(info).kill()
 
 
 def capture_hermes_pane(bridge_dir: Path) -> str | None:
@@ -814,11 +811,7 @@ def capture_hermes_pane(bridge_dir: Path) -> str | None:
     info = read_tmux_info(bridge_dir)
     if info is None:
         return None
-    delivery = build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_HERMES_DELIVERY_STYLE,
-    )
+    delivery = _prompt_delivery(info)
     if not delivery.is_alive():
         return None
     return delivery.snapshot()
@@ -839,8 +832,4 @@ def send_hermes_pane_keys(bridge_dir: Path, *keys: str) -> None:
     info = read_tmux_info(bridge_dir)
     if info is None:
         raise RuntimeError("hermes-native tmux target not advertised")
-    build_prompt_delivery(
-        socket_path=info["socket_path"],
-        target=info["tmux_target"],
-        tmux_delivery_style=_HERMES_DELIVERY_STYLE,
-    ).send_keys_atomic(keys)
+    _prompt_delivery(info).send_keys_atomic(keys)

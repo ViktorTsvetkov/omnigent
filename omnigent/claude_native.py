@@ -2399,9 +2399,7 @@ async def _attach_with_reconnect(
                 err=True,
             )
         else:
-            if user_requested_exit:
-                return _AttachOutcome.DETACHED if IS_WINDOWS else _AttachOutcome.EXITED
-            if recover is None:
+            if user_requested_exit or recover is None:
                 return _AttachOutcome.DETACHED if IS_WINDOWS else _AttachOutcome.EXITED
             if base_url is not None and session_id is not None and terminal_id is not None:
                 terminal_gone = await _is_terminal_resource_gone(

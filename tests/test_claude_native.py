@@ -3350,6 +3350,60 @@ async def test_websocket_to_stdout_does_not_block_event_loop() -> None:
         os.close(stdout_r)
 
 
+@pytest.mark.asyncio
+async def test_websocket_to_stdout_batches_ready_frames_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows writes ready binary frames as one byte-identical batch."""
+
+    class _FakeWS:
+        close_code = None
+
+        async def __aiter__(self):
+            for message in (b"first", "ignored", bytearray(b"second"), memoryview(b"third")):
+                yield message
+
+    writes: list[tuple[int, bytes]] = []
+
+    def _write(fd: int, data: bytes) -> int:
+        writes.append((fd, data))
+        return len(data)
+
+    monkeypatch.setattr(claude_native, "IS_WINDOWS", True)
+    monkeypatch.setattr(claude_native.os, "write", _write)
+
+    await claude_native._websocket_to_stdout(_FakeWS(), 123)
+
+    assert writes == [(123, b"firstsecondthird")]
+
+
+@pytest.mark.asyncio
+async def test_websocket_to_stdout_keeps_posix_frames_unbatched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The non-Windows path retains one write per binary frame."""
+
+    class _FakeWS:
+        close_code = None
+
+        async def __aiter__(self):
+            for message in (b"first", b"second", b"third"):
+                yield message
+
+    writes: list[bytes] = []
+
+    def _write(_fd: int, data: bytes) -> int:
+        writes.append(data)
+        return len(data)
+
+    monkeypatch.setattr(claude_native, "IS_WINDOWS", False)
+    monkeypatch.setattr(claude_native.os, "write", _write)
+
+    await claude_native._websocket_to_stdout(_FakeWS(), 123)
+
+    assert writes == [b"first", b"second", b"third"]
+
+
 class _AttachWSStub:
     """
     Fake attach WebSocket for local terminal attach tests.

@@ -4468,10 +4468,61 @@ async def _websocket_to_stdout(ws: Any, stdout_fd: int) -> None:
         :data:`WS_CLOSE_TERMINAL_NOT_FOUND`, so the outer loop's
         :func:`_is_terminal_not_found_close` check fires.
     """
+    if IS_WINDOWS:
+        await _websocket_to_stdout_windows(ws, stdout_fd)
+        return
     async for message in ws:
         if isinstance(message, str):
             continue
         await asyncio.to_thread(os.write, stdout_fd, bytes(message))
+    close_code = getattr(ws, "close_code", None)
+    if close_code == WS_CLOSE_TERMINAL_NOT_FOUND:
+        raise ConnectionClosedError(
+            Close(close_code, getattr(ws, "close_reason", None) or ""),
+            None,
+        )
+
+
+async def _websocket_to_stdout_windows(ws: Any, stdout_fd: int) -> None:
+    """Copy WebSocket output to a Windows console in ready-frame batches."""
+    frames: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+    async def _receive_frames() -> None:
+        try:
+            async for message in ws:
+                if isinstance(message, str):
+                    continue
+                frames.put_nowait(bytes(message))
+        finally:
+            frames.put_nowait(None)
+
+    async def _write_frames() -> None:
+        while True:
+            frame = await frames.get()
+            if frame is None:
+                return
+            batch = bytearray(frame)
+            while True:
+                try:
+                    frame = frames.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if frame is None:
+                    await asyncio.to_thread(os.write, stdout_fd, bytes(batch))
+                    return
+                batch.extend(frame)
+            await asyncio.to_thread(os.write, stdout_fd, bytes(batch))
+
+    receiver = asyncio.create_task(_receive_frames(), name="claude-windows-ws-receiver")
+    try:
+        await _write_frames()
+        await receiver
+    finally:
+        if not receiver.done():
+            receiver.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await receiver
+
     close_code = getattr(ws, "close_code", None)
     if close_code == WS_CLOSE_TERMINAL_NOT_FOUND:
         raise ConnectionClosedError(

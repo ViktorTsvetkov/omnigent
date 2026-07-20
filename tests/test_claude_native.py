@@ -3378,6 +3378,39 @@ async def test_websocket_to_stdout_batches_ready_frames_on_windows(
 
 
 @pytest.mark.asyncio
+async def test_websocket_to_stdout_fully_writes_large_windows_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows retries short console writes without changing byte order."""
+    payload = bytes(range(256)) * 256
+
+    class _FakeWS:
+        close_code = None
+
+        async def __aiter__(self):
+            for offset in range(0, len(payload), 4096):
+                yield payload[offset : offset + 4096]
+
+    delivered = bytearray()
+    write_sizes: list[int] = []
+
+    def _short_write(_fd: int, data: bytes) -> int:
+        write_sizes.append(len(data))
+        written = min(len(data), 3000)
+        delivered.extend(data[:written])
+        return written
+
+    monkeypatch.setattr(claude_native, "IS_WINDOWS", True)
+    monkeypatch.setattr(claude_native.os, "write", _short_write)
+
+    await claude_native._websocket_to_stdout(_FakeWS(), 123)
+
+    assert delivered == payload
+    assert max(write_sizes) <= 16 * 1024
+    assert sum(min(size, 3000) for size in write_sizes) == len(payload)
+
+
+@pytest.mark.asyncio
 async def test_websocket_to_stdout_keeps_posix_frames_unbatched(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -4485,7 +4485,21 @@ async def _websocket_to_stdout(ws: Any, stdout_fd: int) -> None:
 
 async def _websocket_to_stdout_windows(ws: Any, stdout_fd: int) -> None:
     """Copy WebSocket output to a Windows console in ready-frame batches."""
+    write_chunk_size = 16 * 1024
     frames: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+    async def _write_batch(batch: bytearray) -> None:
+        data = bytes(batch)
+        offset = 0
+        while offset < len(data):
+            written = await asyncio.to_thread(
+                os.write,
+                stdout_fd,
+                data[offset : offset + write_chunk_size],
+            )
+            if written <= 0:
+                raise OSError("Windows console write made no progress")
+            offset += written
 
     async def _receive_frames() -> None:
         try:
@@ -4508,10 +4522,10 @@ async def _websocket_to_stdout_windows(ws: Any, stdout_fd: int) -> None:
                 except asyncio.QueueEmpty:
                     break
                 if frame is None:
-                    await asyncio.to_thread(os.write, stdout_fd, bytes(batch))
+                    await _write_batch(batch)
                     return
                 batch.extend(frame)
-            await asyncio.to_thread(os.write, stdout_fd, bytes(batch))
+            await _write_batch(batch)
 
     receiver = asyncio.create_task(_receive_frames(), name="claude-windows-ws-receiver")
     try:

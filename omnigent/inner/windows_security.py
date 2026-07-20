@@ -27,7 +27,6 @@ SDDL_REVISION_1 = 1
 SE_FILE_OBJECT = 1
 LABEL_SECURITY_INFORMATION = 0x10
 DACL_SECURITY_INFORMATION = 0x4
-ERROR_ALREADY_EXISTS = 183
 GRANT_ACCESS = 1
 SET_ACCESS = 2
 REVOKE_ACCESS = 4
@@ -355,6 +354,33 @@ def _sid_from_string(value: str) -> wintypes.LPVOID:
     return sid
 
 
+def _explicit_access_entries(
+    sids: list[wintypes.LPVOID], access_mask: int, access_mode: int, inheritance: int
+) -> ctypes.Array[_EXPLICIT_ACCESS_W]:
+    """Build one EXPLICIT_ACCESS_W per SID granting the same mask/mode/inheritance."""
+    entries = (_EXPLICIT_ACCESS_W * len(sids))()
+    for entry, sid in zip(entries, sids, strict=True):
+        entry.grfAccessPermissions = access_mask
+        entry.grfAccessMode = access_mode
+        entry.grfInheritance = inheritance
+        entry.Trustee.TrusteeForm = TRUSTEE_IS_SID
+        entry.Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN
+        entry.Trustee.ptstrName = ctypes.cast(sid, wintypes.LPWSTR)
+    return entries
+
+
+def _effective_rights(old_dacl: wintypes.LPVOID, sid: wintypes.LPVOID) -> tuple[int, int]:
+    """Return (error, granted-mask) for one SID against an existing DACL."""
+    trustee = _TRUSTEE_W(
+        None, 0, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, ctypes.cast(sid, wintypes.LPWSTR)
+    )
+    effective = wintypes.DWORD()
+    error = advapi32.GetEffectiveRightsFromAclW(
+        old_dacl, ctypes.byref(trustee), ctypes.byref(effective)
+    )
+    return error, effective.value
+
+
 def _grant_acl(path: Path, sids: list[wintypes.LPVOID], access_mask: int) -> AclLease:
     target = os.fspath(path)
     key = os.path.normcase(os.path.abspath(target))
@@ -381,15 +407,8 @@ def _grant_acl(path: Path, sids: list[wintypes.LPVOID], access_mask: int) -> Acl
             descriptor, ctypes.byref(present), ctypes.byref(old_dacl), ctypes.byref(defaulted)
         ):
             _raise("GetSecurityDescriptorDacl")
-        entries = (_EXPLICIT_ACCESS_W * len(sids))()
         inheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT if path.is_dir() else NO_INHERITANCE
-        for entry, sid in zip(entries, sids, strict=True):
-            entry.grfAccessPermissions = access_mask
-            entry.grfAccessMode = GRANT_ACCESS
-            entry.grfInheritance = inheritance
-            entry.Trustee.TrusteeForm = TRUSTEE_IS_SID
-            entry.Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN
-            entry.Trustee.ptstrName = ctypes.cast(sid, wintypes.LPWSTR)
+        entries = _explicit_access_entries(sids, access_mask, GRANT_ACCESS, inheritance)
         new_dacl = wintypes.LPVOID()
         error = advapi32.SetEntriesInAclW(len(entries), entries, old_dacl, ctypes.byref(new_dacl))
         if error:
@@ -458,49 +477,22 @@ def _set_persistent_acl(
         if any(path == root or path.is_relative_to(root) for root in system_roots):
             all_apps = _sid_from_string("S-1-15-2-1")
             try:
-                trustee = _TRUSTEE_W(
-                    None,
-                    0,
-                    TRUSTEE_IS_SID,
-                    TRUSTEE_IS_UNKNOWN,
-                    ctypes.cast(all_apps, wintypes.LPWSTR),
-                )
-                effective = wintypes.DWORD()
-                error = advapi32.GetEffectiveRightsFromAclW(
-                    old_dacl, ctypes.byref(trustee), ctypes.byref(effective)
-                )
-                if not error and effective.value & access_mask == access_mask:
+                error, granted = _effective_rights(old_dacl, all_apps)
+                if not error and granted & access_mask == access_mask:
                     kernel32.LocalFree(descriptor)
                     return
             finally:
                 kernel32.LocalFree(all_apps)
-        trustee = _TRUSTEE_W(
-            None,
-            0,
-            TRUSTEE_IS_SID,
-            TRUSTEE_IS_UNKNOWN,
-            ctypes.cast(sids[0], wintypes.LPWSTR),
-        )
-        effective = wintypes.DWORD()
-        error = advapi32.GetEffectiveRightsFromAclW(
-            old_dacl, ctypes.byref(trustee), ctypes.byref(effective)
-        )
+        error, granted = _effective_rights(old_dacl, sids[0])
         if error:
             kernel32.LocalFree(descriptor)
             _raise(f"GetEffectiveRightsFromAclW: {target}", error)
-        if effective.value & access_mask == access_mask:
+        if granted & access_mask == access_mask:
             kernel32.LocalFree(descriptor)
             return
-    entries = (_EXPLICIT_ACCESS_W * len(sids))()
     should_inherit = path.is_dir() if inherit is None else inherit
     inheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT if should_inherit else NO_INHERITANCE
-    for entry, sid in zip(entries, sids, strict=True):
-        entry.grfAccessPermissions = access_mask
-        entry.grfAccessMode = access_mode
-        entry.grfInheritance = inheritance
-        entry.Trustee.TrusteeForm = TRUSTEE_IS_SID
-        entry.Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN
-        entry.Trustee.ptstrName = ctypes.cast(sid, wintypes.LPWSTR)
+    entries = _explicit_access_entries(sids, access_mask, access_mode, inheritance)
     new_dacl = wintypes.LPVOID()
     try:
         error = advapi32.SetEntriesInAclW(len(entries), entries, old_dacl, ctypes.byref(new_dacl))
@@ -581,6 +573,8 @@ def _runtime_read_paths(argv0: str | None = None) -> list[Path]:
             requirement = Requirement(requirement_text)
             if requirement.marker is None or requirement.marker.evaluate({"extra": ""}):
                 pending.append(requirement.name)
+    prefix = Path(sys.prefix).resolve()
+    base_prefix = Path(sys.base_prefix).resolve()
     for entry in sys.path:
         if not entry or entry.startswith("__editable__"):
             continue
@@ -589,9 +583,9 @@ def _runtime_read_paths(argv0: str | None = None) -> list[Path]:
             candidate.is_relative_to(site) for site in site_packages
         ):
             if (
-                candidate != Path(sys.prefix).resolve()
-                and candidate != Path(sys.base_prefix).resolve()
-                and not candidate.is_relative_to(Path(sys.base_prefix).resolve())
+                candidate != prefix
+                and candidate != base_prefix
+                and not candidate.is_relative_to(base_prefix)
             ):
                 candidates.append(candidate)
     return list(dict.fromkeys(candidates))

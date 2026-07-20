@@ -37,6 +37,12 @@ class ConptyBackend(TerminalBackend):
     )
     platforms = frozenset({"windows"})
     _OUTPUT_JOURNAL_LIMIT: ClassVar[int] = 8 * 1024 * 1024
+    # How long the child's output must stay quiet before a write is
+    # considered "settled" and a following capture will see its frame.
+    _QUIET_WINDOW_S: ClassVar[float] = 0.02
+    # Hard ceiling on that settle wait, so output that never goes quiet
+    # cannot block the caller indefinitely.
+    _QUIET_WAIT_CAP_S: ClassVar[float] = 0.2
     _OSC_COLOR_QUERY: ClassVar[re.Pattern[str]] = re.compile(r"\x1b\]1[012];\?(?:\x07|\x1b\\)")
 
     _KEYS: ClassVar[dict[str, str]] = {
@@ -375,11 +381,20 @@ class ConptyBackend(TerminalBackend):
             return
         # One PTY write can arrive as many tiny reads. Wait until the reader has
         # drained a complete burst so capture observes the resulting frame.
+        #
+        # The quiet window is the primary exit. The deadline is only a
+        # backstop: output that never goes quiet (a child emitting chunks
+        # closer together than the window, indefinitely) would otherwise
+        # block the caller forever, since nothing else ends this loop.
+        deadline = time.monotonic() + self._QUIET_WAIT_CAP_S
         while not (self._eof or self._reader_error is not None or self._closed):
-            quiet_for = time.monotonic() - self._last_output_at
-            if quiet_for >= 0.02:
+            now = time.monotonic()
+            quiet_for = now - self._last_output_at
+            if quiet_for >= self._QUIET_WINDOW_S:
                 return
-            self._changed.wait(timeout=0.02 - quiet_for)
+            if now >= deadline:
+                return
+            self._changed.wait(timeout=min(self._QUIET_WINDOW_S - quiet_for, deadline - now))
 
     def _require_live_process(self) -> Any:
         process = self._process

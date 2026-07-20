@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -172,3 +174,52 @@ def test_send_text_and_keys_still_wait_for_output(
     assert len(waits) == 3
 
     assert process.writes == ["\x1b[200~hi\x1b[201~", "\r", "\x1b[200~more\x1b[201~"]
+
+
+@pytest.mark.windows_only
+def test_quiet_wait_returns_promptly_once_output_settles(tmp_path: Path) -> None:
+    """The quiet window stays the primary exit: a settled terminal returns at once."""
+    backend = ConptyBackend(socket_path=tmp_path / "conpty", target="main")
+    backend._output_generation = 1
+    backend._last_output_at = time.monotonic() - 1.0
+
+    started = time.monotonic()
+    with backend._changed:
+        backend._wait_for_output_locked(0)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.05
+
+
+@pytest.mark.windows_only
+def test_quiet_wait_is_bounded_when_output_never_settles(tmp_path: Path) -> None:
+    """Output that never goes quiet must not block the caller indefinitely."""
+    backend = ConptyBackend(socket_path=tmp_path / "conpty", target="main")
+    backend._output_generation = 1
+    backend._last_output_at = time.monotonic()
+
+    stop = threading.Event()
+
+    def _keep_emitting() -> None:
+        """Bump the output clock faster than the quiet window, forever."""
+        while not stop.is_set():
+            with backend._changed:
+                backend._last_output_at = time.monotonic()
+                backend._changed.notify_all()
+            time.sleep(backend._QUIET_WINDOW_S / 4)
+
+    emitter = threading.Thread(target=_keep_emitting, daemon=True)
+    emitter.start()
+    try:
+        started = time.monotonic()
+        with backend._changed:
+            backend._wait_for_output_locked(0)
+        elapsed = time.monotonic() - started
+    finally:
+        stop.set()
+        emitter.join(timeout=5)
+
+    # It must have actually hit the cap (not exited early via the quiet
+    # window), and it must not have run away past it.
+    assert elapsed >= backend._QUIET_WAIT_CAP_S * 0.75
+    assert elapsed < 0.6

@@ -185,13 +185,11 @@ def reconfigure_std_streams_for_windows() -> None:
     """
     if not IS_WINDOWS:
         return
-    import contextlib
-
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is None:
             continue
-        with contextlib.suppress(Exception):
+        with suppress(Exception):
             reconfigure(encoding="utf-8", errors="backslashreplace")
 
 
@@ -235,11 +233,10 @@ _OFFERED_INTERACTIVE_SHELLS = ("bash", "zsh", "fish")
 def resolve_windows_interactive_shell_path(command: str) -> str | None:
     """Resolve a native Windows interactive shell to an absolute executable."""
     name = Path(command).name.lower()
+    windir = Path(os.environ.get("WINDIR") or os.environ.get("SYSTEMROOT") or r"C:\Windows")
     if name in {"cmd", "cmd.exe"}:
-        windir = Path(os.environ.get("WINDIR") or os.environ.get("SYSTEMROOT") or r"C:\Windows")
         candidates = (windir / "System32" / "cmd.exe",)
     elif name in {"powershell", "powershell.exe"}:
-        windir = Path(os.environ.get("WINDIR") or os.environ.get("SYSTEMROOT") or r"C:\Windows")
         candidates = (windir / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe",)
     elif name in {"pwsh", "pwsh.exe"}:
         roots = [Path(os.environ.get("PROGRAMFILES") or r"C:\Program Files") / "PowerShell"]
@@ -306,9 +303,10 @@ def installed_interactive_shells() -> list[str]:
     if IS_WINDOWS:
         # ConPTY hosts native shells, but its runner has a deliberately stripped
         # PATH, so only offer executables found at resolvable absolute paths.
-        powershell = "pwsh" if resolve_windows_interactive_shell_path("pwsh") else "powershell"
-        if resolve_windows_interactive_shell_path(powershell):
-            ordered.append(powershell)
+        if resolve_windows_interactive_shell_path("pwsh"):
+            ordered.append("pwsh")
+        elif resolve_windows_interactive_shell_path("powershell"):
+            ordered.append("powershell")
         if resolve_windows_interactive_shell_path("cmd"):
             ordered.append("cmd")
         return ordered

@@ -345,7 +345,7 @@ def filtered_server_env(
     env: dict[str, str] = {}
     passthrough_keys = _ENV_PASSTHROUGH_KEYS
     if IS_WINDOWS:
-        passthrough_keys = (*passthrough_keys, *WINDOWS_ENV_PASSTHROUGH, "TEMP", "TMP")
+        passthrough_keys = (*passthrough_keys, *WINDOWS_ENV_PASSTHROUGH)
     for key, value in os.environ.items():
         if key in _ENV_OPENCODE_CONFIG_DENYLIST:
             # Never inherit the parent's global OpenCode config — the

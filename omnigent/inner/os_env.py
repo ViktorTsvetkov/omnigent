@@ -596,7 +596,7 @@ class _HelperProcessClient:
         # launcher backends (they isolate via wrap_launcher_argv before
         # exec); on Windows this assigns the helper to a kill-on-close
         # Job Object so the whole tree is torn down in ``_stop_locked``.
-        if not (IS_WINDOWS and sandbox.active) and sandbox.active and self._proc.pid is not None:
+        if not IS_WINDOWS and sandbox.active and self._proc.pid is not None:
             self._sandbox_handle = get_backend(sandbox.backend_type).post_spawn(
                 sandbox, self._proc.pid
             )
@@ -1006,14 +1006,12 @@ def _resolve_windows_shell() -> str:
         pass
 
     git_roots.extend(
-        root
-        for root in (
+        (
             os.path.join(system_drive + os.sep, "Program Files", "Git"),
             os.path.join(system_drive + os.sep, "Program Files (x86)", "Git"),
             r"C:\Program Files\Git",
             r"C:\Program Files (x86)\Git",
         )
-        if root
     )
     for root in dict.fromkeys(git_roots):
         for relative in (("bin", "bash.exe"), ("usr", "bin", "bash.exe")):

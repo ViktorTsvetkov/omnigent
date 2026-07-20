@@ -141,19 +141,16 @@ def _global_terminal_transport_default() -> str:
     return TERMINAL_TRANSPORT_CONTROL
 
 
-def _read_terminal_transport_config() -> str | None:
-    """Read ``terminal.transport`` from the global config, or ``None``.
+def _read_terminal_config_table() -> dict[str, Any] | None:  # type: ignore[explicit-any]
+    """Read the ``terminal:`` table from the global config, or ``None``.
 
-    Best-effort: any failure (missing/unreadable file, non-mapping YAML,
-    absent table/key, non-string/bool value) returns ``None`` so the caller
-    uses the control default. Never raises.
+    Best-effort shared reader for :func:`_read_terminal_transport_config` and
+    :func:`_read_terminal_backend_config`: any failure (missing/unreadable file,
+    malformed YAML, non-mapping document, absent/non-mapping table) returns
+    ``None`` so callers fall back to their defaults. Never raises — reading the
+    config must not crash an attach or terminal construction.
 
-    An unquoted YAML ``true``/``false`` parses as a real bool rather than a
-    string, so a bool value is normalized to its lowercase string spelling
-    before returning — ``terminal.transport: false`` still selects the PTY
-    alias in :data:`_TRANSPORT_PTY_ALIASES`.
-
-    :returns: The raw configured transport string, or ``None`` when unset.
+    :returns: The ``terminal`` table mapping, or ``None`` when unavailable.
     """
     import yaml
 
@@ -169,7 +166,25 @@ def _read_terminal_transport_config() -> str | None:
     if not isinstance(raw, dict):
         return None
     table = raw.get(_TERMINAL_CONFIG_TABLE)
-    if not isinstance(table, dict):
+    return table if isinstance(table, dict) else None
+
+
+def _read_terminal_transport_config() -> str | None:
+    """Read ``terminal.transport`` from the global config, or ``None``.
+
+    Best-effort: any failure (missing/unreadable file, non-mapping YAML,
+    absent table/key, non-string/bool value) returns ``None`` so the caller
+    uses the control default. Never raises.
+
+    An unquoted YAML ``true``/``false`` parses as a real bool rather than a
+    string, so a bool value is normalized to its lowercase string spelling
+    before returning — ``terminal.transport: false`` still selects the PTY
+    alias in :data:`_TRANSPORT_PTY_ALIASES`.
+
+    :returns: The raw configured transport string, or ``None`` when unset.
+    """
+    table = _read_terminal_config_table()
+    if table is None:
         return None
     value = table.get(_TERMINAL_TRANSPORT_CONFIG_KEY)
     if isinstance(value, bool):
@@ -2401,6 +2416,19 @@ class HerdrBackend(TerminalBackend):
 
     # ------------------------------------------------------------- derivation
 
+    @staticmethod
+    def _socket_digest(socket_path: Path) -> str:
+        """Return the stable 12-char SHA-1 digest of *socket_path*.
+
+        The shared basis for every per-terminal herdr identifier (session name,
+        workspace label, agent name): a hash of the private socket path, so each
+        derived name is unique per terminal instance and deterministic across a
+        restart that reuses the same private endpoint.
+        """
+        import hashlib
+
+        return hashlib.sha1(str(socket_path).encode("utf-8")).hexdigest()[:12]
+
     @classmethod
     def _session_name(cls, socket_path: Path) -> str:
         """Derive this instance's omnigent-scoped herdr ``--session`` name.
@@ -2409,10 +2437,7 @@ class HerdrBackend(TerminalBackend):
         instance and, by the :data:`_SESSION_PREFIX`, guaranteed distinct from
         herdr's ``default`` session (the user's live panes).
         """
-        import hashlib
-
-        digest = hashlib.sha1(str(socket_path).encode("utf-8")).hexdigest()[:12]
-        return f"{cls._SESSION_PREFIX}{digest}"
+        return f"{cls._SESSION_PREFIX}{cls._socket_digest(socket_path)}"
 
     @classmethod
     def _workspace_label(cls, socket_path: Path, target: str) -> str:
@@ -2423,11 +2448,8 @@ class HerdrBackend(TerminalBackend):
         leftover as a husk (see :meth:`launch`). With per-launch socket paths the
         label is effectively unique and husk adoption is a safe no-op.
         """
-        import hashlib
-
         slug = re.sub(r"[^A-Za-z0-9]+", "-", target).strip("-").lower() or "main"
-        digest = hashlib.sha1(str(socket_path).encode("utf-8")).hexdigest()[:12]
-        return f"{cls._LABEL_PREFIX}{digest}-{slug}"
+        return f"{cls._LABEL_PREFIX}{cls._socket_digest(socket_path)}-{slug}"
 
     @classmethod
     def workspace_label_for(cls, socket_path: Path, target: str = "main") -> str:
@@ -2453,10 +2475,7 @@ class HerdrBackend(TerminalBackend):
         private endpoint, :data:`_AGENT_PREFIX`-scoped so it is unique per
         terminal and never collides with a user's own agents.
         """
-        import hashlib
-
-        digest = hashlib.sha1(str(socket_path).encode("utf-8")).hexdigest()[:12]
-        return f"{cls._AGENT_PREFIX}{digest}"
+        return f"{cls._AGENT_PREFIX}{cls._socket_digest(socket_path)}"
 
     @staticmethod
     def _result_payload(data: dict[str, Any]) -> dict[str, Any]:  # type: ignore[explicit-any]
@@ -2576,8 +2595,6 @@ class HerdrBackend(TerminalBackend):
         JSON parse failure, or a non-string element falls back to treating the
         whole value as one binary path.
         """
-        import json
-
         raw = os.environ.get(cls.BIN_ENV_VAR, cls.DEFAULT_BIN).strip() or cls.DEFAULT_BIN
         if raw.startswith("["):
             try:
@@ -2665,8 +2682,6 @@ class HerdrBackend(TerminalBackend):
         rejected). Callers unwrap the ``result`` payload via
         :meth:`_result_payload` / :meth:`_workspaces_of` / :meth:`_pane_ids_of`.
         """
-        import json
-
         raw = await self._run_output(*args)
         return json.loads(self._normalize_newlines(raw))
 
@@ -2921,8 +2936,6 @@ class HerdrBackend(TerminalBackend):
         non-zero exit). Try stdout first, then stderr; return the first mapping
         that parses, else ``None``.
         """
-        import json
-
         for raw in (stdout, stderr):
             if not raw:
                 continue
@@ -3357,21 +3370,8 @@ def _read_terminal_backend_config() -> str | None:
 
     :returns: The configured backend name, or ``None`` when unset.
     """
-    import yaml
-
-    path = _global_config_path()
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return None
-    try:
-        raw = yaml.safe_load(text)
-    except yaml.YAMLError:
-        return None
-    if not isinstance(raw, dict):
-        return None
-    table = raw.get(_TERMINAL_CONFIG_TABLE)
-    if not isinstance(table, dict):
+    table = _read_terminal_config_table()
+    if table is None:
         return None
     value = table.get(_TERMINAL_BACKEND_CONFIG_KEY)
     if not isinstance(value, str):
@@ -4044,21 +4044,6 @@ class TerminalInstance:
         """Store a pane capture for later exit diagnostics."""
         self._last_pane_snapshot = snapshot
 
-    def _tmux_base_cmd(self) -> list[str]:
-        """
-        Build the tmux argv prefix for this instance's private server.
-
-        Managed terminal sessions must not inherit the user's
-        ``~/.tmux.conf``. The terminal integration owns the server
-        lifecycle and applies the supported options explicitly during
-        launch, so user config would make identical agent specs behave
-        differently across machines.
-
-        :returns: Base argv for subprocess calls, e.g.
-            ``["tmux", "-S", "/tmp/.../tmux.sock", "-f", "/dev/null"]``.
-        """
-        return ["tmux", "-S", str(self.socket_path), "-f", _TMUX_CONFIG_PATH]
-
     async def set_conversation_link(self, conversation_link: str | None) -> None:
         """
         Update the link shown in this terminal's status bar.
@@ -4722,53 +4707,6 @@ class TerminalInstance:
             handles).
         """
         return await self._backend.liveness() is Liveness.INNER_EXITED
-
-    async def _tmux(self, *args: str) -> None:
-        """Run a tmux command against this instance's server."""
-        proc = await asyncio.create_subprocess_exec(
-            *self._tmux_base_cmd(),
-            *args,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(f"tmux command failed: {' '.join(args)}: {stderr.decode().strip()}")
-
-    async def _tmux_output(self, *args: str) -> str:
-        """Run a tmux command and return stdout."""
-        proc = await asyncio.create_subprocess_exec(
-            *self._tmux_base_cmd(),
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(f"tmux command failed: {' '.join(args)}: {stderr.decode().strip()}")
-        return stdout.decode()
-
-    def _tmux_output_sync(self, *args: str) -> str:
-        """
-        Synchronous sibling of :meth:`_tmux_output`.
-
-        Used by :meth:`_idle_watch_loop_threaded` because that
-        watcher runs on a daemon thread without an event loop.
-        Same error semantics as the async version: non-zero exit
-        codes raise :class:`RuntimeError` carrying the stderr.
-
-        :param args: Args to pass after ``tmux -S <socket>``,
-            e.g. ``("capture-pane", "-t", "main", "-p", "-e")``.
-        :returns: The captured stdout, decoded as UTF-8.
-        :raises RuntimeError: When the tmux subprocess exits
-            non-zero (typically because the server has gone away).
-        """
-        proc = subprocess.run([*self._tmux_base_cmd(), *args], capture_output=True, check=False)
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"tmux command failed: {' '.join(args)}: {proc.stderr.decode().strip()}"
-            )
-        return proc.stdout.decode()
 
 
 def _shell_quote(s: str) -> str:

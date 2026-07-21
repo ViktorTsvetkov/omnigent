@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import datetime
+from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar
 
@@ -11,6 +13,7 @@ from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 
 from omnigent.db.utils import now_epoch
+from omnigent.onboarding.sandboxes.base import render_host_config_write_command
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -58,6 +61,7 @@ def _injected_config(
     *,
     server_url: str = "https://srv.example.com",
     token_ttl_s: int = 3600,
+    host_config: dict[str, object] | None = None,
 ) -> ManagedSandboxConfig:
     """
     Build a config that injects *fake* through the launcher-factory seam
@@ -66,12 +70,14 @@ def _injected_config(
     :param fake: The launcher every launch should use.
     :param server_url: Server URL the sandbox host dials back to.
     :param token_ttl_s: Launch-token lifetime in seconds.
+    :param host_config: In-sandbox config.yaml content to forward, or ``None``.
     :returns: A ready :class:`ManagedSandboxConfig`.
     """
     return ManagedSandboxConfig(
         server_url=server_url,
         launcher_factory=lambda: fake,
         token_ttl_s=token_ttl_s,
+        host_config=host_config,
     )
 
 
@@ -552,6 +558,126 @@ def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPat
     assert fake.resources is None
 
 
+def test_parse_host_config_threads_verbatim_without_resolving_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A valid host_config lands on the parsed config verbatim, and its
+    ``api_key_ref: env:`` reference is NOT resolved at parse time — the
+    variable names sandbox environment, not server environment, so parsing
+    must succeed with the variable unset on the server.
+    """
+    monkeypatch.delenv("LITELLM_API_KEY", raising=False)
+    monkeypatch.delenv("OMNIGENT_LITELLM_API_KEY", raising=False)
+    host_config = {
+        "providers": {
+            "litellm": {
+                "kind": "gateway",
+                "default": ["pi"],
+                "openai": {
+                    "base_url": "http://litellm.litellm.svc.cluster.local/v1",
+                    "api_key_ref": "env:LITELLM_API_KEY",
+                    "wire_api": "chat",
+                },
+            }
+        }
+    }
+
+    cfg = parse_sandbox_config(
+        {"provider": "modal", "server_url": "https://s.example.com", "host_config": host_config}
+    )
+
+    assert cfg is not None
+    assert cfg.host_config == host_config
+
+
+def test_parse_absent_host_config_is_none() -> None:
+    """No host_config key → nothing forwarded, existing configs unchanged."""
+    cfg = parse_sandbox_config({"provider": "modal", "server_url": "https://s.example.com"})
+    assert cfg is not None
+    assert cfg.host_config is None
+
+
+def test_parse_host_config_null_providers_fails_loud() -> None:
+    """
+    An explicit ``providers: null`` fails parse. Left through, the sandbox
+    merge would write ``providers: null`` over any existing block and the
+    harness would silently fall back to its own login — the exact
+    degradation this parse exists to stop.
+    """
+    with pytest.raises(ValueError, match=r"sandbox\.host_config\.providers"):
+        parse_sandbox_config(
+            {
+                "provider": "modal",
+                "server_url": "https://s.example.com",
+                "host_config": {"providers": None},
+            }
+        )
+
+
+def test_parse_host_config_duplicate_default_fails_loud() -> None:
+    """Duplicate defaults fail at server startup, before sandbox launch."""
+    provider = {
+        "kind": "gateway",
+        "default": ["pi"],
+        "openai": {
+            "base_url": "https://gateway.example.com/v1",
+            "api_key_ref": "env:GATEWAY_API_KEY",
+        },
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=r"sandbox\.host_config\.providers.*multiple providers.*'pi' family",
+    ):
+        parse_sandbox_config(
+            {
+                "provider": "modal",
+                "server_url": "https://s.example.com",
+                "host_config": {
+                    "providers": {
+                        "first": provider,
+                        "second": provider,
+                    }
+                },
+            }
+        )
+
+
+def test_parse_host_config_inline_api_key_fails_loud() -> None:
+    """Literal provider credentials cannot ride in the managed host config."""
+    with pytest.raises(ValueError, match=r"api_key_ref: env:VAR"):
+        parse_sandbox_config(
+            {
+                "provider": "modal",
+                "server_url": "https://s.example.com",
+                "host_config": {
+                    "providers": {
+                        "openai": {
+                            "kind": "key",
+                            "openai": {
+                                "base_url": "https://api.openai.com/v1",
+                                "api_key": "sk-inline-secret",
+                            },
+                        }
+                    }
+                },
+            }
+        )
+
+
+def test_parse_host_config_lossy_json_key_collision_fails_loud() -> None:
+    """JSON key coercion cannot silently collapse distinct config entries."""
+    with pytest.raises(ValueError, match=r"JSON-serializable"):
+        parse_sandbox_config(
+            {
+                "provider": "modal",
+                "server_url": "https://s.example.com",
+                "host_config": {"metadata": {1: "integer", "1": "string"}},
+            }
+        )
+
+
 @pytest.mark.parametrize(
     ("kubernetes_block", "expected_fragment"),
     [
@@ -773,6 +899,36 @@ def test_parse_kubernetes_invalid_block_fails_loud(
         (
             {"provider": "openshell", "server_url": "https://s", "openshell": {"cluster": "  "}},
             "sandbox.openshell.cluster",
+        ),
+        # host_config present but malformed (provider-agnostic top-level key).
+        (
+            {"provider": "modal", "server_url": "https://s", "host_config": "providers: {}"},
+            "sandbox.host_config",
+        ),
+        (
+            {"provider": "modal", "server_url": "https://s", "host_config": {"providers": "x"}},
+            "sandbox.host_config.providers",
+        ),
+        # An invalid provider entry (bad kind) is caught by the same parser
+        # omnigent itself uses — inside the sandbox this would degrade
+        # silently, so parse time is the only loud failure point.
+        (
+            {
+                "provider": "modal",
+                "server_url": "https://s",
+                "host_config": {"providers": {"litellm": {"kind": "bogus"}}},
+            },
+            "sandbox.host_config.providers",
+        ),
+        # yaml.safe_load turns an unquoted date into datetime.date, which the
+        # per-launch json.dumps cannot take — must fail startup, not launches.
+        (
+            {
+                "provider": "modal",
+                "server_url": "https://s",
+                "host_config": {"last_rotated": datetime.date(2024, 1, 1)},
+            },
+            "JSON-serializable",
         ),
     ],
 )
@@ -1018,11 +1174,148 @@ async def test_launch_success_registers_host_and_returns_workspace(db_uri: str) 
     # The token injected into the sandbox is the one whose digest was
     # stored: resolving it (the tunnel's auth path) yields this host,
     # which also proves it is unexpired.
-    resolved = host_store.resolve_launch_token(start.token)
+    resolved = host_store.resolve_launch_token(start.host_id, start.token)
     assert resolved is not None
     assert resolved.host_id == result.host_id
     # Nothing was torn down on the success path.
     assert fake.terminated == []
+
+
+async def test_launch_materializes_host_config_before_host_start(db_uri: str) -> None:
+    """
+    A configured host_config is written into the sandbox strictly BEFORE
+    ``omnigent host`` starts — the whole point of the injection is that the
+    host boots with its providers already on disk.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            owner=_OWNER,
+        )
+
+    fake = FakeSandboxLauncher(on_host_start=_register)
+    host_config: dict[str, object] = {"providers": {"litellm": {"kind": "gateway"}}}
+
+    await launch_managed_host(
+        config=_injected_config(fake, host_config=host_config),
+        owner=_OWNER,
+        host_store=host_store,
+    )
+
+    write_index = fake.commands.index(render_host_config_write_command(host_config))
+    host_index = next(i for i, cmd in enumerate(fake.commands) if "omnigent host --server" in cmd)
+    assert write_index < host_index
+
+
+async def test_resume_rematerializes_host_config_before_host_restart(db_uri: str) -> None:
+    """
+    Waking a dormant sandbox re-runs the config write before re-execing the
+    host — resume_managed_host bypasses _arm_and_start_host, so this is a
+    distinct wiring point, and re-materializing is what lets an operator's
+    host_config change land on the next wake without a new sandbox.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            owner=_OWNER,
+        )
+
+    fake = FakeSandboxLauncher(on_host_start=_register, can_resume=True)
+    host_config: dict[str, object] = {"providers": {"litellm": {"kind": "gateway"}}}
+    config = _injected_config(fake, host_config=host_config)
+
+    result = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host_store.set_offline(result.host_id)
+    commands_before = len(fake.commands)
+
+    await resume_managed_host(result.host_id, host_store, config)
+
+    assert fake.resumed == ["sb-fake-1"]
+    resumed_commands = fake.commands[commands_before:]
+    write_index = resumed_commands.index(render_host_config_write_command(host_config))
+    host_index = next(
+        i for i, cmd in enumerate(resumed_commands) if "omnigent host --server" in cmd
+    )
+    assert write_index < host_index
+
+
+async def test_launch_without_host_config_writes_no_config(db_uri: str) -> None:
+    """No host_config → the launch issues no config-write command at all."""
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            owner=_OWNER,
+        )
+
+    fake = FakeSandboxLauncher(on_host_start=_register)
+
+    await launch_managed_host(config=_injected_config(fake), owner=_OWNER, host_store=host_store)
+
+    assert not any(cmd.startswith("python3 -c") for cmd in fake.commands)
+
+
+async def test_launch_without_host_config_supports_legacy_start_host_signature(
+    db_uri: str,
+) -> None:
+    """
+    A deployment-injected launcher whose ``start_host`` override predates the
+    ``host_config`` parameter keeps launching when no host_config is set —
+    the kwarg is omitted entirely rather than passed as ``None``.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            owner=_OWNER,
+        )
+
+    class _LegacySignatureLauncher(FakeSandboxLauncher):
+        """Overrides start_host with the pre-host_config explicit signature."""
+
+        def start_host(
+            self,
+            sandbox_id: str,
+            *,
+            token: str,
+            host_id: str,
+            host_name: str,
+            server_url: str,
+            repo_url: str | None = None,
+            repo_branch: str | None = None,
+            repo_name: str | None = None,
+            on_stage: Callable[[str], None] | None = None,
+        ) -> str:
+            return super().start_host(
+                sandbox_id,
+                token=token,
+                host_id=host_id,
+                host_name=host_name,
+                server_url=server_url,
+                repo_url=repo_url,
+                repo_branch=repo_branch,
+                repo_name=repo_name,
+                on_stage=on_stage,
+            )
+
+    fake = _LegacySignatureLauncher(on_host_start=_register)
+
+    result = await launch_managed_host(
+        config=_injected_config(fake), owner=_OWNER, host_store=host_store
+    )
+
+    [start] = fake.host_starts
+    assert result.host_id == start.host_id
 
 
 async def test_launch_with_injected_custom_launcher(db_uri: str) -> None:
@@ -1182,7 +1475,10 @@ async def test_launch_online_timeout_terminates_and_deletes_host(
     assert host_store.list_hosts(_OWNER) == []
     # The start command DID run (the failure was registration, not
     # startup), so its minted token exists — and must be dead.
-    assert host_store.resolve_launch_token(fake.host_starts[0].token) is None
+    assert (
+        host_store.resolve_launch_token(fake.host_starts[0].host_id, fake.host_starts[0].token)
+        is None
+    )
 
 
 async def test_launch_with_repo_clones_into_workspace(db_uri: str) -> None:
@@ -1293,6 +1589,7 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
         repo_url: str | None = None,
         repo_branch: str | None = None,
         repo_name: str | None = None,
+        host_config: dict[str, object] | None = None,
         on_stage=None,
     ) -> str:
         """Record the call, prove the token already resolves, and connect."""
@@ -1307,7 +1604,9 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
             }
         )
         # The token was registered before start_host, so it resolves now.
-        self.token_resolved_at_start = self._host_store.resolve_launch_token(token) is not None
+        self.token_resolved_at_start = (
+            self._host_store.resolve_launch_token(host_id, token) is not None
+        )
         # Simulate the host's entrypoint dialing back over the tunnel.
         self._host_store.upsert_on_connect(host_id=host_id, name=host_name, owner=_OWNER)
         return f"/home/omnigent/workspace/{repo_name}" if repo_name else "/home/omnigent/workspace"
@@ -1414,9 +1713,9 @@ async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) ->
     # revoked by the re-arm (its digest no longer matches anything).
     gen2_token = fake.host_starts[1].token
     assert gen2_token != gen1_token
-    resolved = host_store.resolve_launch_token(gen2_token)
+    resolved = host_store.resolve_launch_token(fake.host_starts[1].host_id, gen2_token)
     assert resolved is not None and resolved.host_id == first.host_id
-    assert host_store.resolve_launch_token(gen1_token) is None
+    assert host_store.resolve_launch_token(fake.host_starts[0].host_id, gen1_token) is None
 
 
 async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) -> None:
@@ -1461,7 +1760,10 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) ->
     # cleanup (revoke_launch_token — covered directly in the host-store
     # suite). Gen 1's raw token is the only one observable here (the
     # failed start never executed), so assert on it.
-    assert host_store.resolve_launch_token(fake.host_starts[0].token) is None
+    assert (
+        host_store.resolve_launch_token(fake.host_starts[0].host_id, fake.host_starts[0].token)
+        is None
+    )
 
 
 async def test_relaunch_rejects_unconfigured_provider(db_uri: str) -> None:
@@ -1573,8 +1875,8 @@ async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri
     assert woke.sandbox_id == "sb-fake-1"
     second_token = fake.host_starts[1].token
     assert second_token != first_token
-    assert host_store.resolve_launch_token(first_token) is None
-    resolved = host_store.resolve_launch_token(second_token)
+    assert host_store.resolve_launch_token(fake.host_starts[0].host_id, first_token) is None
+    resolved = host_store.resolve_launch_token(fake.host_starts[1].host_id, second_token)
     assert resolved is not None and resolved.host_id == first.host_id
 
 
@@ -1604,8 +1906,13 @@ async def test_resume_managed_host_force_wakes_fresh_online_row(db_uri: str) -> 
 
     assert fake.resumed == ["sb-resume-force"]
     assert len(fake.host_starts) == 1
-    assert host_store.resolve_launch_token("tok-resume-force") is None
-    resolved = host_store.resolve_launch_token(fake.host_starts[0].token)
+    assert (
+        host_store.resolve_launch_token("62d4405ba38711fe34bebfeb5a7adaf2", "tok-resume-force")
+        is None
+    )
+    resolved = host_store.resolve_launch_token(
+        "62d4405ba38711fe34bebfeb5a7adaf2", fake.host_starts[0].token
+    )
     assert resolved is not None and resolved.host_id == "62d4405ba38711fe34bebfeb5a7adaf2"
 
 
@@ -1633,7 +1940,10 @@ async def test_resume_managed_host_noops_for_non_resumable_provider(db_uri: str)
     assert host is not None
     assert host.status == "offline"
     assert host.sandbox_id == "sb-resume-noop"
-    assert host_store.resolve_launch_token("tok-resume-noop") is not None
+    assert (
+        host_store.resolve_launch_token("249d058fbcde7b2ce941479cdb8c82d7", "tok-resume-noop")
+        is not None
+    )
 
 
 async def test_resume_managed_host_failure_preserves_existing_row_and_token(db_uri: str) -> None:
@@ -1662,7 +1972,10 @@ async def test_resume_managed_host_failure_preserves_existing_row_and_token(db_u
     assert host is not None
     assert host.status == "offline"
     assert host.sandbox_id == "sb-resume-fail"
-    assert host_store.resolve_launch_token("tok-resume-fail") is not None
+    assert (
+        host_store.resolve_launch_token("efbef7dede7be6577770cbb1287992f2", "tok-resume-fail")
+        is not None
+    )
 
 
 # ── terminate_managed_host ──────────────────────────────────
@@ -1690,7 +2003,9 @@ async def test_terminate_managed_host_terminates_and_deletes_row(db_uri: str) ->
 
     assert fake.terminated == ["sb-term-1"]
     assert host_store.get_host("62a91eb065624754c6a6dfb5869dd7e8") is None
-    assert host_store.resolve_launch_token("tok-term-1") is None
+    assert (
+        host_store.resolve_launch_token("62a91eb065624754c6a6dfb5869dd7e8", "tok-term-1") is None
+    )
 
 
 async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
@@ -1722,7 +2037,9 @@ async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
     await terminate_managed_host(host, host_store, _injected_config(fake))
 
     assert host_store.get_host("057e7fa3f1cdb40c0ec393a3d42affc7") is None
-    assert host_store.resolve_launch_token("tok-term-2") is None
+    assert (
+        host_store.resolve_launch_token("057e7fa3f1cdb40c0ec393a3d42affc7", "tok-term-2") is None
+    )
 
 
 async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> None:
@@ -1750,7 +2067,9 @@ async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> 
     # No cross-provider terminate was attempted.
     assert fake.terminated == []
     assert host_store.get_host("487212fd2b157b6ab6a6d6d3ef06ce5b") is None
-    assert host_store.resolve_launch_token("tok-term-3") is None
+    assert (
+        host_store.resolve_launch_token("487212fd2b157b6ab6a6d6d3ef06ce5b", "tok-term-3") is None
+    )
 
     # config=None behaves the same: row deleted, nothing terminated.
     host2 = host_store.register_managed_host(

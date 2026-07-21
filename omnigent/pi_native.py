@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 from collections.abc import Callable, Mapping, Sequence
@@ -44,8 +45,11 @@ from omnigent.native_terminal import terminal_attach_url as _attach_url
 from omnigent.native_terminal import url_component
 from omnigent.pi_native_bridge import bridge_dir_for_session_id
 
+_logger = logging.getLogger(__name__)
+
 _DEFAULT_PI_COMMAND = "pi"
 _PI_PATH_ENV = "OMNIGENT_PI_PATH"
+# Deprecated alias — remove in v0.8.0 (read via the legacy branch below, which warns).
 _LEGACY_HARNESS_PI_PATH_ENV = "HARNESS_PI_PATH"
 _AGENT_NAME = "pi-native-ui"
 _TERMINAL_NAME = "pi"
@@ -85,11 +89,21 @@ class PreparedPiTerminal:
 
 
 def _configured_pi_command(env: Mapping[str, str]) -> str:
-    """Return the configured Pi executable name/path from *env*."""
-    for key in (_PI_PATH_ENV, _LEGACY_HARNESS_PI_PATH_ENV):
-        value = env.get(key, "").strip()
-        if value:
-            return value
+    """Return the configured Pi executable name/path from *env*.
+
+    Reads ``OMNIGENT_PI_PATH`` (canonical) then the deprecated
+    ``HARNESS_PI_PATH`` (emitting a one-time-per-process deprecation warning
+    via the shared helper so wording/dedupe stay consistent).
+    """
+    value = env.get(_PI_PATH_ENV, "").strip()
+    if value:
+        return value
+    legacy = env.get(_LEGACY_HARNESS_PI_PATH_ENV, "").strip()
+    if legacy:
+        from omnigent.harness_startup_config import _warn_legacy_path
+
+        _warn_legacy_path(_LEGACY_HARNESS_PI_PATH_ENV, _PI_PATH_ENV)
+        return legacy
     return _DEFAULT_PI_COMMAND
 
 

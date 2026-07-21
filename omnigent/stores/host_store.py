@@ -12,6 +12,7 @@ connection state is tracked separately in the in-memory
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from omnigent.db.db_models import (
 )
 from omnigent.db.enum_codecs import decode_host_status, encode_host_status
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, now_epoch
+from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 
 # A host is considered live only if its row was touched (connect or
 # heartbeat) within this window. The host tunnel's ping loop writes a
@@ -39,7 +41,6 @@ from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, 
 # (PING_INTERVAL_S * PING_MISS_THRESHOLD) so a healthy host that is
 # still heart-beating is never falsely aged out.
 HOST_LIVENESS_TTL_S = 90
-HarnessAvailability = bool | str
 
 
 @dataclass
@@ -114,7 +115,7 @@ def _parse_configured_harnesses(raw: str | None) -> dict[str, HarnessAvailabilit
     Tolerant: ``NULL``, malformed JSON, or a non-object payload all
     map to ``None`` ("unknown") — a corrupt column value must degrade
     to no-warning in the UI, never break host listing. Entries with a
-    non-bool/string value are dropped for the same reason.
+    unsupported readiness value are dropped for the same reason.
 
     :param raw: The raw column value, e.g.
         ``'{"claude-sdk": true, "codex": false}'`` or ``None``.
@@ -129,7 +130,7 @@ def _parse_configured_harnesses(raw: str | None) -> dict[str, HarnessAvailabilit
         return None
     if not isinstance(parsed, dict):
         return None
-    return {k: v for k, v in parsed.items() if isinstance(k, str) and isinstance(v, (bool, str))}
+    return {k: v for k, v in parsed.items() if isinstance(k, str) and is_harness_availability(v)}
 
 
 def _row_to_host(row: SqlHost) -> Host:
@@ -491,6 +492,29 @@ class HostStore:
                 row.status = encode_host_status("offline")
                 row.updated_at = now_epoch()
 
+    def update_harness_readiness(
+        self,
+        host_id: str,
+        configured_harnesses: dict[str, HarnessAvailability],
+    ) -> None:
+        """Replace a connected host's live per-harness readiness map.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param configured_harnesses: Current readiness keyed by harness spelling.
+        """
+        with self._session() as session:
+            session.execute(
+                update(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                )
+                .values(
+                    configured_harnesses=json.dumps(configured_harnesses),
+                    updated_at=now_epoch(),
+                )
+            )
+
     def heartbeat(self, host_id: str) -> None:
         """
         Refresh a host's last-seen timestamp while its tunnel is alive.
@@ -703,33 +727,43 @@ class HostStore:
             session.add(row)
             return _row_to_host(row)
 
-    def resolve_launch_token(self, token: str) -> Host | None:
+    def resolve_launch_token(self, host_id: str, token: str) -> Host | None:
         """
-        Resolve a presented launch token to its managed host, if valid.
+        Resolve a launch token presented for *host_id* to its managed host.
 
-        The host tunnel's auth path for managed hosts. Lookup is by
-        SHA-256 digest — the comparison happens inside an indexed
-        equality query on a uniformly distributed hash, which is not
-        byte-by-byte comparable from the network (the standard
-        reset-token pattern; no timing oracle on the raw token).
-        Expired tokens do not authenticate; the expiry is checked
-        atomically with the lookup.
+        The host tunnel's auth path for managed hosts, whose endpoint is
+        ``/hosts/{host_id}/tunnel`` — so the connecting peer names the
+        host it claims to be, and the token proves the claim. The row is
+        fetched by its ``(workspace_id, host_id)`` primary key and the
+        stored SHA-256 digest is compared to the presented token's digest
+        with :func:`hmac.compare_digest`, so the equality is constant-time
+        and leaks no timing oracle on the raw token. Presenting a token
+        for the wrong ``host_id`` fails closed: the named row's digest
+        won't match. Expired tokens do not authenticate.
 
-        :param token: The raw token presented by a connecting host.
+        :param host_id: The host the peer claims to be, from the tunnel
+            path, e.g. ``"host_a1b2c3d4..."``.
+        :param token: The raw token presented by the connecting host.
         :returns: The matching :class:`Host` whose token is unexpired,
-            or ``None`` when the token is unknown or expired.
+            or ``None`` when the host is unknown, the token does not match,
+            or the token is expired.
         """
         with self._session() as session:
             row = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(),
-                    SqlHost.token_hash == hash_host_launch_token(token),
+                    SqlHost.host_id == host_id,
                 )
             ).scalar_one_or_none()
             # token_expires_at is written together with token_hash, so a
-            # matched row always carries it; the None arm is mypy
-            # narrowing that doubles as fail-closed.
-            if row is None or row.token_expires_at is None or row.token_expires_at < now_epoch():
+            # credentialled row always carries both; a row with either
+            # cleared (external host, or a revoked credential) never
+            # authenticates.
+            if row is None or row.token_hash is None or row.token_expires_at is None:
+                return None
+            if not hmac.compare_digest(row.token_hash, hash_host_launch_token(token)):
+                return None
+            if row.token_expires_at < now_epoch():
                 return None
             return _row_to_host(row)
 

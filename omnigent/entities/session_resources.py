@@ -183,7 +183,7 @@ def _resolve_transport_for_view(entry: TerminalListEntry) -> str:
 
     return resolve_terminal_transport(
         spec_transport=entry.instance.terminal_transport,
-        backend_capabilities=entry.instance.backend_capabilities,
+        backend_capabilities=getattr(entry.instance, "backend_capabilities", None),
     )
 
 

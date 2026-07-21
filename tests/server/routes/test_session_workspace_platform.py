@@ -5,14 +5,14 @@ from unittest.mock import Mock
 import pytest
 
 from omnigent.errors import OmnigentError
-from omnigent.server.routes import sessions
+from omnigent.server.routes import _session_create_validation, sessions
 
 
 async def test_windows_absolute_workspace_rejected_on_posix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """POSIX restores the upstream absolute-path guard byte-for-byte."""
-    monkeypatch.setattr(sessions, "IS_WINDOWS", False)
+    monkeypatch.setattr(_session_create_validation, "IS_WINDOWS", False)
 
     with pytest.raises(OmnigentError, match="absolute path starting with /"):
         await sessions._validate_session_workspace(
@@ -29,7 +29,7 @@ async def test_windows_absolute_workspace_passes_guard_on_windows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Windows absolute paths reach validation beyond the POSIX guard."""
-    monkeypatch.setattr(sessions, "IS_WINDOWS", True)
+    monkeypatch.setattr(_session_create_validation, "IS_WINDOWS", True)
 
     with pytest.raises(OmnigentError, match="requires an agent cache"):
         await sessions._validate_session_workspace(

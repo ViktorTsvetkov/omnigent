@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 import omnigent.inner.terminal as terminal_mod
+from omnigent._platform import IS_WINDOWS
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import (
     TERMINAL_TRANSPORT_CONTROL,
@@ -473,6 +474,7 @@ def test_create_terminal_instance_propagates_keep_alive_after_exit(
         shutil.rmtree(result.instance.private_dir, ignore_errors=True)
 
 
+@pytest.mark.skipif(not IS_WINDOWS, reason="native Windows terminal/path behavior")
 @pytest.mark.parametrize("shell", ["powershell", "pwsh", "cmd"])
 def test_create_terminal_instance_resolves_native_windows_shell_to_absolute_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shell: str

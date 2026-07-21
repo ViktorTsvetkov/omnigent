@@ -316,7 +316,7 @@ def _publish_tmux_target_for_bridge(
 
     control_url: str | None = None
     control_token: str | None = None
-    if instance.backend_name == "conpty":
+    if getattr(instance, "backend_name", None) == "conpty":
         runner_url = os.environ.get("RUNNER_SERVER_URL", "").rstrip("/")
         if runner_url:
             control_url = (
@@ -333,8 +333,8 @@ def _publish_tmux_target_for_bridge(
         bridge_dir_for_bridge_id(bridge_id),
         socket_path=instance.socket_path,
         tmux_target=instance.tmux_target,
-        backend=instance.backend_name,
-        pane_id=instance.delivery_target,
+        backend=getattr(instance, "backend_name", None),
+        pane_id=getattr(instance, "delivery_target", None),
         control_url=control_url,
         control_token=control_token,
     )

@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.host.frames import (
     HostHelloFrame,
     HostStatFrame,
@@ -611,6 +612,7 @@ async def test_tilde_boundary_passed_through_to_host(
 # ── Windows-host workspaces (native codex hosting, #13) ──────────
 
 
+@pytest.mark.skipif(not IS_WINDOWS, reason="native Windows terminal/path behavior")
 async def test_windows_absolute_workspace_is_accepted(
     host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
 ) -> None:
@@ -631,6 +633,7 @@ async def test_windows_absolute_workspace_is_accepted(
     assert result == r"D:\Repos\omnigent"
 
 
+@pytest.mark.skipif(not IS_WINDOWS, reason="native Windows terminal/path behavior")
 async def test_windows_workspace_missing_is_rejected(
     host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
 ) -> None:
@@ -646,6 +649,7 @@ async def test_windows_workspace_missing_is_rejected(
     assert "does not exist" in exc_info.value.message
 
 
+@pytest.mark.skipif(not IS_WINDOWS, reason="native Windows terminal/path behavior")
 async def test_windows_workspace_inside_boundary_is_accepted(
     host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
 ) -> None:
@@ -662,6 +666,7 @@ async def test_windows_workspace_inside_boundary_is_accepted(
     assert result == r"C:\Users\dev\proj"
 
 
+@pytest.mark.skipif(not IS_WINDOWS, reason="native Windows terminal/path behavior")
 async def test_windows_workspace_outside_boundary_is_rejected(
     host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
 ) -> None:
@@ -679,6 +684,7 @@ async def test_windows_workspace_outside_boundary_is_rejected(
     assert "outside the agent's required path" in exc_info.value.message
 
 
+@pytest.mark.skipif(not IS_WINDOWS, reason="native Windows terminal/path behavior")
 async def test_windows_subdir_cwd_requires_present_subdir(
     host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
 ) -> None:
@@ -696,6 +702,7 @@ async def test_windows_subdir_cwd_requires_present_subdir(
     assert result == r"D:\Repos\omnigent"
 
 
+@pytest.mark.skipif(not IS_WINDOWS, reason="native Windows terminal/path behavior")
 async def test_windows_subdir_cwd_missing_subdir_is_rejected(
     host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
 ) -> None:

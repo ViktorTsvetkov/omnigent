@@ -671,23 +671,24 @@ def setup_appcontainer_read_grants(
     """Ensure durable, idempotent RX grants for the stable profile SID."""
     sid = create_or_open_appcontainer_profile()
     try:
-        requested = set(_runtime_read_paths(executable))
-        requested.update(Path(path).resolve(strict=True) for path in read_roots)
-        requested = {
+        explicit = {Path(path).resolve(strict=True) for path in read_roots}
+        runtime = set(_runtime_read_paths(executable))
+        runtime = {
             path
-            for path in requested
+            for path in runtime
             if not any(
                 other != path and other.is_dir() and path.is_relative_to(other)
-                for other in requested
+                for other in runtime
             )
         }
+        requested = runtime | explicit
         traversal_sources = requested | {
             Path(path).resolve(strict=False) for path in (traversal_targets or [])
         }
         traversal = {parent for path in traversal_sources for parent in _parents(path)}
         configured_trees, configured_traversal = _read_rx_state()
         mask = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
-        for path in sorted(requested - configured_trees, key=os.fspath):
+        for path in sorted((runtime - configured_trees) | explicit, key=os.fspath):
             _grant_tree(path, [sid], mask)
         for path in sorted(traversal, key=os.fspath):
             _set_persistent_acl(

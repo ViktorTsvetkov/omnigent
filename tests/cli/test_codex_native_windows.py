@@ -4,7 +4,7 @@ Covers the CLI-side pieces that let ``omnigent codex`` run on native Windows by
 hosting the codex CLI in a herdr pane instead of tmux:
 
 * the rejection → backend-availability check
-  (:func:`omnigent.cli._ensure_native_terminal_backend_available`), which
+  (:func:`omnigent.cli_common.ensure_native_terminal_backend_available`), which
   replaces the hard Windows rejection for the hosting-only codex harness; and
 * the local-attach herdr-UI guidance
   (:func:`omnigent.codex_native._print_herdr_local_attach_guidance`), the
@@ -26,7 +26,7 @@ from pathlib import Path
 import click
 import pytest
 
-import omnigent.cli as cli_mod
+import omnigent.cli_common as cli_common_mod
 import omnigent.codex_native as codex_native
 import omnigent.inner.terminal as terminal_mod
 from omnigent.codex_native import (
@@ -42,7 +42,7 @@ _FAKE_PATH = Path(_fake_herdr.__file__).resolve()
 
 def _force_windows(monkeypatch: pytest.MonkeyPatch) -> None:
     """Simulate native Windows for both the CLI gate and backend selection."""
-    monkeypatch.setattr(cli_mod, "IS_WINDOWS", True)
+    monkeypatch.setattr(cli_common_mod, "IS_WINDOWS", True)
     monkeypatch.setattr(terminal_mod, "IS_WINDOWS", True)
 
 
@@ -65,7 +65,7 @@ def test_availability_check_passes_when_backend_available(
     _force_windows(monkeypatch)
     _install_fake_herdr(monkeypatch, tmp_path)
     # Must not raise — codex can be hosted in a herdr pane.
-    cli_mod._ensure_native_terminal_backend_available("codex")
+    cli_common_mod.ensure_native_terminal_backend_available("codex")
 
 
 def test_availability_check_uses_conpty_when_herdr_missing(
@@ -74,17 +74,17 @@ def test_availability_check_uses_conpty_when_herdr_missing(
     """A missing/unspawnable herdr backend fails with a clear, actionable error."""
     _force_windows(monkeypatch)
     monkeypatch.setenv(HerdrBackend.BIN_ENV_VAR, str(tmp_path / "no-such-herdr"))
-    cli_mod._ensure_native_terminal_backend_available("codex")
+    cli_common_mod.ensure_native_terminal_backend_available("codex")
 
 
 def test_availability_check_is_noop_on_posix(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """On POSIX the gate is a no-op even with an unusable herdr bin (byte-identical)."""
-    monkeypatch.setattr(cli_mod, "IS_WINDOWS", False)
+    monkeypatch.setattr(cli_common_mod, "IS_WINDOWS", False)
     monkeypatch.setenv(HerdrBackend.BIN_ENV_VAR, str(tmp_path / "no-such-herdr"))
     # Returns without raising — the POSIX path never gained an early gate.
-    cli_mod._ensure_native_terminal_backend_available("codex")
+    cli_common_mod.ensure_native_terminal_backend_available("codex")
 
 
 # ---------------------------------------------------------------------------

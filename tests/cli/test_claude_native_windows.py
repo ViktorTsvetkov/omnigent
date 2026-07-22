@@ -12,7 +12,7 @@ import click
 import pytest
 
 import omnigent.claude_native as claude_native
-import omnigent.cli as cli_mod
+import omnigent.cli_common as cli_common_mod
 import omnigent.inner.terminal as terminal_mod
 from omnigent.claude_native import PreparedClaudeTerminal
 from omnigent.inner.terminal import HerdrBackend
@@ -33,23 +33,23 @@ def _prepared(socket_path: Path | None) -> PreparedClaudeTerminal:
 
 
 def test_availability_gate_accepts_herdr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(cli_mod, "IS_WINDOWS", True)
+    monkeypatch.setattr(cli_common_mod, "IS_WINDOWS", True)
     monkeypatch.setattr(terminal_mod, "IS_WINDOWS", True)
     monkeypatch.setenv(HerdrBackend.BIN_ENV_VAR, json.dumps([sys.executable, str(_FAKE_PATH)]))
     monkeypatch.setenv(_fake_herdr.STATE_DIR_ENV_VAR, str(tmp_path / "herdr-state"))
     monkeypatch.setenv(_fake_herdr.PROTOCOL_ENV_VAR, _fake_herdr.DEFAULT_PROTOCOL)
 
-    cli_mod._ensure_native_terminal_backend_available("claude")
+    cli_common_mod.ensure_native_terminal_backend_available("claude")
 
 
 def test_availability_gate_uses_conpty_without_herdr(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(cli_mod, "IS_WINDOWS", True)
+    monkeypatch.setattr(cli_common_mod, "IS_WINDOWS", True)
     monkeypatch.setattr(terminal_mod, "IS_WINDOWS", True)
     monkeypatch.setenv(HerdrBackend.BIN_ENV_VAR, str(tmp_path / "missing-herdr"))
 
-    cli_mod._ensure_native_terminal_backend_available("claude")
+    cli_common_mod.ensure_native_terminal_backend_available("claude")
 
 
 def test_preflight_skips_only_tmux_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:

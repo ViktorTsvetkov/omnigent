@@ -31,9 +31,7 @@ from omnigent.inner.terminal import TerminalDelivery, TmuxDeliveryStyle, build_p
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_KIMI_NATIVE_BRIDGE_DIR"
 
-_BRIDGE_ROOT = (
-    Path(os.environ.get("TMPDIR", "/tmp")) / f"omnigent-{stable_user_id()}" / "kimi-native"
-)
+_BRIDGE_ROOT = Path(tempfile.gettempdir()) / f"omnigent-{stable_user_id()}" / "kimi-native"
 _TMUX_FILE = "tmux.json"
 # Omnigent routing details the kimi hook subprocess reads to reach the server.
 # Mirrors claude-native's ``permission_hook.json`` (server URL + auth headers +

@@ -23,9 +23,7 @@ from omnigent.inner.terminal import TerminalDelivery, TmuxDeliveryStyle, build_p
 KIRO_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_KIRO_NATIVE_BRIDGE_DIR"
 KIRO_ACP_RECORD_PATH_ENV_VAR = "KIRO_ACP_RECORD_PATH"
 
-_BRIDGE_ROOT = (
-    Path(os.environ.get("TMPDIR", "/tmp")) / f"omnigent-{stable_user_id()}" / "kiro-native"
-)
+_BRIDGE_ROOT = Path(tempfile.gettempdir()) / f"omnigent-{stable_user_id()}" / "kiro-native"
 _TMUX_FILE = "tmux.json"
 _FORWARDER_READY_FILE = "kiro_session_forwarder_ready.json"
 _ACP_RECORD_FILE = "kiro_acp_record.jsonl"

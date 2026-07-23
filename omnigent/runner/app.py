@@ -144,6 +144,18 @@ from omnigent.tools.builtins.load_skill import (
 _logger = logging.getLogger(__name__)
 
 
+async def _session_labels_for_runner_spawn(
+    *,
+    server_client: httpx.AsyncClient,
+    session_id: str,
+) -> dict[str, str]:
+    """Keep the native helper patchable through the runner app facade."""
+    return await _native_runtime._session_labels_for_runner_spawn(
+        server_client=server_client,
+        session_id=session_id,
+    )
+
+
 def __getattr__(name: str) -> Any:
     """Preserve private native-helper imports during the package move."""
     return getattr(_native, name)

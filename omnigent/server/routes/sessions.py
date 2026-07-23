@@ -18776,7 +18776,14 @@ def create_sessions_router(
         )
         if not is_native_bootstrap:
             spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
-            declared = list(spec.terminals or {}) if spec is not None else []
+            host_terminals = _host_terminal_capabilities(conv, spec)
+            declared = (
+                list(host_terminals)
+                if host_terminals is not None
+                else list(spec.terminals or {})
+                if spec is not None
+                else []
+            )
             if body.get("terminal") not in declared:
                 raise OmnigentError(
                     (
@@ -18786,6 +18793,8 @@ def create_sessions_router(
                     ),
                     code=ErrorCode.INVALID_INPUT,
                 )
+            if host_terminals is not None:
+                body["spec"] = {"command": host_terminals[body["terminal"]]}
         path = f"/v1/sessions/{session_id}/resources/terminals"
         status, payload = await _proxy_post_to_runner(
             session_id,
@@ -21904,7 +21913,25 @@ def create_sessions_router(
             return entry.description if entry else spec.function.path
         return None
 
-    def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
+    def _host_terminal_capabilities(
+        conv: Conversation,
+        spec: Any,
+    ) -> dict[str, str] | None:
+        """Resolve host shells for a host-bound native wrapper."""
+        if (
+            host_registry is None
+            or conv.host_id is None
+            or spec is None
+            or native_coding_agent_for_harness(spec.executor.harness_kind) is None
+        ):
+            return None
+        return host_registry.get_host_terminal_capabilities(conv.host_id)
+
+    def _to_agent_object(
+        agent: Agent,
+        cache: AgentCache | None,
+        host_terminal_capabilities: Mapping[str, str] | None = None,
+    ) -> AgentObject:
         """
         Convert a runtime :class:`Agent` entity to an API-layer
         :class:`AgentObject`.
@@ -21943,6 +21970,8 @@ def create_sessions_router(
                 # Declared terminal names, in spec order — the Web UI
                 # gates its "new terminal" affordance on this list.
                 terminals = list(loaded.spec.terminals or {})
+                if host_terminal_capabilities is not None:
+                    terminals = list(host_terminal_capabilities)
                 # Bundled skills only (mirrors GET /v1/agents); the merged
                 # bundled + host-discovered set lives on the session snapshot.
                 skills = [
@@ -22040,7 +22069,9 @@ def create_sessions_router(
                 f"Agent not found: {conv.agent_id!r}",
                 code=ErrorCode.NOT_FOUND,
             )
-        return _to_agent_object(agent, agent_cache)
+        loaded_spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+        host_terminals = _host_terminal_capabilities(conv, loaded_spec)
+        return _to_agent_object(agent, agent_cache, host_terminals)
 
     @router.get(
         "/sessions/{session_id}/agent/contents",

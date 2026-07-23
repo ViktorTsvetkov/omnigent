@@ -95,6 +95,25 @@ def test_get_host_platform_falls_back_for_older_host(
     assert registry.get_host_platform("host_legacy") == "darwin"
 
 
+def test_get_host_terminal_capabilities_preserves_order_and_isolation() -> None:
+    """The registry resolves the connected host's advertised shell mapping."""
+    registry = HostRegistry()
+    hello = _make_hello()
+    hello.terminal_capabilities = {
+        "bash": r"C:\Program Files\Git\bin\bash.exe",
+        "pwsh": r"C:\Program Files\PowerShell\7\pwsh.exe",
+        "cmd": r"C:\Windows\System32\cmd.exe",
+    }
+    registry.register("host_shells", FakeWebSocket(), hello, owner=None)
+
+    resolved = registry.get_host_terminal_capabilities("host_shells")
+
+    assert resolved == hello.terminal_capabilities
+    assert list(resolved or {}) == ["bash", "pwsh", "cmd"]
+    assert resolved is not hello.terminal_capabilities
+    assert registry.get_host_terminal_capabilities("host_legacy") is None
+
+
 def test_deregister() -> None:
     """
     Verify that deregister removes the host from the registry.

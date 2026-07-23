@@ -91,6 +91,9 @@ class HostHelloFrame:
         authoritative.
     :param platform: Operating system of the host process. ``None`` means an
         older host that did not report it.
+    :param terminal_capabilities: Interactive shell names mapped to commands
+        resolvable on this host. ``None`` preserves the server's legacy
+        spec-derived behavior.
     """
 
     version: str
@@ -101,6 +104,7 @@ class HostHelloFrame:
     telemetry_opt_out: bool = False
     installation_id: str | None = None
     platform: HostPlatform | None = None
+    terminal_capabilities: dict[str, str] | None = None
 
 
 @dataclass
@@ -762,6 +766,8 @@ def encode_host_frame(frame: HostFrame) -> str:
         }
         if frame.platform is not None:
             payload["platform"] = frame.platform
+        if frame.terminal_capabilities is not None:
+            payload["terminal_capabilities"] = frame.terminal_capabilities
         return _encode_payload(payload)
     if isinstance(frame, HostHarnessReadinessFrame):
         return _encode_payload(
@@ -1129,6 +1135,7 @@ def _decode_host_hello(msg: dict[str, Any]) -> HostHelloFrame:
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
         platform=_optional_host_platform(msg, "platform"),
+        terminal_capabilities=_optional_str_map(msg, "terminal_capabilities"),
     )
 
 
@@ -1553,6 +1560,19 @@ def _optional_host_platform(msg: dict[str, Any], key: str) -> HostPlatform | Non
         return None
     if val not in ("windows", "linux", "darwin"):
         raise ValueError(f"frame field must be a supported host platform or null: {key!r}")
+    return val
+
+
+def _optional_str_map(msg: dict[str, Any], key: str) -> dict[str, str] | None:
+    """Return an optional string-to-string map."""
+    val = msg.get(key)
+    if val is None:
+        return None
+    if not isinstance(val, dict) or not all(
+        isinstance(name, str) and name and isinstance(command, str) and command
+        for name, command in val.items()
+    ):
+        raise ValueError(f"frame field must be a string map or null: {key!r}")
     return val
 
 

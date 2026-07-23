@@ -442,6 +442,15 @@ class HostRegistry:
             return "darwin"
         return "linux"
 
+    def get_host_terminal_capabilities(
+        self, host_id: str, workspace_id: int | None = None
+    ) -> dict[str, str] | None:
+        """Return explicitly advertised host shells, or ``None`` for legacy hosts."""
+        conn = self.get(host_id, workspace_id)
+        if conn is None or conn.hello.terminal_capabilities is None:
+            return None
+        return dict(conn.hello.terminal_capabilities)
+
     def send_text(self, conn: HostConnection, data: str) -> None:
         """Enqueue a text frame for sending to the host.
 

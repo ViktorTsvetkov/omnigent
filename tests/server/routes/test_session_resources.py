@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import _globals, session_stream, set_runner_client, set_runner_router
+from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
 
@@ -454,10 +455,15 @@ def app(runner_globals_reset: None) -> FastAPI:
             """
             return
 
+    conversation_store = _ConversationStore()
+    host_registry = HostRegistry()
+    app.state.test_conversation_store = conversation_store
+    app.state.host_registry = host_registry
     app.include_router(
         create_sessions_router(
-            _ConversationStore(),  # type: ignore[arg-type]
+            conversation_store,  # type: ignore[arg-type]
             _StubAgentStore(),  # type: ignore[arg-type]
+            host_registry=host_registry,
         ),
         prefix="/v1",
     )
@@ -1208,6 +1214,127 @@ async def test_create_terminal_rejected_for_undeclared_name(
     assert body["error"]["code"] == "invalid_input"
     # The message names the declared set so a UI/user can self-correct.
     assert "bash" in body["error"]["message"]
+    assert fake_runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_terminal_uses_windows_host_capability_on_linux_server(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native Windows host supplies both the allowed name and launch command."""
+    from omnigent.host.frames import HostHelloFrame
+    from omnigent.inner.datamodel import TerminalEnvSpec
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    app.state.test_conversation_store._conversations[session_id].host_id = "host_windows"
+    app.state.host_registry.register(
+        "host_windows",
+        object(),
+        HostHelloFrame(
+            version="test",
+            frame_protocol_version=1,
+            name="windows",
+            platform="windows",
+            terminal_capabilities={
+                "bash": r"C:\Program Files\Git\bin\bash.exe",
+                "pwsh": r"C:\Program Files\PowerShell\7\pwsh.exe",
+                "cmd": r"C:\Windows\System32\cmd.exe",
+            },
+        ),
+        owner=None,
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        terminals={"bash": TerminalEnvSpec(command="bash")},
+    )
+    monkeypatch.setattr(
+        sessions_module,
+        "_load_agent_spec_for_session",
+        lambda conv, agent_store: spec,
+    )
+    terminal_resource = {
+        "id": "terminal_pwsh_s1",
+        "object": "session.resource",
+        "type": "terminal",
+        "session_id": session_id,
+        "name": "pwsh:s1",
+        "metadata": {
+            "terminal_name": "pwsh",
+            "session_key": "s1",
+            "running": True,
+        },
+    }
+    fake_runner = _FakeRunnerClient(payload=terminal_resource)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/resources/terminals",
+        json={"terminal": "pwsh", "session_key": "s1"},
+    )
+
+    assert resp.status_code == 200
+    assert fake_runner.post_json_calls == [
+        (
+            f"/v1/sessions/{session_id}/resources/terminals",
+            {
+                "terminal": "pwsh",
+                "session_key": "s1",
+                "spec": {"command": r"C:\Program Files\PowerShell\7\pwsh.exe"},
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_terminal_rejects_name_missing_from_windows_host_capabilities(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host-bound native wrapper cannot launch an unadvertised shell."""
+    from omnigent.host.frames import HostHelloFrame
+    from omnigent.inner.datamodel import TerminalEnvSpec
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    app.state.test_conversation_store._conversations[session_id].host_id = "host_windows"
+    app.state.host_registry.register(
+        "host_windows",
+        object(),
+        HostHelloFrame(
+            version="test",
+            frame_protocol_version=1,
+            name="windows",
+            terminal_capabilities={"cmd": r"C:\Windows\System32\cmd.exe"},
+        ),
+        owner=None,
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        terminals={"bash": TerminalEnvSpec(command="bash")},
+    )
+    monkeypatch.setattr(
+        sessions_module,
+        "_load_agent_spec_for_session",
+        lambda conv, agent_store: spec,
+    )
+    fake_runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/resources/terminals",
+        json={"terminal": "pwsh", "session_key": "s1"},
+    )
+
+    assert resp.status_code == 400
+    assert "cmd" in resp.json()["error"]["message"]
     assert fake_runner.calls == []
 
 

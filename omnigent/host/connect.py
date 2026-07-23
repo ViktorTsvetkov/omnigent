@@ -13,6 +13,7 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Iterator, Mapping
@@ -22,7 +23,13 @@ from pathlib import Path
 import websockets.asyncio.client
 from websockets.exceptions import InvalidStatus, InvalidURI
 
-from omnigent._platform import IS_DARWIN, IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
+from omnigent._platform import (
+    IS_DARWIN,
+    IS_WINDOWS,
+    WINDOWS_ENV_PASSTHROUGH,
+    installed_interactive_shells,
+    resolve_windows_interactive_shell_path,
+)
 from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host.frames import (
@@ -2127,6 +2134,14 @@ class HostProcess:
         except Exception:  # noqa: BLE001
             pass
         configured_harnesses = await asyncio.to_thread(configured_harness_map)
+        terminal_capabilities = None
+        if IS_WINDOWS:
+            terminal_capabilities = {
+                shell: (
+                    resolve_windows_interactive_shell_path(shell) or shutil.which(shell) or shell
+                )
+                for shell in installed_interactive_shells()
+            }
         hello = HostHelloFrame(
             version=VERSION,
             frame_protocol_version=1,
@@ -2138,6 +2153,7 @@ class HostProcess:
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
             platform="windows" if IS_WINDOWS else "darwin" if IS_DARWIN else "linux",
+            terminal_capabilities=terminal_capabilities,
         )
         await ws.send(encode_host_frame(hello))
         self._ws = ws

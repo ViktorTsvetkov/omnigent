@@ -90,6 +90,11 @@ def test_hello_frame_round_trip() -> None:
         name="corey-laptop",
         runners=["runner_token_aaa", "runner_token_bbb"],
         platform="windows",
+        terminal_capabilities={
+            "bash": r"C:\Program Files\Git\bin\bash.exe",
+            "pwsh": r"C:\Program Files\PowerShell\7\pwsh.exe",
+            "cmd": r"C:\Windows\System32\cmd.exe",
+        },
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
@@ -98,6 +103,7 @@ def test_hello_frame_round_trip() -> None:
     assert decoded.name == "corey-laptop"
     assert decoded.runners == ["runner_token_aaa", "runner_token_bbb"]
     assert decoded.platform == "windows"
+    assert decoded.terminal_capabilities == original.terminal_capabilities
 
 
 def test_hello_frame_empty_runners() -> None:
@@ -116,7 +122,9 @@ def test_hello_frame_empty_runners() -> None:
     assert isinstance(decoded, HostHelloFrame)
     assert decoded.runners == []
     assert decoded.platform is None
+    assert decoded.terminal_capabilities is None
     assert "platform" not in json.loads(encoded)
+    assert "terminal_capabilities" not in json.loads(encoded)
 
 
 def test_launch_runner_frame_round_trip() -> None:

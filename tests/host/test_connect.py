@@ -866,6 +866,42 @@ async def test_hello_advertises_installed_version() -> None:
     assert hello.version != "0.1.0"
 
 
+async def test_windows_hello_advertises_resolved_terminal_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Windows host reports ordered shell names and executable commands."""
+    monkeypatch.setattr("omnigent.host.connect.IS_WINDOWS", True)
+    monkeypatch.setattr(
+        "omnigent.host.connect.installed_interactive_shells",
+        lambda: ["bash", "pwsh", "cmd"],
+    )
+    native_paths = {
+        "pwsh": r"C:\Program Files\PowerShell\7\pwsh.exe",
+        "cmd": r"C:\Windows\System32\cmd.exe",
+    }
+    monkeypatch.setattr(
+        "omnigent.host.connect.resolve_windows_interactive_shell_path",
+        native_paths.get,
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.shutil.which",
+        lambda name: r"C:\Program Files\Git\bin\bash.exe" if name == "bash" else None,
+    )
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type]
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.terminal_capabilities == {
+        "bash": r"C:\Program Files\Git\bin\bash.exe",
+        "pwsh": r"C:\Program Files\PowerShell\7\pwsh.exe",
+        "cmd": r"C:\Windows\System32\cmd.exe",
+    }
+
+
 def test_handle_stop_terminates_process(tmp_path: Path) -> None:
     """
     Verify that _handle_stop terminates a tracked runner and

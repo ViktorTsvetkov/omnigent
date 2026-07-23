@@ -21970,7 +21970,10 @@ def create_sessions_router(
                 # Declared terminal names, in spec order — the Web UI
                 # gates its "new terminal" affordance on this list.
                 terminals = list(loaded.spec.terminals or {})
-                if host_terminal_capabilities is not None:
+                if (
+                    host_terminal_capabilities is not None
+                    and native_coding_agent_for_harness(harness) is not None
+                ):
                     terminals = list(host_terminal_capabilities)
                 # Bundled skills only (mirrors GET /v1/agents); the merged
                 # bundled + host-discovered set lives on the session snapshot.
@@ -22069,8 +22072,11 @@ def create_sessions_router(
                 f"Agent not found: {conv.agent_id!r}",
                 code=ErrorCode.NOT_FOUND,
             )
-        loaded_spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
-        host_terminals = _host_terminal_capabilities(conv, loaded_spec)
+        host_terminals = (
+            host_registry.get_host_terminal_capabilities(conv.host_id)
+            if host_registry is not None and conv.host_id is not None
+            else None
+        )
         return _to_agent_object(agent, agent_cache, host_terminals)
 
     @router.get(

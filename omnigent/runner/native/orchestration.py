@@ -86,16 +86,16 @@ def _publish_tmux_target_for_bridge(
     session_key: str,
 ) -> None:
     """
-    Advertise a launched terminal's tmux target to a bridge directory.
+    Advertise a launched terminal's backend delivery target to a bridge directory.
 
     Called from the terminal-launch POST when the caller opts in via
     truthy ``bridge_inject_dir`` in the body. The destination path is
     derived from a server-side bridge id, so a caller can't redirect
     the write.
 
-    The ``claude-native`` harness reads ``tmux.json`` from the derived
-    directory and shells out to ``tmux -S <socket> send-keys``. No-op
-    if the registry has no live instance for the triple.
+    The ``claude-native`` harness reads ``tmux.json`` from the derived directory
+    and reconstructs the advertised backend. Legacy records without a backend
+    remain tmux. No-op if the registry has no live instance for the triple.
 
     :param resource_registry: Session resource registry that exposes
         the underlying terminal registry.
@@ -116,10 +116,29 @@ def _publish_tmux_target_for_bridge(
     # generic runner module's import-time graph.
     from omnigent.claude_native_bridge import bridge_dir_for_bridge_id, write_tmux_target
 
+    control_url: str | None = None
+    control_token: str | None = None
+    if getattr(instance, "backend_name", None) == "conpty":
+        runner_url = os.environ.get("RUNNER_SERVER_URL", "").rstrip("/")
+        if runner_url:
+            control_url = (
+                f"{runner_url}/v1/sessions/{urllib.parse.quote(session_id, safe='')}"
+                f"/resources/terminals/{urllib.parse.quote(terminal_name, safe='')}"
+                f"/{urllib.parse.quote(session_key, safe='')}/control"
+            )
+        from omnigent.runner._entry import _make_auth_token_factory
+
+        token_factory = _make_auth_token_factory()
+        control_token = token_factory() if token_factory is not None else None
+
     write_tmux_target(
         bridge_dir_for_bridge_id(bridge_id),
         socket_path=instance.socket_path,
         tmux_target=instance.tmux_target,
+        backend=getattr(instance, "backend_name", None),
+        pane_id=getattr(instance, "delivery_target", None),
+        control_url=control_url,
+        control_token=control_token,
     )
 
 

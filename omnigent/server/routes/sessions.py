@@ -52,6 +52,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from omnigent.codex_native_elicitation import codex_elicitation_id
+from omnigent.native_coding_agents import native_coding_agent_for_harness
 from omnigent.cost_plan import (
     reserved_cost_control_keys,
 )

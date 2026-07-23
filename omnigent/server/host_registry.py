@@ -22,8 +22,9 @@ from typing import Any, Protocol
 
 from cachetools import TTLCache
 
+from omnigent._platform import IS_DARWIN, IS_WINDOWS
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
-from omnigent.host.frames import HostHelloFrame
+from omnigent.host.frames import HostHelloFrame, HostPlatform
 
 _logger = logging.getLogger(__name__)
 
@@ -429,6 +430,17 @@ class HostRegistry:
         if conn is None:
             return None
         return conn.hello.installation_id
+
+    def get_host_platform(self, host_id: str, workspace_id: int | None = None) -> HostPlatform:
+        """Return the host OS, falling back to the server OS for older hosts."""
+        conn = self.get(host_id, workspace_id)
+        if conn is not None and conn.hello.platform is not None:
+            return conn.hello.platform
+        if IS_WINDOWS:
+            return "windows"
+        if IS_DARWIN:
+            return "darwin"
+        return "linux"
 
     def send_text(self, conn: HostConnection, data: str) -> None:
         """Enqueue a text frame for sending to the host.

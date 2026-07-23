@@ -73,6 +73,28 @@ def test_register_and_get() -> None:
     assert fetched.hello.name == "test-host"
 
 
+def test_get_host_platform_prefers_advertised_host_platform() -> None:
+    """A remote host's platform wins over the server process platform."""
+    registry = HostRegistry()
+    hello = _make_hello()
+    hello.platform = "windows"
+    registry.register("host_platform", FakeWebSocket(), hello, owner=None)
+
+    assert registry.get_host_platform("host_platform") == "windows"
+
+
+def test_get_host_platform_falls_back_for_older_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An older hello without platform retains the server-platform behavior."""
+    monkeypatch.setattr("omnigent.server.host_registry.IS_WINDOWS", False)
+    monkeypatch.setattr("omnigent.server.host_registry.IS_DARWIN", True)
+    registry = HostRegistry()
+    registry.register("host_legacy", FakeWebSocket(), _make_hello(), owner=None)
+
+    assert registry.get_host_platform("host_legacy") == "darwin"
+
+
 def test_deregister() -> None:
     """
     Verify that deregister removes the host from the registry.

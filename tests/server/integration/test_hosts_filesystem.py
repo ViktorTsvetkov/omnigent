@@ -27,6 +27,7 @@ from omnigent.host.frames import (
     HostHelloFrame,
     HostListDirFrame,
     HostListDirResultFrame,
+    HostPlatform,
     decode_host_frame,
     encode_host_frame,
 )
@@ -72,7 +73,7 @@ def _websocket_scope(path: str) -> dict[str, object]:
     }
 
 
-def _hello_text(name: str = _HOST_NAME) -> str:
+def _hello_text(name: str = _HOST_NAME, platform: HostPlatform | None = None) -> str:
     """Encode a hello frame for tests.
 
     :param name: Host name reported in the hello frame.
@@ -83,6 +84,7 @@ def _hello_text(name: str = _HOST_NAME) -> str:
             version="0.1.0-test",
             frame_protocol_version=1,
             name=name,
+            platform=platform,
         )
     )
 
@@ -278,11 +280,12 @@ async def test_list_filesystem_windows_absolute_path_is_forwarded_unchanged(
         dict[str, dict[str, Any]],
         asyncio.Task[None],
     ],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A native-Windows absolute path reaches host.list_dir without a slash prefix."""
-    monkeypatch.setattr("omnigent.server.routes.hosts.IS_WINDOWS", True)
-    app, _reg, _comm, replies, _drain = fs_setup
+    app, registry, _comm, replies, _drain = fs_setup
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    conn.hello.platform = "windows"
     windows_path = r"C:\Users\viktor\Downloads"
     replies[windows_path] = {"entries": [], "has_more": False}
 
@@ -301,11 +304,12 @@ async def test_list_filesystem_posix_path_still_gets_leading_slash(
         dict[str, dict[str, Any]],
         asyncio.Task[None],
     ],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """POSIX keeps forwarding non-tilde route paths with a leading slash."""
-    monkeypatch.setattr("omnigent.server.routes.hosts.IS_WINDOWS", False)
-    app, _reg, _comm, replies, _drain = fs_setup
+    app, registry, _comm, replies, _drain = fs_setup
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    conn.hello.platform = "linux"
     replies["/Users/corey/projects"] = {"entries": [], "has_more": False}
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

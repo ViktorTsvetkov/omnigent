@@ -89,6 +89,7 @@ def test_hello_frame_round_trip() -> None:
         frame_protocol_version=1,
         name="corey-laptop",
         runners=["runner_token_aaa", "runner_token_bbb"],
+        platform="windows",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
@@ -96,6 +97,7 @@ def test_hello_frame_round_trip() -> None:
     assert decoded.frame_protocol_version == 1
     assert decoded.name == "corey-laptop"
     assert decoded.runners == ["runner_token_aaa", "runner_token_bbb"]
+    assert decoded.platform == "windows"
 
 
 def test_hello_frame_empty_runners() -> None:
@@ -109,9 +111,12 @@ def test_hello_frame_empty_runners() -> None:
         frame_protocol_version=1,
         name="laptop",
     )
-    decoded = decode_host_frame(encode_host_frame(original))
+    encoded = encode_host_frame(original)
+    decoded = decode_host_frame(encoded)
     assert isinstance(decoded, HostHelloFrame)
     assert decoded.runners == []
+    assert decoded.platform is None
+    assert "platform" not in json.loads(encoded)
 
 
 def test_launch_runner_frame_round_trip() -> None:

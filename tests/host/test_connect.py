@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -858,6 +859,9 @@ async def test_hello_advertises_installed_version() -> None:
     hello = decode_host_frame(tunnel.sent[0])
     assert isinstance(hello, HostHelloFrame)
     assert hello.version == VERSION
+    assert hello.platform == (
+        "windows" if sys.platform == "win32" else "darwin" if sys.platform == "darwin" else "linux"
+    )
     # Guard against the old hard-coded literal creeping back.
     assert hello.version != "0.1.0"
 

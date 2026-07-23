@@ -16,9 +16,9 @@ from typing import Any
 
 import pytest
 
-from omnigent._platform import IS_WINDOWS
 from omnigent.host.frames import (
     HostHelloFrame,
+    HostPlatform,
     HostStatFrame,
     decode_host_frame,
 )
@@ -54,7 +54,7 @@ class _FakeWebSocket:
         self.sent.append(data)
 
 
-def _hello_frame() -> HostHelloFrame:
+def _hello_frame(platform: HostPlatform | None = "windows") -> HostHelloFrame:
     """Construct a host hello frame for registry registration.
 
     :returns: Hello frame with default version + empty runners.
@@ -63,6 +63,7 @@ def _hello_frame() -> HostHelloFrame:
         version="0.1.0-test",
         frame_protocol_version=1,
         name="ws-test-host",
+        platform=platform,
     )
 
 
@@ -612,7 +613,6 @@ async def test_tilde_boundary_passed_through_to_host(
 # ── Windows-host workspaces (native codex hosting, #13) ──────────
 
 
-@pytest.mark.skipif(not IS_WINDOWS, reason="native Windows terminal/path behavior")
 async def test_windows_absolute_workspace_is_accepted(
     host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
 ) -> None:
@@ -633,7 +633,6 @@ async def test_windows_absolute_workspace_is_accepted(
     assert result == r"D:\Repos\omnigent"
 
 
-@pytest.mark.skipif(not IS_WINDOWS, reason="native Windows terminal/path behavior")
 async def test_windows_workspace_missing_is_rejected(
     host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
 ) -> None:
@@ -649,7 +648,6 @@ async def test_windows_workspace_missing_is_rejected(
     assert "does not exist" in exc_info.value.message
 
 
-@pytest.mark.skipif(not IS_WINDOWS, reason="native Windows terminal/path behavior")
 async def test_windows_workspace_inside_boundary_is_accepted(
     host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
 ) -> None:
@@ -666,7 +664,6 @@ async def test_windows_workspace_inside_boundary_is_accepted(
     assert result == r"C:\Users\dev\proj"
 
 
-@pytest.mark.skipif(not IS_WINDOWS, reason="native Windows terminal/path behavior")
 async def test_windows_workspace_outside_boundary_is_rejected(
     host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
 ) -> None:
@@ -684,7 +681,6 @@ async def test_windows_workspace_outside_boundary_is_rejected(
     assert "outside the agent's required path" in exc_info.value.message
 
 
-@pytest.mark.skipif(not IS_WINDOWS, reason="native Windows terminal/path behavior")
 async def test_windows_subdir_cwd_requires_present_subdir(
     host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
 ) -> None:
@@ -702,7 +698,6 @@ async def test_windows_subdir_cwd_requires_present_subdir(
     assert result == r"D:\Repos\omnigent"
 
 
-@pytest.mark.skipif(not IS_WINDOWS, reason="native Windows terminal/path behavior")
 async def test_windows_subdir_cwd_missing_subdir_is_rejected(
     host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
 ) -> None:
@@ -738,6 +733,24 @@ async def test_non_absolute_path_still_rejected_posix_behavior(
             spec_cwd=".",
         )
     assert "absolute path starting with /" in exc_info.value.message
+
+
+async def test_windows_absolute_workspace_rejected_for_posix_host(
+    host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
+) -> None:
+    """A Windows-shaped path never opts a POSIX host into Windows semantics."""
+    registry, _, _ = host_setup
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    conn.hello.platform = "linux"
+    with pytest.raises(WorkspaceValidationError) as exc_info:
+        await validate_workspace(
+            host_registry=registry,
+            host_id=_HOST_ID,
+            workspace=r"C:\Users\dev\proj",
+            spec_cwd=".",
+        )
+    assert exc_info.value.message == "workspace must be an absolute path starting with /"
 
 
 def test_is_subpath_of_windows_unit() -> None:

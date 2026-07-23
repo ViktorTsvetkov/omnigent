@@ -13,7 +13,6 @@ import logging
 from pathlib import PureWindowsPath
 from typing import Any
 
-from omnigent._platform import IS_WINDOWS
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.model_override import validate_model_override
 from omnigent.reasoning_effort import EFFORT_VALUES, validate_effort
@@ -117,7 +116,9 @@ async def validate_existing_host_workspace(
             code=ErrorCode.INVALID_INPUT,
         )
     if not workspace.startswith("/") and not (
-        IS_WINDOWS and PureWindowsPath(workspace).is_absolute()
+        host_registry is not None
+        and host_registry.get_host_platform(host_id) == "windows"
+        and PureWindowsPath(workspace).is_absolute()
     ):
         raise OmnigentError(
             "workspace must be an absolute path starting with /",

@@ -26,7 +26,6 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from omnigent._platform import IS_WINDOWS
 from omnigent.db.utils import now_epoch
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
@@ -840,7 +839,10 @@ def create_hosts_router(
             # the :path converter only strips a leading POSIX "/". Prepending "/" to a
             # drive-letter path yields the invalid "/C:\..." and fails host scandir with a 502.
             # Skip the prepend only for a Windows-absolute path; POSIX behavior is unchanged.
-            if not (IS_WINDOWS and PureWindowsPath(path).is_absolute()):
+            if not (
+                host_registry.get_host_platform(host_id) == "windows"
+                and PureWindowsPath(path).is_absolute()
+            ):
                 path = "/" + path
         return await _list_host_filesystem(
             request=request,

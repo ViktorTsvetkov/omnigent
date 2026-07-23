@@ -22,7 +22,7 @@ from pathlib import Path
 import websockets.asyncio.client
 from websockets.exceptions import InvalidStatus, InvalidURI
 
-from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
+from omnigent._platform import IS_DARWIN, IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
 from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host.frames import (
@@ -2137,6 +2137,7 @@ class HostProcess:
             configured_harnesses=configured_harnesses,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
+            platform="windows" if IS_WINDOWS else "darwin" if IS_DARWIN else "linux",
         )
         await ws.send(encode_host_frame(hello))
         self._ws = ws

@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 
@@ -32,6 +32,8 @@ from omnigent.harness_availability import HarnessAvailability, is_harness_availa
 # by the daemon (producer), server (maps it to
 # ``ErrorCode.HARNESS_NOT_CONFIGURED``), and tests.
 HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
+
+HostPlatform = Literal["windows", "linux", "darwin"]
 
 
 class HostFrameKind(str, Enum):
@@ -87,6 +89,8 @@ class HostHelloFrame:
         treat ``None`` as "nothing is configured". Changes arrive in
         :class:`HostHarnessReadinessFrame`; launch-time checks remain
         authoritative.
+    :param platform: Operating system of the host process. ``None`` means an
+        older host that did not report it.
     """
 
     version: str
@@ -96,6 +100,7 @@ class HostHelloFrame:
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     telemetry_opt_out: bool = False
     installation_id: str | None = None
+    platform: HostPlatform | None = None
 
 
 @dataclass
@@ -745,18 +750,19 @@ def encode_host_frame(frame: HostFrame) -> str:
     :raises TypeError: If ``frame`` is not a known host frame type.
     """
     if isinstance(frame, HostHelloFrame):
-        return _encode_payload(
-            {
-                "kind": HostFrameKind.HELLO.value,
-                "version": frame.version,
-                "frame_protocol_version": frame.frame_protocol_version,
-                "name": frame.name,
-                "runners": list(frame.runners),
-                "configured_harnesses": frame.configured_harnesses,
-                "telemetry_opt_out": frame.telemetry_opt_out,
-                "installation_id": frame.installation_id,
-            }
-        )
+        payload = {
+            "kind": HostFrameKind.HELLO.value,
+            "version": frame.version,
+            "frame_protocol_version": frame.frame_protocol_version,
+            "name": frame.name,
+            "runners": list(frame.runners),
+            "configured_harnesses": frame.configured_harnesses,
+            "telemetry_opt_out": frame.telemetry_opt_out,
+            "installation_id": frame.installation_id,
+        }
+        if frame.platform is not None:
+            payload["platform"] = frame.platform
+        return _encode_payload(payload)
     if isinstance(frame, HostHarnessReadinessFrame):
         return _encode_payload(
             {
@@ -1122,6 +1128,7 @@ def _decode_host_hello(msg: dict[str, Any]) -> HostHelloFrame:
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
+        platform=_optional_host_platform(msg, "platform"),
     )
 
 
@@ -1536,6 +1543,16 @@ def _required_str(msg: dict[str, Any], key: str) -> str:
     val = msg.get(key)
     if not isinstance(val, str):
         raise ValueError(f"frame missing required string field: {key!r}")
+    return val
+
+
+def _optional_host_platform(msg: dict[str, Any], key: str) -> HostPlatform | None:
+    """Return an optional supported host platform."""
+    val = msg.get(key)
+    if val is None:
+        return None
+    if val not in ("windows", "linux", "darwin"):
+        raise ValueError(f"frame field must be a supported host platform or null: {key!r}")
     return val
 
 

@@ -67,15 +67,6 @@ _REPL_TERMINAL_NAME = "tui"
 _REPL_TERMINAL_SESSION_KEY = "main"
 _NO_BODY_STATUS_CODES = {204, 304}
 
-_BACKGROUND_TITLE_HARNESS_ADAPTERS = {
-    "claude-sdk": "claude-sdk",
-    "claude-native": "claude-sdk",
-    "codex": "codex",
-}
-_BACKGROUND_TITLE_MAX_PROMPT_CHARS = 4_000
-_BACKGROUND_TITLE_MAX_OUTPUT_TOKENS = 32
-_BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS = 60.0
-
 
 def _publish_tmux_target_for_bridge(
     *,
@@ -4694,6 +4685,12 @@ def _codex_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -
     """
     Read the Codex model default from a resolved agent spec.
 
+    Reads the canonical ``spec.executor.model`` field (the same field the
+    in-process codex harness consumes via ``_resolve_spec_model``), falling
+    back to ``executor.config["model"]`` for bundle specs that pin the model
+    inside the harness config block. Gateway-routed ``databricks-*`` ids are
+    valid Codex models on the Databricks path, so they pass through.
+
     :param agent_spec: Agent spec object, or a resolved wrapper carrying a
         ``spec`` attribute. ``None`` means no spec was available.
     :returns: Model id, e.g. ``"gpt-5.4-mini"``, or ``None``.
@@ -4701,8 +4698,11 @@ def _codex_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     if spec is None:
         return None
-    model = spec.executor.config.get("model")
-    return model if isinstance(model, str) and model else None
+    model = spec.executor.model
+    if isinstance(model, str) and model:
+        return model
+    config_model = spec.executor.config.get("model")
+    return config_model if isinstance(config_model, str) and config_model else None
 
 
 def _claude_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
